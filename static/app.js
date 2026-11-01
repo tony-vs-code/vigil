@@ -36,8 +36,31 @@ let cachedStorageDisks = null;
 const MEMORY_HISTORY_LIMIT = 30;
 const memoryHistoryBuffer = [];
 
-const CPU_CORE_HISTORY_LIMIT = 45;
+const CPU_CORE_HISTORY_LIMIT = 60;
 const cpuCoresHistoryBuffers = [];
+let activeHoveredCoreIndex = null;
+const CPU_CORE_COLORS = [
+  "#00f0ff",
+  "#10b981",
+  "#f59e0b",
+  "#a855f7",
+  "#ec4899",
+  "#38bdf8",
+  "#84cc16",
+  "#f97316",
+  "#eab308",
+  "#06b6d4",
+  "#6366f1",
+  "#14b8a6",
+  "#d946ef",
+  "#e11d48",
+  "#22c55e",
+  "#3b82f6",
+  "#8b5cf6",
+  "#f43f5e",
+  "#0ea5e9",
+  "#fbbf24",
+];
 let systemUpdatePollTimerId = null;
 let systemUpdateNoticeDismissed = false;
 let lastKnownUpdateSignature = null;
@@ -446,15 +469,16 @@ function renderMemoryHistoryChart(history) {
 }
 
 /**
- * Render Windows Task Manager style rolling time-series graph on a core canvas.
- * Handles devicePixelRatio for razor-sharp rendering on Retina/HiDPI screens.
+ * Render Windows Task Manager style rolling time-series graph on the unified CPU cores canvas.
+ * Handles window.devicePixelRatio for crisp HiDPI / Retina rendering.
+ * Renders multiple core series simultaneously with vibrant colors and interactive hover focus.
  */
-function drawCpuCoreGraph(canvas, history, currentPercent) {
+function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
   if (!canvas) return;
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
-  const w = Math.floor(rect.width) || canvas.clientWidth || 140;
-  const h = Math.floor(rect.height) || canvas.clientHeight || 44;
+  const w = Math.floor(rect.width) || canvas.clientWidth || 600;
+  const h = Math.floor(rect.height) || canvas.clientHeight || 150;
 
   const targetW = Math.round(w * dpr);
   const targetH = Math.round(h * dpr);
@@ -470,107 +494,198 @@ function drawCpuCoreGraph(canvas, history, currentPercent) {
   ctx.scale(dpr, dpr);
   ctx.clearRect(0, 0, w, h);
 
-  // 1. Subtle dark Task Manager style background
-  ctx.fillStyle = "rgba(4, 9, 20, 0.75)";
+  // 1. Task-manager style dark background
+  ctx.fillStyle = "rgba(4, 9, 20, 0.8)";
   ctx.fillRect(0, 0, w, h);
 
-  // 2. Grid lines (Task Manager divisions: 25%, 50%, 75%)
-  const padTop = 3;
-  const padBottom = 3;
-  const usableH = h - padTop - padBottom;
+  // 2. Padding and usable plot geometry
+  const padLeft = 32;
+  const padRight = 10;
+  const padTop = 10;
+  const padBottom = 12;
+  const plotW = Math.max(10, w - padLeft - padRight);
+  const plotH = Math.max(10, h - padTop - padBottom);
 
+  // 3. Subtle horizontal grid lines & faint percentage labels (100%, 75%, 50%, 25%, 0%)
+  const gridPcts = [100, 75, 50, 25, 0];
   ctx.lineWidth = 1;
-  ctx.strokeStyle = "rgba(71, 85, 105, 0.22)";
-  ctx.beginPath();
-  [0.25, 0.5, 0.75].forEach((frac) => {
-    const y = Math.round(padTop + usableH * (1 - frac)) + 0.5;
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
+  gridPcts.forEach((pct) => {
+    const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
+    ctx.strokeStyle = "rgba(71, 85, 105, 0.22)";
+    ctx.beginPath();
+    ctx.moveTo(padLeft, y);
+    ctx.lineTo(w - padRight, y);
+    ctx.stroke();
+
+    if (pct > 0) {
+      ctx.fillStyle = "rgba(148, 163, 184, 0.45)";
+      ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(`${pct}%`, padLeft - 4, y);
+    }
   });
 
-  // Vertical time ticks (4 divisions across width)
-  const numVDivs = 4;
+  // Vertical time ticks
+  const numVDivs = 6;
+  ctx.strokeStyle = "rgba(71, 85, 105, 0.16)";
+  ctx.beginPath();
   for (let d = 1; d < numVDivs; d++) {
-    const x = Math.round((w / numVDivs) * d) + 0.5;
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
+    const x = Math.round(padLeft + (plotW / numVDivs) * d) + 0.5;
+    ctx.moveTo(x, padTop);
+    ctx.lineTo(x, padTop + plotH);
   }
   ctx.stroke();
 
-  if (!history || history.length === 0) {
+  // Handle normalization of buffers (support single buffer or array of buffers)
+  if (!buffers || buffers.length === 0) {
     ctx.restore();
     return;
   }
+  const isSingleBuffer = Array.isArray(buffers) && typeof buffers[0] === "number";
+  const allBuffers = isSingleBuffer ? [buffers] : buffers;
 
-  // 3. Stroke & Gradient color based on utilization
-  let strokeColor = "#10b981"; // Emerald/cyan
-  let gradTop = "rgba(16, 185, 129, 0.4)";
-  let gradBottom = "rgba(16, 185, 129, 0.02)";
-  if (currentPercent >= 90) {
-    strokeColor = "#ef4444"; // Danger red
-    gradTop = "rgba(239, 68, 68, 0.45)";
-    gradBottom = "rgba(239, 68, 68, 0.02)";
-  } else if (currentPercent >= 75) {
-    strokeColor = "#f59e0b"; // Warning amber
-    gradTop = "rgba(245, 158, 11, 0.4)";
-    gradBottom = "rgba(245, 158, 11, 0.02)";
-  }
-
-  // 4. Calculate coordinates scrolling right to left
   const maxSamples = CPU_CORE_HISTORY_LIMIT;
-  const n = history.length;
-  const stepX = w / (maxSamples - 1);
-  const points = [];
+  const stepX = plotW / Math.max(1, maxSamples - 1);
 
-  for (let i = 0; i < n; i++) {
-    const sample = Math.max(0, Math.min(100, Number(history[i]) || 0));
-    const x = w - (n - 1 - i) * stepX;
-    const y = padTop + usableH * (1 - sample / 100);
-    points.push({ x, y });
+  // Prepare points for each core
+  const coreSeries = [];
+  for (let idx = 0; idx < allBuffers.length; idx++) {
+    const buf = allBuffers[idx];
+    if (!buf || buf.length === 0) continue;
+    const n = buf.length;
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
+      const x = (w - padRight) - (n - 1 - i) * stepX;
+      const y = padTop + plotH * (1 - sample / 100);
+      pts.push({ x, y });
+    }
+    if (pts.length === 1) {
+      pts.unshift({ x: padLeft, y: pts[0].y });
+    }
+    const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+    coreSeries.push({ idx, color, pts });
   }
 
-  if (points.length === 1) {
-    points.unshift({ x: 0, y: points[0].y });
-  }
+  const hasHover =
+    activeHoverIndex !== null &&
+    activeHoverIndex !== undefined &&
+    activeHoverIndex >= 0;
 
-  // 5. Fill translucent area gradient underneath
-  if (points.length > 1) {
-    const areaGrad = ctx.createLinearGradient(0, 0, 0, h);
-    areaGrad.addColorStop(0, gradTop);
-    areaGrad.addColorStop(1, gradBottom);
+  // Render function for a core series
+  const renderSeriesLine = (series, isEmphasized, isDimmed) => {
+    const { color, pts } = series;
+    if (!pts || pts.length === 0) return;
 
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, h);
-    points.forEach((pt) => ctx.lineTo(pt.x, pt.y));
-    ctx.lineTo(points[points.length - 1].x, h);
-    ctx.closePath();
-    ctx.fillStyle = areaGrad;
-    ctx.fill();
-  }
+    if (isEmphasized) {
+      // Glow and thicker line
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2.4;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalAlpha = 1.0;
+      ctx.beginPath();
+      pts.forEach((pt, i) => {
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+      ctx.restore();
 
-  // 6. Glowing stroke line
-  ctx.save();
-  ctx.shadowColor = strokeColor;
-  ctx.shadowBlur = 4;
-  ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = 1.6;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.beginPath();
-  points.forEach((pt, idx) => {
-    if (idx === 0) ctx.moveTo(pt.x, pt.y);
-    else ctx.lineTo(pt.x, pt.y);
-  });
-  ctx.stroke();
-  ctx.restore();
+      // Subtle gradient underlay for emphasized line
+      ctx.save();
+      const areaGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+      areaGrad.addColorStop(0, `${color}33`);
+      areaGrad.addColorStop(1, `${color}00`);
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, padTop + plotH);
+      pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+      ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
+      ctx.closePath();
+      ctx.fillStyle = areaGrad;
+      ctx.fill();
+      ctx.restore();
 
-  // Pulse point on the latest reading
-  if (points.length > 0) {
-    const last = points[points.length - 1];
-    ctx.fillStyle = strokeColor;
-    ctx.beginPath();
-    ctx.arc(last.x, last.y, 2, 0, Math.PI * 2);
-    ctx.fill();
+      // Rightmost current utilization pulse dot
+      const last = pts[pts.length - 1];
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    } else if (isDimmed) {
+      // Dimmed line
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.0;
+      ctx.globalAlpha = 0.2;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      pts.forEach((pt, i) => {
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+
+      const last = pts[pts.length - 1];
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    } else {
+      // Clean standard line
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 3;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.globalAlpha = 0.85;
+      ctx.beginPath();
+      pts.forEach((pt, i) => {
+        if (i === 0) ctx.moveTo(pt.x, pt.y);
+        else ctx.lineTo(pt.x, pt.y);
+      });
+      ctx.stroke();
+      ctx.restore();
+
+      // Rightmost edge dot
+      const last = pts[pts.length - 1];
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 4;
+      ctx.beginPath();
+      ctx.arc(last.x, last.y, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  };
+
+  if (hasHover) {
+    // Draw non-hovered (dimmed) lines first
+    coreSeries
+      .filter((s) => s.idx !== activeHoverIndex)
+      .forEach((s) => renderSeriesLine(s, false, true));
+
+    // Draw active hovered (emphasized) line on top
+    const hoveredSeries = coreSeries.find((s) => s.idx === activeHoverIndex);
+    if (hoveredSeries) {
+      renderSeriesLine(hoveredSeries, true, false);
+    }
+  } else {
+    // Draw all lines cleanly
+    coreSeries.forEach((s) => renderSeriesLine(s, false, false));
   }
 
   ctx.restore();
@@ -677,8 +792,11 @@ function renderSystemMetrics(system) {
     }
   }
 
-  // CPU per-core drilldown grid (Task Manager Style Live Rolling Charts)
+  // CPU per-core drilldown (Unified Multi-Line Chart + Interactive Core Chips)
   const coresGrid = document.getElementById("cpu-cores-grid");
+  const unifiedCanvas =
+    document.getElementById("cpu-cores-unified-canvas") ||
+    document.querySelector(".cpu-core-canvas");
   if (coresGrid) {
     const cores =
       Array.isArray(system.cpu_cores) && system.cpu_cores.length > 0
@@ -695,26 +813,58 @@ function renderSystemMetrics(system) {
     let items = coresGrid.querySelectorAll(".cpu-core-item");
     if (items.length !== cores.length) {
       coresGrid.innerHTML = cores
-        .map(
-          (_, idx) => `
-        <div class="cpu-core-item" data-core-idx="${idx}">
+        .map((_, idx) => {
+          const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+          return `
+        <div class="cpu-core-item" data-core-idx="${idx}" title="Core ${idx}">
           <div class="cpu-core-header">
-            <span class="cpu-core-label">Core ${idx}</span>
+            <div class="cpu-core-legend-info">
+              <span class="cpu-core-color-dot" style="background-color: ${color};"></span>
+              <span class="cpu-core-label">Core ${idx}</span>
+            </div>
             <span class="cpu-core-percent mono-text">0.0%</span>
           </div>
-          <canvas class="cpu-core-canvas" width="140" height="44"></canvas>
           <div class="progress-track cpu-core-track">
-            <div class="progress-fill" style="width: 0%"></div>
+            <div class="progress-fill" style="width: 0%; background-color: ${color};"></div>
           </div>
         </div>
-      `
-        )
+      `;
+        })
         .join("");
       items = coresGrid.querySelectorAll(".cpu-core-item");
+
+      items.forEach((item) => {
+        const idx = parseInt(item.getAttribute("data-core-idx"), 10);
+        item.addEventListener("mouseenter", () => {
+          activeHoveredCoreIndex = idx;
+          const allChips = coresGrid.querySelectorAll(".cpu-core-item");
+          allChips.forEach((chip, cIdx) => {
+            chip.classList.toggle("is-hovered", cIdx === idx);
+            chip.classList.toggle("is-dimmed", cIdx !== idx);
+          });
+          const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+          if (unifiedCanvas) {
+            drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, activeHoveredCoreIndex);
+          }
+        });
+        item.addEventListener("mouseleave", () => {
+          activeHoveredCoreIndex = null;
+          const allChips = coresGrid.querySelectorAll(".cpu-core-item");
+          allChips.forEach((chip) => {
+            chip.classList.remove("is-hovered", "is-dimmed");
+          });
+          const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+          if (unifiedCanvas) {
+            drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, null);
+          }
+        });
+      });
     }
 
+    const currentCoreValues = [];
     cores.forEach((coreVal, idx) => {
       const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
+      currentCoreValues.push(cPercent);
       const buf = cpuCoresHistoryBuffers[idx];
       buf.push(cPercent);
       if (buf.length > CPU_CORE_HISTORY_LIMIT) {
@@ -732,18 +882,15 @@ function renderSystemMetrics(system) {
 
       const barEl = item.querySelector(".cpu-core-track .progress-fill");
       if (barEl) {
-        let barClass = "progress-fill";
-        if (cPercent >= 90) barClass += " danger";
-        else if (cPercent >= 75) barClass += " warn";
-        barEl.className = barClass;
+        const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
         barEl.style.width = `${cPercent.toFixed(1)}%`;
-      }
-
-      const canvasEl = item.querySelector(".cpu-core-canvas");
-      if (canvasEl) {
-        drawCpuCoreGraph(canvasEl, buf, cPercent);
+        barEl.style.backgroundColor = color;
       }
     });
+
+    if (unifiedCanvas) {
+      drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentCoreValues, activeHoveredCoreIndex);
+    }
   }
 
   // Memory
@@ -8263,18 +8410,15 @@ function initDashboard() {
       if (bar) bar.classList.add("hidden");
     });
 
-  // HiDPI / Window Resize Listener for Per-Core CPU Canvases
+  // HiDPI / Window Resize Listener for Unified CPU Cores Canvas
   window.addEventListener("resize", () => {
-    const coresGrid = document.getElementById("cpu-cores-grid");
-    if (!coresGrid) return;
-    const items = coresGrid.querySelectorAll(".cpu-core-item");
-    items.forEach((item, idx) => {
-      const canvasEl = item.querySelector(".cpu-core-canvas");
-      const buf = cpuCoresHistoryBuffers[idx];
-      if (canvasEl && buf && buf.length > 0) {
-        drawCpuCoreGraph(canvasEl, buf, buf[buf.length - 1]);
-      }
-    });
+    const unifiedCanvas =
+      document.getElementById("cpu-cores-unified-canvas") ||
+      document.querySelector(".cpu-core-canvas");
+    if (unifiedCanvas && cpuCoresHistoryBuffers.length > 0) {
+      const latestValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+      drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, latestValues, activeHoveredCoreIndex);
+    }
   });
 
   if (!localTickerTimerId) {
