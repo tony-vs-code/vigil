@@ -7061,20 +7061,40 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         """Verify Windows Task Manager style rolling time-series graph for CPU cores."""
         css_text = (Path(__file__).parent / "static" / "styles.css").read_text(encoding="utf-8")
         
-        # JS Invariants: buffer, limit, drawing function, canvas creation, HiDPI devicePixelRatio handling
-        self.assertIn("CPU_CORE_HISTORY_LIMIT", self.app_js)
-        self.assertIn("cpuCoresHistoryBuffers", self.app_js)
-        self.assertIn("function drawCpuCoreGraph(", self.app_js)
-        self.assertIn("cpu-core-canvas", self.app_js)
+        # 1. HTML DOM Structure: #cpu-cores-unified-canvas inside #cpu-cores-drilldown
+        self.assertIn('id="cpu-cores-drilldown"', self.index_html)
+        self.assertIn('id="cpu-cores-unified-canvas"', self.index_html)
+        drilldown_pos = self.index_html.find('id="cpu-cores-drilldown"')
+        canvas_pos = self.index_html.find('id="cpu-cores-unified-canvas"')
+        cores_grid_pos = self.index_html.find('id="cpu-cores-grid"')
+        self.assertGreater(drilldown_pos, -1)
+        self.assertGreater(canvas_pos, drilldown_pos)
+        self.assertGreater(cores_grid_pos, canvas_pos)
+
+        # 2. CPU Core Grid elements and indicators
+        self.assertIn("cpu-core-item", self.app_js)
         self.assertIn("cpu-core-label", self.app_js)
         self.assertIn("cpu-core-percent", self.app_js)
         self.assertIn("cpu-core-track", self.app_js)
-        self.assertIn("devicePixelRatio", self.app_js)
+        self.assertIn("cpu-core-color-dot", self.app_js)
 
-        # CSS Invariants
+        # 3. JS Invariants: buffer, limit, drawing function, multi-core buffers, colors, devicePixelRatio, hover highlighting
+        self.assertIn("CPU_CORE_HISTORY_LIMIT", self.app_js)
+        self.assertIn("CPU_CORE_COLORS", self.app_js)
+        self.assertIn("cpuCoresHistoryBuffers", self.app_js)
+        self.assertIn("function drawCpuCoreGraph(", self.app_js)
+        self.assertIn("devicePixelRatio", self.app_js)
+        self.assertIn("activeHoverIndex", self.app_js)
+        self.assertIn("isEmphasized", self.app_js)
+        self.assertIn("isDimmed", self.app_js)
+
+        # 4. CSS Invariants
+        self.assertIn(".cpu-unified-chart-container", css_text)
+        self.assertIn(".cpu-unified-chart-canvas", css_text)
         self.assertIn(".cpu-core-canvas", css_text)
         self.assertIn(".cpu-core-item", css_text)
         self.assertIn(".cpu-core-header", css_text)
+        self.assertIn(".cpu-core-color-dot", css_text)
         self.assertIn(".cpu-core-track", css_text)
 
     def test_slide_over_notification_drawer_contracts(self):
