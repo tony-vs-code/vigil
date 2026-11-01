@@ -562,7 +562,10 @@
               <!-- Memory Telemetry -->
               <article class="metric-card" id="memory-metric-card">
                 <div class="metric-header">
-                  <span class="metric-title">Memory Telemetry</span>
+                  <div class="metric-title-group">
+                    <span class="metric-title">Memory Telemetry</span>
+                    <span id="memory-total-badge" class="kind-badge" title="Total Physical Memory">-- Total</span>
+                  </div>
                   <span id="memory-percent-value" class="metric-value">--%</span>
                 </div>
                 <div class="progress-track" aria-label="Memory usage bar">
@@ -582,10 +585,11 @@
                 </div>
                 <div class="metric-footer memory-metric-footer">
                   <span id="memory-detail" class="metric-subtext">-- / -- used (-- available)</span>
-                  <div class="memory-breakdown-row" id="memory-breakdown-chips">
-                    <span id="memory-chip-used" class="breakdown-chip chip-used">Used: --</span>
-                    <span id="memory-chip-cached" class="breakdown-chip chip-cached">Cached: --</span>
-                    <span id="memory-chip-free" class="breakdown-chip chip-free">Free: --</span>
+                  <div class="memory-breakdown-row memory-taskmgr-grid" id="memory-breakdown-chips">
+                    <span id="memory-chip-used" class="breakdown-chip chip-used" title="Active memory used by running processes">In use: --</span>
+                    <span id="memory-chip-available" class="breakdown-chip chip-available" title="Total memory available to applications (Free + Reclaimable Cache)">Available: --</span>
+                    <span id="memory-chip-cached" class="breakdown-chip chip-cached" title="Kernel page cache &amp; buffers (automatically reclaimed when apps need RAM)">Cached: --</span>
+                    <span id="memory-chip-free" class="breakdown-chip chip-free" title="Unallocated memory">Free: --</span>
                   </div>
                 </div>
               </article>
@@ -1478,34 +1482,26 @@
               </div>
             </div>
 
-            <!-- E. FULL-WIDTH NOTIFICATION AUDIT HISTORY -->
-            <div class="notifications-history-fullwidth">
-              <article class="card history-card" id="history-card">
-                <div class="card-header">
-                  <div>
-                    <h3 class="card-title">Notification Audit History</h3>
-                    <p class="card-subtitle">Recent alerts and summaries dispatched to channels</p>
-                  </div>
-                  <span id="history-count-badge" class="pill-counter">0 records</span>
+            <!-- Dispatched Alert History Redirect Banner -->
+            <div class="notif-history-redirect-banner">
+              <div class="redirect-banner-content">
+                <div class="redirect-banner-icon">
+                  <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <polyline points="14 2 14 8 20 8"></polyline>
+                    <line x1="16" y1="13" x2="8" y2="13"></line>
+                    <line x1="16" y1="17" x2="8" y2="17"></line>
+                    <polyline points="10 9 9 9 8 9"></polyline>
+                  </svg>
                 </div>
-
-                <div class="table-container">
-                  <table class="data-table" id="notification-history-table">
-                    <thead>
-                      <tr>
-                        <th>Timestamp</th>
-                        <th>Type</th>
-                        <th>RAID Status</th>
-                      </tr>
-                    </thead>
-                    <tbody id="notification-history-tbody">
-                      <tr>
-                        <td colspan="3" class="empty-state">Loading notification history...</td>
-                      </tr>
-                    </tbody>
-                  </table>
+                <div class="redirect-banner-text">
+                  <span class="redirect-banner-title">Looking for dispatched alert history?</span>
+                  <p class="redirect-banner-desc">Dispatched notifications, periodic summaries, and test runs are now centralized in Audit &amp; Logs.</p>
                 </div>
-              </article>
+                <button id="btn-goto-alert-logs" class="btn-secondary redirect-banner-btn" type="button">
+                  <span>View Alert Dispatch Logs in Audit &amp; Logs &rarr;</span>
+                </button>
+              </div>
             </div>
           </section>
         </div>
@@ -2111,67 +2107,118 @@
               </div>
             </div>
 
-            <!-- Summary Cards -->
-            <div class="overview-status-ribbon audit-status-ribbon" role="region" aria-label="Audit Log Summary">
-              <div class="status-ribbon-item">
-                <div class="status-ribbon-badge-group">
-                  <span class="status-ribbon-label">Total Events</span>
-                  <span id="audit-total-count" class="pill-counter">0</span>
-                </div>
-                <span class="status-ribbon-desc">Historical logged operations</span>
-              </div>
-              <div class="status-ribbon-divider" aria-hidden="true"></div>
-              <div class="status-ribbon-item">
-                <div class="status-ribbon-badge-group">
-                  <span class="status-ribbon-label">Security &amp; Warnings</span>
-                  <span id="audit-security-count" class="status-badge status-ok">0 Events</span>
-                </div>
-                <span class="status-ribbon-desc">Warning or security severity events</span>
-              </div>
-            </div>
-
-            <!-- Filter Controls -->
-            <div class="table-controls-bar">
-              <div class="search-box">
+            <!-- View Subtabs Nav: Audit & Logs -->
+            <div class="view-subtabs-nav" role="tablist" aria-label="Audit &amp; Logs Subtabs">
+              <button id="subtab-audit-security-btn" class="subtab-nav-btn active" type="button" role="tab" aria-selected="true" aria-controls="audit-security-subtab-panel">
                 <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="11" cy="11" r="8"></circle>
-                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
                 </svg>
-                <input id="audit-search-input" type="search" placeholder="Search by description, actor, or event type..." aria-label="Search Audit Logs" />
+                <span>Security Audit Trail</span>
+                <span id="subtab-audit-security-badge" class="pill-counter">0</span>
+              </button>
+              <button id="subtab-audit-alerts-btn" class="subtab-nav-btn" type="button" role="tab" aria-selected="false" aria-controls="audit-alerts-subtab-panel">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                  <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+                </svg>
+                <span>Alert Dispatch Logs</span>
+                <span id="history-count-badge" class="pill-counter">0 records</span>
+              </button>
+            </div>
+
+            <!-- Subtab Panel 1: Security Audit Trail -->
+            <div id="audit-security-subtab-panel" class="subtab-panel" role="tabpanel" aria-labelledby="subtab-audit-security-btn">
+              <!-- Summary Cards -->
+              <div class="overview-status-ribbon audit-status-ribbon" role="region" aria-label="Audit Log Summary">
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Total Events</span>
+                    <span id="audit-total-count" class="pill-counter">0</span>
+                  </div>
+                  <span class="status-ribbon-desc">Historical logged operations</span>
+                </div>
+                <div class="status-ribbon-divider" aria-hidden="true"></div>
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Security &amp; Warnings</span>
+                    <span id="audit-security-count" class="status-badge status-ok">0 Events</span>
+                  </div>
+                  <span class="status-ribbon-desc">Warning or security severity events</span>
+                </div>
               </div>
-              <div class="filter-actions">
-                <label for="audit-severity-filter" class="form-label-inline">Severity:</label>
-                <select id="audit-severity-filter" class="module-interval-select" aria-label="Filter by Severity">
-                  <option value="">All Severities</option>
-                  <option value="info">Info</option>
-                  <option value="warning">Warning</option>
-                  <option value="security">Security</option>
-                </select>
+
+              <!-- Filter Controls -->
+              <div class="table-controls-bar">
+                <div class="search-box">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <input id="audit-search-input" type="search" placeholder="Search by description, actor, or event type..." aria-label="Search Audit Logs" />
+                </div>
+                <div class="filter-actions">
+                  <label for="audit-severity-filter" class="form-label-inline">Severity:</label>
+                  <select id="audit-severity-filter" class="module-interval-select" aria-label="Filter by Severity">
+                    <option value="">All Severities</option>
+                    <option value="info">Info</option>
+                    <option value="warning">Warning</option>
+                    <option value="security">Security</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Audit Table Card -->
+              <div class="card table-card">
+                <div class="table-container">
+                  <table class="data-table" id="audit-table">
+                    <thead>
+                      <tr>
+                        <th>Timestamp</th>
+                        <th>Severity</th>
+                        <th>Event Type</th>
+                        <th>Actor</th>
+                        <th>Client IP</th>
+                        <th>Description</th>
+                        <th style="text-align: right;">Details</th>
+                      </tr>
+                    </thead>
+                    <tbody id="audit-table-body">
+                      <tr>
+                        <td colspan="7" class="empty-state">Loading security audit events...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
 
-            <!-- Audit Table Card -->
-            <div class="card table-card">
-              <div class="table-container">
-                <table class="data-table" id="audit-table">
-                  <thead>
-                    <tr>
-                      <th>Timestamp</th>
-                      <th>Severity</th>
-                      <th>Event Type</th>
-                      <th>Actor</th>
-                      <th>Client IP</th>
-                      <th>Description</th>
-                      <th style="text-align: right;">Details</th>
-                    </tr>
-                  </thead>
-                  <tbody id="audit-table-body">
-                    <tr>
-                      <td colspan="7" class="empty-state">Loading security audit events...</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
+            <!-- Subtab Panel 2: Alert Dispatch Logs -->
+            <div id="audit-alerts-subtab-panel" class="subtab-panel hidden" role="tabpanel" aria-labelledby="subtab-audit-alerts-btn">
+              <article class="card history-card" id="history-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Dispatched Alert Logs</h3>
+                    <p class="card-subtitle">Historical alerts, periodic summaries, and test dispatches sent to external channels</p>
+                  </div>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="notification-history-table">
+                    <thead>
+                      <tr>
+                        <th>Timestamp</th>
+                        <th>Type</th>
+                        <th>RAID Status</th>
+                      </tr>
+                    </thead>
+                    <tbody id="notification-history-tbody">
+                      <tr>
+                        <td colspan="3" class="empty-state">Loading notification history...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
             </div>
           </section>
         </div>
@@ -3213,9 +3260,12 @@
           <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
         </svg>
         <h2 class="drawer-title">Notifications &amp; Alerts</h2>
-        <span id="drawer-notif-count" class="pill-counter">0 recent</span>
+        <span id="drawer-notif-count" class="pill-counter">0 active</span>
       </div>
       <div class="drawer-header-actions">
+        <button id="btn-drawer-dismiss-all" class="btn-drawer-dismiss-all" type="button" title="Dismiss all active notifications" aria-label="Dismiss all active notifications">
+          Dismiss All
+        </button>
         <button id="btn-drawer-refresh-history" class="btn-icon-subtle" type="button" title="Refresh notification history" aria-label="Refresh notification history">
           <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10"></polyline>
@@ -3282,19 +3332,36 @@
       </div>
     </div>
 
+    <!-- Notification Category Filter Pills -->
+    <div class="drawer-categories-bar" role="tablist" aria-label="Filter Notifications">
+      <div class="drawer-category-pills">
+        <button id="drawer-tab-all" class="drawer-category-pill active" type="button" role="tab" aria-selected="true" data-drawer-filter="all">
+          <span>All</span>
+          <span id="drawer-badge-all" class="drawer-pill-badge">0</span>
+        </button>
+        <button id="drawer-tab-alerts" class="drawer-category-pill" type="button" role="tab" aria-selected="false" data-drawer-filter="alerts">
+          <span>Alerts</span>
+          <span id="drawer-badge-alerts" class="drawer-pill-badge">0</span>
+        </button>
+        <button id="drawer-tab-app" class="drawer-category-pill" type="button" role="tab" aria-selected="false" data-drawer-filter="application">
+          <span>Application</span>
+          <span id="drawer-badge-app" class="drawer-pill-badge">0</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Live Scrollable Stream / List -->
     <div class="drawer-stream-container">
       <div class="drawer-stream-header">
-        <span class="drawer-stream-title">Recent Dispatches</span>
-        <span class="drawer-stream-subtitle">Real-time audit log</span>
+        <span class="drawer-stream-title">Active Notifications</span>
+        <span class="drawer-stream-subtitle">Dismissible system alerts &amp; updates</span>
       </div>
-      <div id="drawer-notification-list" class="drawer-notification-list" role="feed" aria-label="Recent alert dispatches">
+      <div id="drawer-notification-list" class="drawer-notification-list" role="feed" aria-label="Notifications and Alerts">
         <div class="drawer-empty-state">
           <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
-            <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+            <polyline points="20 6 9 17 4 12"></polyline>
           </svg>
-          <p>No notifications dispatched yet</p>
+          <p>All caught up! No active notifications.</p>
         </div>
       </div>
     </div>

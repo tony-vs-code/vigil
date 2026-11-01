@@ -7273,6 +7273,128 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         self.assertIn("security_count", summary_data)
         self.assertIn("reboot_required", summary_data)
 
+    def test_raid_resyncing_status_not_degraded_and_sync_tracking(self):
+        """Verify RAID resyncing is tracked as resyncing (not degraded), progress is extracted, and threshold alerts do not flag it as degraded."""
+        # 1. /proc/mdstat parsing
+        mdstat_content = """Personalities : [raid1]
+md0 : active raid1 sdb1[1] sda1[0]
+      1048576 blocks [2/2] [UU]
+      [====>...............]  resync = 24.5% (256896/1048576) finish=5.2min speed=30234K/sec
+
+unused devices: <none>
+"""
+        with patch("main.Path.exists", return_value=True), patch("main.Path.read_text", return_value=mdstat_content):
+            info = main.get_mdstat_sync_progress("md0")
+            self.assertEqual(info["action"], "resync")
+            self.assertAlmostEqual(info["percent"], 24.5)
+            self.assertEqual(info["completed"], "256896")
+            self.assertEqual(info["total"], "1048576")
+            self.assertEqual(info["eta"], "5.2min")
+
+        # 2. mdadm detail output with State: clean, resyncing should be resyncing (not clean, not degraded)
+        mdadm_resync_output = b"""/dev/md0:
+        Version : 1.2
+        Raid Level : raid1
+        Array Size : 1048576 (1024.00 MiB 1073.74 MB)
+        Raid Devices : 2
+        Total Devices : 2
+        State : clean, resyncing
+        Active Devices : 2
+        Working Devices : 2
+        Failed Devices : 0
+        Spare Devices : 0
+        Consistency Policy : resync
+        Resync Status : 35.8% complete
+"""
+        with (
+            patch.object(main, "resolve_raid_device", return_value="/dev/md0"),
+            patch.object(main, "read_sysfs_raid_state", return_value=None),
+            patch("main.check_output", return_value=mdadm_resync_output),
+        ):
+            status, details = main.check_raid_status()
+            self.assertEqual(status, "resyncing")
+            self.assertIn("Resync Status : 35.8% complete", details)
+
+            data = main.extract_raid_summary_data(status, details, "")
+            self.assertEqual(data["status"], "resyncing")
+            self.assertEqual(data["sync_action"], "resync")
+            self.assertAlmostEqual(data["sync_percent"], 35.8)
+
+        # 3. Sysfs with sync_action=resync even with degraded file present should be resyncing, not degraded
+        sysfs_base = Path(self.temp_dir.name) / "sysfs_resync_test"
+        md_dir = sysfs_base / "md0" / "md"
+        md_dir.mkdir(parents=True, exist_ok=True)
+        (md_dir / "array_state").write_text("clean\n", encoding="utf-8")
+        (md_dir / "degraded").write_text("0\n", encoding="utf-8")
+        (md_dir / "sync_action").write_text("resync\n", encoding="utf-8")
+        (md_dir / "sync_completed").write_text("50000 / 100000\n", encoding="utf-8")
+        (md_dir / "sync_speed").write_text("45000\n", encoding="utf-8")
+
+        with patch("main.Path", side_effect=lambda p: Path(str(p).replace("/sys/block", str(sysfs_base)))):
+            status, details = main.read_sysfs_raid_state("/dev/md0")
+            self.assertEqual(status, "resyncing")
+            self.assertIn("Resync Status : 50.0% complete", details)
+
+            data = main.extract_raid_summary_data(status, details, "")
+            self.assertEqual(data["status"], "resyncing")
+            self.assertAlmostEqual(data["sync_percent"], 50.0)
+
+        # 4. Threshold alerts must NOT trigger 'raid_degraded' alert when status is 'resyncing'
+        t_now = 1700000000.0
+        main.update_notification_center_config({
+            "thresholds": {
+                "enabled": True,
+                "ram_percent": 99.0,
+                "cpu_percent": 99.0,
+                "disk_percent": 99.0,
+                "raid_degraded": True,
+                "cooldown_minutes": 60,
+            },
+        })
+        with (
+            patch.object(main, "check_raid_status", return_value=("resyncing", mdadm_resync_output.decode())),
+            patch.object(main, "send_message", new=AsyncMock(return_value=True)) as mock_send,
+        ):
+            alerts = asyncio.run(main.evaluate_threshold_alerts(now=t_now))
+            raid_alerts = [a for a in alerts if a.get("metric") == "raid_degraded"]
+            self.assertEqual(len(raid_alerts), 0, "Resyncing status must not trigger a degraded RAID alert")
+            self.assertEqual(mock_send.await_count, 0)
+
+        # 5. Threshold alerts MUST trigger 'raid_degraded' when status is truly 'degraded'
+        with (
+            patch.object(main, "check_raid_status", return_value=("degraded", "/dev/sda failed")),
+            patch.object(main, "send_message", new=AsyncMock(return_value=True)) as mock_send,
+        ):
+            alerts = asyncio.run(main.evaluate_threshold_alerts(now=t_now + 10))
+            raid_alerts = [a for a in alerts if a.get("metric") == "raid_degraded"]
+            self.assertEqual(len(raid_alerts), 1, "Truly degraded status must trigger raid_degraded alert")
+
+    def test_audit_subtabs_and_memory_telemetry_contracts(self):
+        """Verify DOM elements and contracts for audit subtabs, memory telemetry, and notification drawer."""
+        # Memory task manager badge & available chip
+        self.assertIn('id="memory-total-badge"', self.index_html)
+        self.assertIn('id="memory-chip-available"', self.index_html)
+        self.assertIn("memory-taskmgr-grid", self.index_html)
+
+        # Audit & Logs subtabs
+        self.assertIn('id="subtab-audit-security-btn"', self.index_html)
+        self.assertIn('id="subtab-audit-alerts-btn"', self.index_html)
+        self.assertIn('id="audit-security-subtab-panel"', self.index_html)
+        self.assertIn('id="audit-alerts-subtab-panel"', self.index_html)
+        self.assertIn('id="btn-goto-alert-logs"', self.index_html)
+
+        # Notification drawer filter pills and dismiss all
+        self.assertIn('id="btn-drawer-dismiss-all"', self.index_html)
+        self.assertIn('id="drawer-tab-all"', self.index_html)
+        self.assertIn('id="drawer-tab-alerts"', self.index_html)
+        self.assertIn('id="drawer-tab-app"', self.index_html)
+
+        # JavaScript wiring
+        self.assertIn("switchAuditSubtab", self.app_js)
+        self.assertIn("btn-drawer-dismiss-all", self.app_js)
+        self.assertIn("memory-chip-available", self.app_js)
+
+
 
 if __name__ == "__main__":
     unittest.main()
