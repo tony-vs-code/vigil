@@ -6002,8 +6002,44 @@ def get_storage_metrics() -> list[dict[str, Any]]:
     return disks
 
 
+def get_netplan_interfaces() -> set[str]:
+    """Discover network interface names defined in Netplan YAML files (Debian/Ubuntu)."""
+    netplan_ifaces: set[str] = set()
+    netplan_dirs = ["/etc/netplan", "/run/netplan", "/lib/netplan"]
+    for np_dir in netplan_dirs:
+        if not os.path.isdir(np_dir):
+            continue
+        try:
+            for fname in os.listdir(np_dir):
+                if fname.endswith((".yaml", ".yml")):
+                    fpath = os.path.join(np_dir, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            content = f.read()
+                            current_section = None
+                            for line in content.splitlines():
+                                stripped = line.strip()
+                                if not stripped or stripped.startswith("#"):
+                                    continue
+                                if stripped in ("ethernets:", "wifis:", "bonds:", "bridges:", "vlans:"):
+                                    current_section = stripped[:-1]
+                                    continue
+                                if current_section and (line.startswith("    ") or line.startswith("\t\t")) and stripped.endswith(":"):
+                                    candidate = stripped[:-1].strip()
+                                    non_iface_keys = ("match", "set-name", "dhcp", "dhcp4", "dhcp6", "addresses", "gateway4", "gateway6", "nameservers", "routes", "parameters")
+                                    if candidate and not any(candidate.startswith(k) for k in non_iface_keys):
+                                        netplan_ifaces.add(candidate)
+                                elif not line.startswith(" ") and not line.startswith("\t"):
+                                    current_section = None
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return netplan_ifaces
+
+
 def get_network_metrics() -> dict[str, Any]:
-    """Collect non-loopback network interface telemetry and total counters via psutil."""
+    """Collect non-loopback network interface telemetry and total counters via psutil and sysfs."""
     io_per_nic: dict[str, Any] = {}
     try:
         if hasattr(psutil, "net_io_counters"):
@@ -6025,6 +6061,7 @@ def get_network_metrics() -> dict[str, Any]:
         except Exception:
             stats = {}
 
+    netplan_ifaces = get_netplan_interfaces()
     nic_names = sorted(set(list(addrs.keys()) + list(io_per_nic.keys()) + list(stats.keys())))
     interfaces: list[dict[str, Any]] = []
 
@@ -6068,11 +6105,51 @@ def get_network_metrics() -> dict[str, Any]:
             packets_sent = int(getattr(io, "packets_sent", 0) or 0) if io else 0
             packets_recv = int(getattr(io, "packets_recv", 0) or 0) if io else 0
 
+        # Classify physical host adapter vs virtual / container interface
+        is_virtual = False
+        is_physical = False
+        adapter_type = "physical"
+
+        virtual_prefixes = ("docker", "veth", "br-", "virbr", "cni", "flannel", "calico", "dummy", "tun", "tap")
+        if nic.startswith(virtual_prefixes):
+            is_virtual = True
+            adapter_type = "docker" if nic.startswith(("docker", "veth", "br-")) else "virtual"
+        else:
+            sysfs_dev = f"/sys/class/net/{nic}/device"
+            sysfs_link = f"/sys/class/net/{nic}"
+            if os.path.exists(sysfs_dev) or nic in netplan_ifaces:
+                is_physical = True
+                if os.path.exists(f"/sys/class/net/{nic}/wireless") or nic.startswith(("wl", "wlan")):
+                    adapter_type = "wifi"
+                elif nic in netplan_ifaces:
+                    adapter_type = "netplan"
+                else:
+                    adapter_type = "physical"
+            elif os.path.islink(sysfs_link):
+                try:
+                    target = os.readlink(sysfs_link)
+                    if "/virtual/" in target:
+                        is_virtual = True
+                        adapter_type = "virtual"
+                    else:
+                        is_physical = True
+                        adapter_type = "physical"
+                except Exception:
+                    is_physical = nic.startswith(("eth", "en", "wl", "ww", "bond", "ib"))
+            else:
+                is_physical = nic.startswith(("eth", "en", "wl", "ww", "bond", "ib"))
+
+        if is_physical:
+            is_virtual = False
+
         interfaces.append(
             {
                 "interface": nic,
                 "ip": primary_ip,
                 "is_up": is_up,
+                "is_physical": is_physical,
+                "is_virtual": is_virtual,
+                "adapter_type": adapter_type,
                 "bytes_sent": bytes_sent,
                 "bytes_recv": bytes_recv,
                 "packets_sent": packets_sent,
@@ -6080,8 +6157,42 @@ def get_network_metrics() -> dict[str, Any]:
             }
         )
 
-    total_bytes_sent = sum(item["bytes_sent"] for item in interfaces)
-    total_bytes_recv = sum(item["bytes_recv"] for item in interfaces)
+    # Sort so real physical/netplan adapters with active IP come first
+    def _iface_priority(item: dict[str, Any]) -> tuple:
+        phys = item.get("is_physical", False)
+        up = item.get("is_up", False)
+        has_ip = bool(item.get("ip"))
+        virt = item.get("is_virtual", False)
+
+        if phys and up and has_ip:
+            rank = 0
+        elif phys and up:
+            rank = 1
+        elif phys and has_ip:
+            rank = 2
+        elif phys:
+            rank = 3
+        elif not virt and up and has_ip:
+            rank = 4
+        elif not virt and up:
+            rank = 5
+        elif not virt:
+            rank = 6
+        elif virt and up and has_ip:
+            rank = 7
+        else:
+            rank = 8
+        return (rank, item["interface"])
+
+    interfaces.sort(key=_iface_priority)
+
+    phys_or_nonvirt = [i for i in interfaces if not i.get("is_virtual", False)]
+    if phys_or_nonvirt:
+        total_bytes_sent = sum(item["bytes_sent"] for item in phys_or_nonvirt)
+        total_bytes_recv = sum(item["bytes_recv"] for item in phys_or_nonvirt)
+    else:
+        total_bytes_sent = sum(item["bytes_sent"] for item in interfaces)
+        total_bytes_recv = sum(item["bytes_recv"] for item in interfaces)
 
     if total_bytes_sent == 0 and total_bytes_recv == 0:
         try:
@@ -6092,9 +6203,14 @@ def get_network_metrics() -> dict[str, Any]:
         except Exception:
             pass
 
+    primary_interface = interfaces[0]["interface"] if interfaces else ""
+    primary_ip = interfaces[0]["ip"] if interfaces else ""
+
     return {
         "total_bytes_sent": total_bytes_sent,
         "total_bytes_recv": total_bytes_recv,
+        "primary_interface": primary_interface,
+        "primary_ip": primary_ip,
         "interfaces": interfaces,
     }
 

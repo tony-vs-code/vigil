@@ -1943,14 +1943,13 @@ hr.overview-flow-divider {
 /* Overview Health Status Ribbon */
 .overview-status-ribbon {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  background: rgba(15, 23, 42, 0.7);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-lg);
-  padding: 14px 20px;
-  margin-bottom: 24px;
+  gap: 10px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin-bottom: 20px;
 }
 
 /* Flat ribbon variant for overview flow layout — no container chrome */
@@ -1959,12 +1958,13 @@ hr.overview-flow-divider {
   border: none;
   border-radius: 0;
   box-shadow: none;
-  padding: 0 0 18px 0;
-  margin-bottom: 24px;
+  padding: 0 0 16px 0;
+  margin-bottom: 20px;
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
+  flex-wrap: wrap;
   align-items: stretch;
-  gap: 16px;
+  gap: 10px;
 }
 
 .overview-ribbon-flat .status-ribbon-item {
@@ -1972,7 +1972,7 @@ hr.overview-flow-divider {
   flex-direction: column;
   align-items: flex-start;
   gap: 4px;
-  flex: 1;
+  flex: 1 1 160px;
   min-width: 0;
 }
 
@@ -1993,19 +1993,23 @@ hr.overview-flow-divider {
 }
 
 .overview-ribbon-flat .status-ribbon-divider {
-  width: 1px;
-  height: auto;
-  align-self: stretch;
-  background: var(--border-subtle);
-  flex-shrink: 0;
+  display: none;
 }
 
 .status-ribbon-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
+  gap: 10px;
+  flex: 1 1 150px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 8px 14px;
+  transition: border-color var(--transition-fast);
+}
+
+.status-ribbon-item:hover {
+  border-color: rgba(56, 189, 248, 0.35);
 }
 
 .status-ribbon-badge-group {
@@ -2023,19 +2027,15 @@ hr.overview-flow-divider {
 }
 
 .status-ribbon-desc {
-  font-size: 0.78rem;
+  font-size: 0.76rem;
   color: var(--text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
+  white-space: normal;
+  overflow: visible;
+  line-height: 1.25;
 }
 
 .status-ribbon-divider {
-  width: 1px;
-  height: 28px;
-  background: var(--border-subtle);
-  flex-shrink: 0;
+  display: none;
 }
 
 .btn-ribbon-nav {
@@ -2083,23 +2083,18 @@ hr.overview-flow-divider {
   align-items: start;
 }
 
-/* Overview flow variant — 2-column balanced flow, no card chrome */
+/* Overview flow variant — Full-width stacked linear flow */
 .metrics-grid.overview-flow-grid {
-  display: grid;
-  grid-template-columns: 1.15fr 1fr;
-  column-gap: 40px;
-  row-gap: 24px;
-  align-items: start;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  width: 100%;
 }
 
-.overview-flow-grid > #cpu-metric-card {
-  grid-column: 1;
-  grid-row: 1 / span 2;
-}
-
-.overview-flow-grid > #memory-metric-card {
-  grid-column: 2;
-  grid-row: 1;
+.overview-flow-grid > #cpu-metric-card,
+.overview-flow-grid > #memory-metric-card,
+.overview-flow-grid > #host-platform-card {
+  width: 100%;
 }
 
 .overview-flow-grid > #storage-metric-card {
@@ -2107,8 +2102,6 @@ hr.overview-flow-divider {
 }
 
 .overview-flow-grid > #host-platform-card {
-  grid-column: 2;
-  grid-row: 2;
   border-top: 1px solid var(--border-subtle);
   padding-top: 20px;
 }
@@ -2117,24 +2110,111 @@ hr.overview-flow-divider {
   display: none;
 }
 
+/* CPU Unified Full-Width Chart & Summary Styling */
+.cpu-summary-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 12px;
+}
+
+.cpu-chart-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 4px 12px;
+  background: rgba(15, 23, 42, 0.4);
+  border-bottom: 1px solid rgba(71, 85, 105, 0.15);
+}
+
+.cpu-chart-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.cpu-chart-hint {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+/* Memory Chunk Cards */
+.memory-chunks-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+  width: 100%;
+}
+
+@media (max-width: 768px) {
+  .memory-chunks-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.memory-chunk {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+
+.memory-chunk:hover {
+  border-color: var(--accent-primary);
+  background: rgba(15, 23, 42, 0.85);
+  transform: translateY(-1px);
+}
+
+.memory-chunk-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.memory-chunk-val {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.memory-chunk-used {
+  border-left: 3px solid #38bdf8;
+}
+
+.memory-chunk-available {
+  border-left: 3px solid #10b981;
+}
+
+.memory-chunk-cached {
+  border-left: 3px solid #a855f7;
+}
+
+.memory-chunk-free {
+  border-left: 3px solid #64748b;
+}
+
 @media (max-width: 1024px) {
   .metrics-grid.overview-flow-grid {
-    grid-template-columns: 1fr;
     row-gap: 28px;
   }
   .overview-flow-grid > #cpu-metric-card {
-    grid-column: 1;
-    grid-row: auto;
     border-bottom: 1px solid var(--border-subtle);
     padding-bottom: 24px;
-  }
-  .overview-flow-grid > #memory-metric-card {
-    grid-column: 1;
-    grid-row: auto;
-  }
-  .overview-flow-grid > #host-platform-card {
-    grid-column: 1;
-    grid-row: auto;
   }
 }
 

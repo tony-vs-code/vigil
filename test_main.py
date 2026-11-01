@@ -2395,8 +2395,8 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertGreater(raid_grid_pos, -1)
         self.assertLess(mounts_pos, raid_grid_pos)
 
-        # Verify Vigil Logs buttons exist
-        self.assertIn('id="btn-topbar-vigil-logs"', html)
+        # Verify Vigil Logs button exists on sidebar nav and is removed from topbar
+        self.assertNotIn('id="btn-topbar-vigil-logs"', html)
         self.assertIn('id="btn-sidebar-vigil-logs"', html)
 
         # Verify overview panel contains the cockpit summary cards and quick navigation buttons
@@ -7121,17 +7121,11 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         self.assertNotIn("overflow-y", grid_content, ".cpu-cores-grid must not have internal scrollbar overflow-y")
         self.assertNotIn("max-height", grid_content, ".cpu-cores-grid must not constrain height with max-height")
 
-        # 8. CSS Invariants: 2-column balanced flow layout and mobile collapse
-        self.assertIn("grid-template-columns: 1.15fr 1fr;", css_text)
+        # 8. CSS Invariants: Full-width stacked linear flow layout
+        self.assertIn(".metrics-grid.overview-flow-grid", css_text)
         self.assertIn(".overview-flow-grid > #cpu-metric-card", css_text)
-        self.assertIn("grid-column: 1;", css_text)
-        self.assertIn("grid-row: 1 / span 2;", css_text)
         self.assertIn(".overview-flow-grid > #memory-metric-card", css_text)
-        self.assertIn("grid-column: 2;", css_text)
-        self.assertIn("grid-row: 1;", css_text)
         self.assertIn(".overview-flow-grid > #host-platform-card", css_text)
-        self.assertIn("grid-column: 2;", css_text)
-        self.assertIn("grid-row: 2;", css_text)
         self.assertIn(".overview-flow-grid > #storage-metric-card", css_text)
         self.assertIn("display: none !important;", css_text)
 
@@ -7211,7 +7205,7 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         self.assertIn('id="notification-drawer-backdrop"', self.index_html)
 
         # Drawer header & controls
-        self.assertIn('id="drawer-notif-count"', self.index_html)
+        self.assertNotIn('id="drawer-notif-count"', self.index_html)
         self.assertIn('id="btn-drawer-refresh-history"', self.index_html)
         self.assertIn('id="btn-close-notification-drawer"', self.index_html)
         self.assertIn('id="btn-drawer-dismiss-all"', self.index_html)
@@ -7405,6 +7399,43 @@ unused devices: <none>
         self.assertIn("switchAuditSubtab", self.app_js)
         self.assertIn("btn-drawer-dismiss-all", self.app_js)
         self.assertIn("memory-chip-available", self.app_js)
+
+    def test_streamlined_layout_network_telemetry_and_groups_preloading(self):
+        """Verify full-width CPU chart, memory chunks, physical network adapter priority, and groups preloading."""
+        # Full width CPU chart at top of CPU card
+        self.assertIn("cpu-unified-chart-container", self.index_html)
+        self.assertIn("cpu-summary-block", self.index_html)
+        cpu_chart_pos = self.index_html.find('class="cpu-unified-chart-container"')
+        cpu_summary_pos = self.index_html.find('class="cpu-summary-block"')
+        cores_grid_pos = self.index_html.find('id="cpu-cores-grid"')
+        self.assertGreater(cpu_chart_pos, -1)
+        self.assertGreater(cpu_summary_pos, -1)
+        self.assertGreater(cores_grid_pos, -1)
+        self.assertLess(cpu_chart_pos, cpu_summary_pos, "Core chart must span top of CPU card before telemetry summary")
+        self.assertLess(cpu_summary_pos, cores_grid_pos, "CPU telemetry summary must come before core grid")
+
+        # Memory chunks grid
+        self.assertIn("memory-chunks-grid", self.index_html)
+        self.assertIn("memory-chunk-used", self.index_html)
+        self.assertIn("memory-chunk-available", self.index_html)
+        self.assertIn("memory-chunk-cached", self.index_html)
+        self.assertIn("memory-chunk-free", self.index_html)
+
+        # Network physical / virtual adapter classification
+        net = main.get_network_metrics()
+        self.assertIn("primary_interface", net)
+        self.assertIn("primary_ip", net)
+        for iface in net["interfaces"]:
+            self.assertIn("is_physical", iface)
+            self.assertIn("is_virtual", iface)
+            self.assertIn("adapter_type", iface)
+
+        # Users & Groups preloading wiring in JS
+        self.assertIn("fetchSystemGroups", self.app_js)
+        users_switch_idx = self.app_js.find("else if (isUsers)")
+        self.assertGreater(users_switch_idx, -1)
+        users_snippet = self.app_js[users_switch_idx:users_switch_idx + 600]
+        self.assertIn("fetchSystemGroups()", users_snippet)
 
 
 
