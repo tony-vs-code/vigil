@@ -119,6 +119,7 @@ async def docker_events_listener(
 
 
 _notifications_task: Optional[asyncio.Task] = None
+_sentinel_probes_task: Optional[asyncio.Task] = None
 
 
 async def notifications_evaluator_loop() -> None:
@@ -138,11 +139,13 @@ async def notifications_evaluator_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _docker_events_task, _notifications_task
+    global _docker_events_task, _notifications_task, _sentinel_probes_task
     if _docker_events_task is None or _docker_events_task.done():
         _docker_events_task = asyncio.create_task(docker_events_listener())
     if _notifications_task is None or _notifications_task.done():
         _notifications_task = asyncio.create_task(notifications_evaluator_loop())
+    if _sentinel_probes_task is None or _sentinel_probes_task.done():
+        _sentinel_probes_task = asyncio.create_task(main.sentinel_probes_worker())
     try:
         yield
     finally:
@@ -156,6 +159,12 @@ async def lifespan(app: FastAPI):
             _notifications_task.cancel()
             try:
                 await _notifications_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if _sentinel_probes_task and not _sentinel_probes_task.done():
+            _sentinel_probes_task.cancel()
+            try:
+                await _sentinel_probes_task
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -1850,6 +1859,229 @@ def api_get_audit_logs(
         )
 
 
+# ============================================================================
+# Vigil Sentinel: Service Uptime & Health Probes Endpoints
+# ============================================================================
+
+
+class ProbeCreateRequest(BaseModel):
+    name: str
+    type: str
+    target: str
+    interval_seconds: Optional[int] = 60
+    timeout_seconds: Optional[int] = 5
+    expected_status: Optional[int] = 200
+    keyword: Optional[str] = ""
+    ssl_check: Optional[bool] = True
+    enabled: Optional[bool] = True
+
+
+class ProbeUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = None
+    target: Optional[str] = None
+    interval_seconds: Optional[int] = None
+    timeout_seconds: Optional[int] = None
+    expected_status: Optional[int] = None
+    keyword: Optional[str] = None
+    ssl_check: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+@app.get("/api/probes")
+def api_get_probes(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    probes = main.get_probes_summary()
+    total = len(probes)
+    up = sum(1 for p in probes if p.get("last_status") == "up")
+    down = sum(1 for p in probes if p.get("last_status") == "down")
+    active_latencies = [
+        p["last_response_time_ms"]
+        for p in probes
+        if p.get("last_status") in ("up", "degraded") and p.get("last_response_time_ms", 0) > 0
+    ]
+    avg_latency = (
+        round(sum(active_latencies) / len(active_latencies), 1)
+        if active_latencies
+        else 0.0
+    )
+
+    return {
+        "probes": probes,
+        "summary": {
+            "total": total,
+            "up": up,
+            "down": down,
+            "avg_latency": avg_latency,
+        },
+    }
+
+
+@app.post("/api/probes")
+async def api_create_probe(
+    payload: ProbeCreateRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Probe name is required.")
+    probe_type = payload.type.strip().lower()
+    if probe_type not in ("http", "tcp", "ping"):
+        raise HTTPException(
+            status_code=400, detail="Probe type must be 'http', 'tcp', or 'ping'."
+        )
+    target = payload.target.strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Probe target is required.")
+
+    interval_sec = max(5, int(payload.interval_seconds or 60))
+    timeout_sec = max(1, min(60, int(payload.timeout_seconds or 5)))
+    expected_status = int(payload.expected_status or 200)
+    keyword = (payload.keyword or "").strip()
+    ssl_check = True if payload.ssl_check is None else bool(payload.ssl_check)
+    enabled = True if payload.enabled is None else bool(payload.enabled)
+
+    probe = main.create_sentinel_probe(
+        name=name,
+        type=probe_type,
+        target=target,
+        interval_seconds=interval_sec,
+        timeout_seconds=timeout_sec,
+        expected_status=expected_status,
+        keyword=keyword,
+        ssl_check=ssl_check,
+        enabled=enabled,
+    )
+    if not probe:
+        raise HTTPException(status_code=500, detail="Failed to create probe.")
+
+    try:
+        initial_result = await main.execute_probe(probe)
+        main.record_probe_check(probe["id"], initial_result)
+    except Exception as exc:
+        logging.warning(f"Initial probe execution encountered error: {exc}")
+
+    main.record_audit_event(
+        "sentinel.probe.create",
+        f"Created sentinel probe '{name}' ({probe_type}: {target})",
+        actor=_user,
+        metadata={"probe_id": probe["id"], "name": name, "type": probe_type, "target": target},
+    )
+
+    enriched = main.get_sentinel_probe_enriched(probe["id"])
+    return enriched or probe
+
+
+@app.get("/api/probes/{probe_id}")
+def api_get_probe(
+    probe_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    probe = main.get_sentinel_probe_enriched(probe_id)
+    if not probe:
+        raise HTTPException(status_code=404, detail="Probe not found")
+    return probe
+
+
+@app.put("/api/probes/{probe_id}")
+def api_update_probe(
+    probe_id: int,
+    payload: ProbeUpdateRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    existing = main.get_sentinel_probe(probe_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Probe not found")
+
+    updates = payload.model_dump(exclude_unset=True)
+    if "type" in updates:
+        t = str(updates["type"]).strip().lower()
+        if t not in ("http", "tcp", "ping"):
+            raise HTTPException(
+                status_code=400, detail="Probe type must be 'http', 'tcp', or 'ping'."
+            )
+        updates["type"] = t
+    if "name" in updates:
+        n = str(updates["name"]).strip()
+        if not n:
+            raise HTTPException(status_code=400, detail="Probe name cannot be empty.")
+        updates["name"] = n
+    if "target" in updates:
+        tgt = str(updates["target"]).strip()
+        if not tgt:
+            raise HTTPException(status_code=400, detail="Probe target cannot be empty.")
+        updates["target"] = tgt
+    if "interval_seconds" in updates and updates["interval_seconds"] is not None:
+        updates["interval_seconds"] = max(5, int(updates["interval_seconds"]))
+    if "timeout_seconds" in updates and updates["timeout_seconds"] is not None:
+        updates["timeout_seconds"] = max(1, min(60, int(updates["timeout_seconds"])))
+
+    updated = main.update_sentinel_probe(probe_id, updates)
+    main.record_audit_event(
+        "sentinel.probe.update",
+        f"Updated sentinel probe '{existing['name']}' (ID: {probe_id})",
+        actor=_user,
+        metadata={"probe_id": probe_id, "updated_fields": list(updates.keys())},
+    )
+    enriched = main.get_sentinel_probe_enriched(probe_id)
+    return enriched or (updated or existing)
+
+
+@app.delete("/api/probes/{probe_id}")
+def api_delete_probe(
+    probe_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    probe = main.get_sentinel_probe(probe_id)
+    if not probe:
+        raise HTTPException(status_code=404, detail="Probe not found")
+
+    main.delete_sentinel_probe(probe_id)
+    main.record_audit_event(
+        "sentinel.probe.delete",
+        f"Deleted sentinel probe '{probe['name']}' (ID: {probe_id})",
+        actor=_user,
+        metadata={"probe_id": probe_id, "name": probe["name"]},
+    )
+    return {"ok": True, "message": f"Probe {probe_id} deleted successfully."}
+
+
+@app.post("/api/probes/{probe_id}/test")
+async def api_test_probe(
+    probe_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    probe = main.get_sentinel_probe(probe_id)
+    if not probe:
+        raise HTTPException(status_code=404, detail="Probe not found")
+
+    result = await main.execute_probe(probe)
+    main.record_probe_check(probe_id, result)
+    return {
+        "ok": result.get("status") in ("up", "degraded"),
+        "result": result,
+    }
+
+
+@app.get("/api/probes/{probe_id}/history")
+def api_get_probe_history(
+    probe_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    probe = main.get_sentinel_probe(probe_id)
+    if not probe:
+        raise HTTPException(status_code=404, detail="Probe not found")
+
+    history = main.get_probe_history(probe_id, limit=limit)
+    return {
+        "probe_id": probe_id,
+        "history": history,
+        "total": len(history),
+    }
+
+
 class CacheControlStaticFiles(StaticFiles):
     def file_response(
         self,
@@ -1881,6 +2113,10 @@ class CacheControlStaticFiles(StaticFiles):
 @app.get("/users/{subpath:path}")
 @app.get("/notifications")
 @app.get("/audit")
+@app.get("/probes")
+@app.get("/probes/{subpath:path}")
+@app.get("/sentinel")
+@app.get("/sentinel/{subpath:path}")
 @app.get("/login")
 @app.get("/logs")
 def serve_index(subpath: Optional[str] = None):

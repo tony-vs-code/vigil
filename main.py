@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import concurrent.futures
 import copy
 import glob
@@ -11,10 +12,12 @@ import platform
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlparse
 import aiohttp
 import discord
 import logging
@@ -354,6 +357,38 @@ def _connect_state_db() -> sqlite3.Connection:
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type ON audit_logs(event_type)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS sentinel_probes ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "type TEXT NOT NULL, "
+        "target TEXT NOT NULL, "
+        "interval_seconds INTEGER NOT NULL DEFAULT 60, "
+        "timeout_seconds INTEGER NOT NULL DEFAULT 5, "
+        "expected_status INTEGER DEFAULT 200, "
+        "keyword TEXT DEFAULT '', "
+        "ssl_check INTEGER NOT NULL DEFAULT 1, "
+        "enabled INTEGER NOT NULL DEFAULT 1, "
+        "created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS sentinel_probe_history ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "probe_id INTEGER NOT NULL, "
+        "timestamp REAL NOT NULL, "
+        "status TEXT NOT NULL, "
+        "response_time_ms REAL NOT NULL, "
+        "http_status INTEGER, "
+        "error_message TEXT DEFAULT '', "
+        "ssl_days_remaining INTEGER)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_probe_history_probe_id ON sentinel_probe_history(probe_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_probe_history_ts ON sentinel_probe_history(timestamp)"
     )
     connection.commit()
     return connection
@@ -6732,6 +6767,874 @@ def manage_group_membership(groupname: str, action: str, username: str) -> dict[
     }
 
 
+
+
+# ============================================================================
+# Vigil Sentinel: Service Uptime & Health Probes Engine
+# ============================================================================
+
+_sentinel_alert_queue: list[dict[str, Any]] = []
+_probe_last_run: dict[int, float] = {}
+
+
+def get_ssl_days_remaining(
+    host: str, port: int = 443, timeout: float = 5.0
+) -> Optional[int]:
+    """Inspect the peer SSL certificate for a host/port and return days until expiration."""
+    clean_host = host.strip("[]")
+    try:
+        context = ssl.create_default_context()
+        try:
+            socket.inet_aton(clean_host)
+            server_hostname = None
+            context.check_hostname = False
+        except OSError:
+            server_hostname = clean_host
+
+        with socket.create_connection((clean_host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=server_hostname) as ssock:
+                cert = ssock.getpeercert()
+                if not cert or "notAfter" not in cert:
+                    return None
+                not_after = cert["notAfter"]
+                try:
+                    expire_date = datetime.strptime(
+                        not_after, "%b %d %H:%M:%S %Y %Z"
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    try:
+                        expire_date = datetime.fromisoformat(not_after)
+                        if expire_date.tzinfo is None:
+                            expire_date = expire_date.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        return None
+
+                remaining_sec = (expire_date - datetime.now(timezone.utc)).total_seconds()
+                return max(0, int(remaining_sec / 86400.0))
+    except ssl.SSLCertVerificationError as exc:
+        if "expired" in str(exc).lower():
+            return 0
+        logging.debug(f"SSL certificate verification failed for {host}:{port}: {exc}")
+        return None
+    except Exception as exc:
+        logging.debug(f"SSL check error for {host}:{port}: {exc}")
+        return None
+
+
+async def _execute_http_probe(
+    probe: dict[str, Any], target: str, timeout_sec: float
+) -> dict[str, Any]:
+    url = target
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+
+    expected_status = int(probe.get("expected_status") or 200)
+    keyword = str(probe.get("keyword") or "").strip()
+    ssl_check_enabled = bool(probe.get("ssl_check", 1))
+
+    ssl_days_remaining: Optional[int] = None
+    if url.startswith("https://") and ssl_check_enabled:
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            port = parsed.port or 443
+            if host:
+                ssl_days_remaining = await asyncio.to_thread(
+                    get_ssl_days_remaining, host, port, min(timeout_sec, 5.0)
+                )
+        except Exception as exc:
+            logging.debug(f"Failed to check SSL cert for {url}: {exc}")
+
+    client_timeout = aiohttp.ClientTimeout(total=timeout_sec, connect=min(timeout_sec, 5.0))
+    t0 = time.perf_counter()
+    try:
+        async with aiohttp.ClientSession(timeout=client_timeout) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                raw_body = await resp.content.read(512 * 1024)
+                text = raw_body.decode("utf-8", errors="replace")
+                latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                http_status = resp.status
+
+                if http_status != expected_status:
+                    return {
+                        "status": "down",
+                        "response_time_ms": latency_ms,
+                        "http_status": http_status,
+                        "error_message": f"Expected HTTP {expected_status}, received {http_status}",
+                        "ssl_days_remaining": ssl_days_remaining,
+                    }
+
+                if keyword and keyword not in text:
+                    return {
+                        "status": "down",
+                        "response_time_ms": latency_ms,
+                        "http_status": http_status,
+                        "error_message": f"Keyword '{keyword}' not found in response body",
+                        "ssl_days_remaining": ssl_days_remaining,
+                    }
+
+                status = "up"
+                error_msg = ""
+                if ssl_days_remaining is not None and ssl_days_remaining <= 14:
+                    status = "degraded"
+                    error_msg = f"SSL certificate expires in {ssl_days_remaining} day(s)"
+                elif latency_ms > (timeout_sec * 1000 * 0.75):
+                    status = "degraded"
+                    error_msg = f"High latency ({latency_ms:.1f}ms)"
+
+                return {
+                    "status": status,
+                    "response_time_ms": latency_ms,
+                    "http_status": http_status,
+                    "error_message": error_msg,
+                    "ssl_days_remaining": ssl_days_remaining,
+                }
+    except asyncio.TimeoutError:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "status": "down",
+            "response_time_ms": max(latency_ms, timeout_sec * 1000.0),
+            "http_status": None,
+            "error_message": f"Request timed out after {timeout_sec}s",
+            "ssl_days_remaining": ssl_days_remaining,
+        }
+    except aiohttp.ClientConnectorCertificateError as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "status": "down",
+            "response_time_ms": latency_ms,
+            "http_status": None,
+            "error_message": f"SSL certificate error: {exc}",
+            "ssl_days_remaining": 0,
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "status": "down",
+            "response_time_ms": latency_ms,
+            "http_status": None,
+            "error_message": str(exc),
+            "ssl_days_remaining": ssl_days_remaining,
+        }
+
+
+async def _execute_tcp_probe(
+    probe: dict[str, Any], target: str, timeout_sec: float
+) -> dict[str, Any]:
+    try:
+        clean_target = target.strip()
+        if clean_target.startswith("[") and "]:" in clean_target:
+            host_part, port_part = clean_target.split("]:", 1)
+            host = host_part.lstrip("[")
+            port = int(port_part)
+        elif ":" in clean_target:
+            host, port_str = clean_target.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            return {
+                "status": "down",
+                "response_time_ms": 0.0,
+                "http_status": None,
+                "error_message": "Invalid TCP target: host:port format required",
+                "ssl_days_remaining": None,
+            }
+    except ValueError as exc:
+        return {
+            "status": "down",
+            "response_time_ms": 0.0,
+            "http_status": None,
+            "error_message": f"Invalid TCP port: {exc}",
+            "ssl_days_remaining": None,
+        }
+
+    t0 = time.perf_counter()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout_sec,
+        )
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        close_res = writer.close()
+        if asyncio.iscoroutine(close_res):
+            await close_res
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        status = "degraded" if latency_ms > (timeout_sec * 1000 * 0.75) else "up"
+        error_msg = f"High latency ({latency_ms:.1f}ms)" if status == "degraded" else ""
+        return {
+            "status": status,
+            "response_time_ms": latency_ms,
+            "http_status": None,
+            "error_message": error_msg,
+            "ssl_days_remaining": None,
+        }
+    except asyncio.TimeoutError:
+        return {
+            "status": "down",
+            "response_time_ms": timeout_sec * 1000.0,
+            "http_status": None,
+            "error_message": f"TCP connection timed out after {timeout_sec}s",
+            "ssl_days_remaining": None,
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "status": "down",
+            "response_time_ms": latency_ms,
+            "http_status": None,
+            "error_message": str(exc),
+            "ssl_days_remaining": None,
+        }
+
+
+async def _execute_ping_probe(
+    probe: dict[str, Any], target: str, timeout_sec: float
+) -> dict[str, Any]:
+    clean = re.sub(r"^https?://", "", target.strip())
+    clean = clean.split("/")[0].split(":")[0].strip()
+    if not clean:
+        return {
+            "status": "down",
+            "response_time_ms": 0.0,
+            "http_status": None,
+            "error_message": "Invalid ping target address",
+            "ssl_days_remaining": None,
+        }
+
+    ping_timeout_int = max(1, int(round(timeout_sec)))
+    t0 = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            str(ping_timeout_int),
+            clean,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_sec + 2.0,
+        )
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        out_text = stdout.decode("utf-8", errors="replace")
+        if proc.returncode == 0:
+            match = re.search(r"time[=<]([0-9.]+)\s*ms", out_text)
+            if match:
+                try:
+                    latency_ms = float(match.group(1))
+                except ValueError:
+                    pass
+            status = "degraded" if latency_ms > (timeout_sec * 1000 * 0.75) else "up"
+            error_msg = f"High latency ({latency_ms:.1f}ms)" if status == "degraded" else ""
+            return {
+                "status": status,
+                "response_time_ms": latency_ms,
+                "http_status": None,
+                "error_message": error_msg,
+                "ssl_days_remaining": None,
+            }
+        else:
+            err = stderr.decode("utf-8", errors="replace").strip() or out_text.strip() or f"Ping failed with exit code {proc.returncode}"
+            return {
+                "status": "down",
+                "response_time_ms": latency_ms,
+                "http_status": None,
+                "error_message": err[:200],
+                "ssl_days_remaining": None,
+            }
+    except (FileNotFoundError, PermissionError):
+        try:
+            t_sock = time.perf_counter()
+            await asyncio.to_thread(socket.gethostbyname, clean)
+            latency_ms = round((time.perf_counter() - t_sock) * 1000.0, 2)
+            return {
+                "status": "up",
+                "response_time_ms": latency_ms,
+                "http_status": None,
+                "error_message": "",
+                "ssl_days_remaining": None,
+            }
+        except Exception as exc:
+            return {
+                "status": "down",
+                "response_time_ms": 0.0,
+                "http_status": None,
+                "error_message": f"Ping unavailable and host resolution failed: {exc}",
+                "ssl_days_remaining": None,
+            }
+    except asyncio.TimeoutError:
+        return {
+            "status": "down",
+            "response_time_ms": timeout_sec * 1000.0,
+            "http_status": None,
+            "error_message": f"Ping timed out after {timeout_sec}s",
+            "ssl_days_remaining": None,
+        }
+    except Exception as exc:
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        return {
+            "status": "down",
+            "response_time_ms": latency_ms,
+            "http_status": None,
+            "error_message": str(exc),
+            "ssl_days_remaining": None,
+        }
+
+
+async def execute_probe(probe: dict[str, Any]) -> dict[str, Any]:
+    """Execute a single health check probe (HTTP/S, TCP, or Ping) and return standardized metrics."""
+    probe_type = str(probe.get("type", "http")).lower().strip()
+    target = str(probe.get("target", "")).strip()
+    timeout_sec = float(probe.get("timeout_seconds") or 5)
+    timeout_sec = max(0.5, timeout_sec)
+
+    if probe_type == "http":
+        return await _execute_http_probe(probe, target, timeout_sec)
+    elif probe_type == "tcp":
+        return await _execute_tcp_probe(probe, target, timeout_sec)
+    elif probe_type == "ping":
+        return await _execute_ping_probe(probe, target, timeout_sec)
+    else:
+        return {
+            "status": "down",
+            "response_time_ms": 0.0,
+            "http_status": None,
+            "error_message": f"Unsupported probe type: '{probe_type}'",
+            "ssl_days_remaining": None,
+        }
+
+
+def queue_sentinel_alert(
+    probe: dict[str, Any], old_status: str, new_status: str, result: dict[str, Any]
+) -> None:
+    """Queue a notification alert and schedule delivery if event loop is running."""
+    alert_item = {
+        "probe": probe,
+        "old_status": old_status,
+        "new_status": new_status,
+        "result": result,
+        "timestamp": time.time(),
+    }
+    _sentinel_alert_queue.append(alert_item)
+    try:
+        record_notification(
+            f"sentinel_{probe.get('name', 'probe')}_{new_status}",
+            time.time(),
+            weekly=False,
+        )
+    except Exception as exc:
+        logging.debug(f"Failed to record notification history for sentinel probe alert: {exc}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        if loop and loop.is_running():
+            loop.create_task(dispatch_sentinel_alert(alert_item))
+    except RuntimeError:
+        pass
+
+
+async def dispatch_sentinel_alert(alert_item: dict[str, Any]) -> None:
+    """Dispatch a sentinel probe status transition alert via NotificationManager."""
+    probe = alert_item.get("probe", {})
+    new_status = alert_item.get("new_status", "unknown")
+    result = alert_item.get("result", {})
+    name = probe.get("name", "Unknown Probe")
+    target = probe.get("target", "")
+    probe_type = str(probe.get("type", "")).upper()
+    err = result.get("error_message") or ""
+    latency = float(result.get("response_time_ms", 0.0))
+
+    is_down = new_status == "down"
+    title = f"🚨 Sentinel Alert: {name} is DOWN" if is_down else f"✅ Sentinel Resolved: {name} is UP"
+    message = (
+        f"Probe '{name}' ({probe_type} {target}) is DOWN.\nError: {err}"
+        if is_down
+        else f"Probe '{name}' ({probe_type} {target}) has recovered to UP.\nLatency: {latency:.1f}ms"
+    )
+
+    embed = {
+        "title": title,
+        "description": message,
+        "color": 0xE74C3C if is_down else 0x2ECC71,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "fields": [
+            {"name": "Probe Name", "value": name, "inline": True},
+            {"name": "Type", "value": probe_type, "inline": True},
+            {"name": "Status", "value": new_status.upper(), "inline": True},
+            {"name": "Target", "value": target, "inline": False},
+        ],
+    }
+    if is_down and err:
+        embed["fields"].append({"name": "Error", "value": str(err)[:250], "inline": False})
+    if latency > 0:
+        embed["fields"].append({"name": "Latency", "value": f"{latency:.1f} ms", "inline": True})
+
+    try:
+        mgr = NotificationManager()
+        await mgr.send_all(title, message, embed)
+    except Exception as exc:
+        logging.debug(f"Error dispatching sentinel alert notification: {exc}")
+
+
+def record_probe_check(probe_id: int, result: dict[str, Any]) -> None:
+    """Insert a probe check result into sentinel_probe_history, prune older records,
+    and trigger audit log and alert notifications on status transitions.
+    """
+    ts = time.time()
+    new_status = str(result.get("status", "down")).lower()
+    response_time_ms = float(result.get("response_time_ms", 0.0))
+    http_status = result.get("http_status")
+    error_message = str(result.get("error_message", ""))
+    ssl_days_remaining = result.get("ssl_days_remaining")
+
+    conn = _connect_state_db()
+    prev_status: Optional[str] = None
+    probe_info: Optional[dict[str, Any]] = None
+    try:
+        p_row = conn.execute(
+            "SELECT id, name, type, target FROM sentinel_probes WHERE id = ?",
+            (probe_id,),
+        ).fetchone()
+        if p_row:
+            probe_info = {
+                "id": p_row[0],
+                "name": p_row[1],
+                "type": p_row[2],
+                "target": p_row[3],
+            }
+
+        h_row = conn.execute(
+            "SELECT status FROM sentinel_probe_history WHERE probe_id = ? ORDER BY timestamp DESC, id DESC LIMIT 1",
+            (probe_id,),
+        ).fetchone()
+        if h_row:
+            prev_status = str(h_row[0]).lower()
+
+        conn.execute(
+            """
+            INSERT INTO sentinel_probe_history
+            (probe_id, timestamp, status, response_time_ms, http_status, error_message, ssl_days_remaining)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                probe_id,
+                ts,
+                new_status,
+                response_time_ms,
+                http_status,
+                error_message,
+                ssl_days_remaining,
+            ),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM sentinel_probe_history
+            WHERE probe_id = ? AND id NOT IN (
+                SELECT id FROM sentinel_probe_history
+                WHERE probe_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 200
+            )
+            """,
+            (probe_id, probe_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if prev_status is not None and probe_info is not None:
+        p_name = probe_info.get("name", f"Probe #{probe_id}")
+        target = probe_info.get("target", "")
+
+        # UP -> DOWN transition
+        if prev_status in ("up", "degraded") and new_status == "down":
+            desc = f"Sentinel probe '{p_name}' ({target}) transitioned from {prev_status.upper()} to DOWN: {error_message or 'Check failed'}"
+            record_audit_event(
+                "sentinel.probe.down",
+                desc,
+                actor="sentinel",
+                severity="warning",
+                metadata={"probe_id": probe_id, "prev_status": prev_status, "new_status": new_status, "target": target},
+            )
+            queue_sentinel_alert(probe_info, prev_status, new_status, result)
+
+        # DOWN -> UP transition
+        elif prev_status == "down" and new_status in ("up", "degraded"):
+            desc = f"Sentinel probe '{p_name}' ({target}) recovered: transitioned from DOWN to {new_status.upper()} (latency: {response_time_ms:.1f}ms)"
+            record_audit_event(
+                "sentinel.probe.up",
+                desc,
+                actor="sentinel",
+                severity="info",
+                metadata={"probe_id": probe_id, "prev_status": prev_status, "new_status": new_status, "target": target},
+            )
+            queue_sentinel_alert(probe_info, prev_status, new_status, result)
+
+
+def create_sentinel_probe(
+    name: str,
+    type: str,
+    target: str,
+    interval_seconds: int = 60,
+    timeout_seconds: int = 5,
+    expected_status: int = 200,
+    keyword: str = "",
+    ssl_check: bool = True,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    now = time.time()
+    conn = _connect_state_db()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO sentinel_probes
+            (name, type, target, interval_seconds, timeout_seconds, expected_status, keyword, ssl_check, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name.strip(),
+                type.strip().lower(),
+                target.strip(),
+                max(5, int(interval_seconds)),
+                max(1, int(timeout_seconds)),
+                int(expected_status),
+                (keyword or "").strip(),
+                1 if ssl_check else 0,
+                1 if enabled else 0,
+                now,
+                now,
+            ),
+        )
+        probe_id = cur.lastrowid
+        conn.commit()
+    finally:
+        conn.close()
+    return get_sentinel_probe(probe_id) or {}
+
+
+def get_sentinel_probe(probe_id: int) -> Optional[dict[str, Any]]:
+    conn = _connect_state_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, name, type, target, interval_seconds, timeout_seconds,
+                   expected_status, keyword, ssl_check, enabled, created_at, updated_at
+            FROM sentinel_probes
+            WHERE id = ?
+            """,
+            (probe_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "name": row[1],
+            "type": row[2],
+            "target": row[3],
+            "interval_seconds": row[4],
+            "timeout_seconds": row[5],
+            "expected_status": row[6],
+            "keyword": row[7],
+            "ssl_check": bool(row[8]),
+            "enabled": bool(row[9]),
+            "created_at": row[10],
+            "updated_at": row[11],
+        }
+    finally:
+        conn.close()
+
+
+def get_all_sentinel_probes(enabled_only: bool = False) -> list[dict[str, Any]]:
+    conn = _connect_state_db()
+    try:
+        sql = """
+            SELECT id, name, type, target, interval_seconds, timeout_seconds,
+                   expected_status, keyword, ssl_check, enabled, created_at, updated_at
+            FROM sentinel_probes
+        """
+        if enabled_only:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY id ASC"
+        rows = conn.execute(sql).fetchall()
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "type": row[2],
+                "target": row[3],
+                "interval_seconds": row[4],
+                "timeout_seconds": row[5],
+                "expected_status": row[6],
+                "keyword": row[7],
+                "ssl_check": bool(row[8]),
+                "enabled": bool(row[9]),
+                "created_at": row[10],
+                "updated_at": row[11],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def update_sentinel_probe(probe_id: int, updates: dict[str, Any]) -> Optional[dict[str, Any]]:
+    existing = get_sentinel_probe(probe_id)
+    if not existing:
+        return None
+
+    allowed_fields = {
+        "name", "type", "target", "interval_seconds", "timeout_seconds",
+        "expected_status", "keyword", "ssl_check", "enabled"
+    }
+    set_clauses: list[str] = []
+    params: list[Any] = []
+
+    for k, v in updates.items():
+        if k in allowed_fields and v is not None:
+            if k in ("ssl_check", "enabled"):
+                val = 1 if bool(v) else 0
+            elif k in ("interval_seconds", "timeout_seconds", "expected_status"):
+                val = int(v)
+            else:
+                val = str(v).strip()
+            set_clauses.append(f"{k} = ?")
+            params.append(val)
+
+    if not set_clauses:
+        return existing
+
+    set_clauses.append("updated_at = ?")
+    params.append(time.time())
+    params.append(probe_id)
+
+    conn = _connect_state_db()
+    try:
+        conn.execute(
+            f"UPDATE sentinel_probes SET {', '.join(set_clauses)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return get_sentinel_probe(probe_id)
+
+
+def delete_sentinel_probe(probe_id: int) -> bool:
+    conn = _connect_state_db()
+    try:
+        conn.execute("DELETE FROM sentinel_probes WHERE id = ?", (probe_id,))
+        conn.execute("DELETE FROM sentinel_probe_history WHERE probe_id = ?", (probe_id,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_probe_history(probe_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 200))
+    conn = _connect_state_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, probe_id, timestamp, status, response_time_ms, http_status, error_message, ssl_days_remaining
+            FROM sentinel_probe_history
+            WHERE probe_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ?
+            """,
+            (probe_id, limit),
+        ).fetchall()
+        return [
+            {
+                "id": r[0],
+                "probe_id": r[1],
+                "timestamp": r[2],
+                "status": r[3],
+                "response_time_ms": r[4],
+                "http_status": r[5],
+                "error_message": r[6],
+                "ssl_days_remaining": r[7],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def get_probes_summary() -> list[dict[str, Any]]:
+    """Return all configured sentinel probes enriched with:
+    - last_status: 'up' | 'down' | 'degraded' | 'pending'
+    - last_response_time_ms: float
+    - last_checked_at: float
+    - uptime_24h_percent: float (e.g. 99.8)
+    - ssl_days_remaining: Optional[int]
+    - recent_checks: list of last 20 check statuses (for heartbeat bar)
+    - avg_response_time_ms: float
+    """
+    probes = get_all_sentinel_probes()
+    if not probes:
+        return []
+
+    cutoff_24h = time.time() - 86400
+    conn = _connect_state_db()
+    enriched_list: list[dict[str, Any]] = []
+    try:
+        for probe in probes:
+            probe_id = probe["id"]
+
+            rows_20 = conn.execute(
+                """
+                SELECT status, response_time_ms, timestamp, ssl_days_remaining
+                FROM sentinel_probe_history
+                WHERE probe_id = ?
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 20
+                """,
+                (probe_id,),
+            ).fetchall()
+
+            if rows_20:
+                last_status = rows_20[0][0]
+                last_response_time_ms = round(float(rows_20[0][1]), 2)
+                last_checked_at = float(rows_20[0][2])
+                ssl_days_remaining = rows_20[0][3]
+                recent_checks = [r[0] for r in reversed(rows_20)]
+            else:
+                last_status = "pending"
+                last_response_time_ms = 0.0
+                last_checked_at = 0.0
+                ssl_days_remaining = None
+                recent_checks = []
+
+            rows_24h = conn.execute(
+                """
+                SELECT status, response_time_ms
+                FROM sentinel_probe_history
+                WHERE probe_id = ? AND timestamp >= ?
+                """,
+                (probe_id, cutoff_24h),
+            ).fetchall()
+
+            if rows_24h:
+                total_24h = len(rows_24h)
+                up_24h = sum(1 for r in rows_24h if r[0] in ("up", "degraded"))
+                uptime_24h_percent = round((up_24h / total_24h) * 100.0, 1)
+                latencies_24h = [float(r[1]) for r in rows_24h]
+                avg_response_time_ms = round(sum(latencies_24h) / total_24h, 1)
+            elif rows_20:
+                total_all = len(rows_20)
+                up_all = sum(1 for r in rows_20 if r[0] in ("up", "degraded"))
+                uptime_24h_percent = round((up_all / total_all) * 100.0, 1)
+                latencies_all = [float(r[1]) for r in rows_20]
+                avg_response_time_ms = round(sum(latencies_all) / total_all, 1)
+            else:
+                uptime_24h_percent = 100.0
+                avg_response_time_ms = 0.0
+
+            probe_copy = copy.deepcopy(probe)
+            probe_copy.update({
+                "last_status": last_status,
+                "last_response_time_ms": last_response_time_ms,
+                "last_checked_at": last_checked_at,
+                "uptime_24h_percent": uptime_24h_percent,
+                "ssl_days_remaining": ssl_days_remaining,
+                "recent_checks": recent_checks,
+                "avg_response_time_ms": avg_response_time_ms,
+            })
+            enriched_list.append(probe_copy)
+    finally:
+        conn.close()
+
+    return enriched_list
+
+
+def get_sentinel_probe_enriched(probe_id: int) -> Optional[dict[str, Any]]:
+    """Retrieve a single sentinel probe enriched with its summary metrics."""
+    summary = get_probes_summary()
+    for p in summary:
+        if p["id"] == probe_id:
+            return p
+    probe = get_sentinel_probe(probe_id)
+    if not probe:
+        return None
+    probe_copy = copy.deepcopy(probe)
+    probe_copy.update({
+        "last_status": "pending",
+        "last_response_time_ms": 0.0,
+        "last_checked_at": 0.0,
+        "uptime_24h_percent": 100.0,
+        "ssl_days_remaining": None,
+        "recent_checks": [],
+        "avg_response_time_ms": 0.0,
+    })
+    return probe_copy
+
+
+async def run_single_probe_check(probe: dict[str, Any]) -> dict[str, Any]:
+    """Execute a single probe check and record its result."""
+    try:
+        result = await execute_probe(probe)
+    except Exception as exc:
+        logging.error(f"Error executing probe {probe.get('id')}: {exc}")
+        result = {
+            "status": "down",
+            "response_time_ms": 0.0,
+            "http_status": None,
+            "error_message": str(exc),
+            "ssl_days_remaining": None,
+        }
+    record_probe_check(probe["id"], result)
+    return result
+
+
+async def sentinel_probes_worker(sleep_interval: float = 1.0) -> None:
+    """Background worker that continuously executes enabled sentinel probes at their configured intervals."""
+    while True:
+        try:
+            now = time.time()
+            probes = get_all_sentinel_probes(enabled_only=True)
+            tasks_to_run = []
+
+            for probe in probes:
+                probe_id = probe["id"]
+                interval = max(5, int(probe.get("interval_seconds") or 60))
+                last_run = _probe_last_run.get(probe_id)
+                if last_run is None:
+                    conn = _connect_state_db()
+                    try:
+                        row = conn.execute(
+                            "SELECT MAX(timestamp) FROM sentinel_probe_history WHERE probe_id = ?",
+                            (probe_id,),
+                        ).fetchone()
+                        last_run = float(row[0]) if (row and row[0] is not None) else 0.0
+                    finally:
+                        conn.close()
+                    _probe_last_run[probe_id] = last_run
+
+                if (now - last_run) >= interval:
+                    _probe_last_run[probe_id] = now
+                    tasks_to_run.append(run_single_probe_check(probe))
+
+            if tasks_to_run:
+                await asyncio.gather(*tasks_to_run, return_exceptions=True)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logging.error(f"Error in sentinel_probes_worker: {exc}")
+
+        try:
+            await asyncio.sleep(sleep_interval)
+        except asyncio.CancelledError:
+            break
 
 
 @client.event
