@@ -8135,5 +8135,561 @@ class TestVigilSentinelProbes(unittest.TestCase):
             self.assertEqual(res_ping["status"], "down")
 
 
+class TestHardwareTelemetryAndSmartCollector(unittest.TestCase):
+    """Test suite for S.M.A.R.T. disk telemetry, hardware thermal sensors, and early-warning alerts."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_hardware.sqlite3"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+
+        main.create_user("hwadmin", "hwpass", email="hwadmin@example.com")
+        self.session_token = main.create_session("hwadmin")
+        self.auth_cookies = {"session_token": self.session_token}
+        main.clear_smart_cache()
+
+    def tearDown(self):
+        main.clear_smart_cache()
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_parse_smartctl_json_sata_drive(self):
+        raw = {
+            "json_format_version": [1, 0],
+            "device": {"name": "/dev/sda", "info_name": "/dev/sda", "type": "ata", "protocol": "ATA"},
+            "model_name": "Crucial CT1000MX500SSD1",
+            "serial_number": "2045E4D12345",
+            "firmware_version": "M3CR033",
+            "smart_status": {"passed": True},
+            "power_on_time": {"hours": 14220},
+            "temperature": {"current": 33},
+            "ata_smart_attributes": {
+                "revision": 16,
+                "table": [
+                    {"id": 5, "name": "Reallocated_Sector_Ct", "raw": {"value": 0, "string": "0"}},
+                    {"id": 9, "name": "Power_On_Hours", "raw": {"value": 14220, "string": "14220"}},
+                    {"id": 194, "name": "Temperature_Celsius", "raw": {"value": 33, "string": "33"}},
+                    {"id": 202, "name": "Percent_Lifetime_Remain", "raw": {"value": 96, "string": "96"}},
+                ],
+            },
+        }
+        res = main.parse_smartctl_json(raw, "/dev/sda")
+        self.assertEqual(res["device"], "/dev/sda")
+        self.assertEqual(res["model"], "Crucial CT1000MX500SSD1")
+        self.assertEqual(res["serial_number"], "2045E4D12345")
+        self.assertEqual(res["firmware_version"], "M3CR033")
+        self.assertIs(res["passed"], True)
+        self.assertEqual(res["temperature_c"], 33)
+        self.assertEqual(res["power_on_hours"], 14220)
+        self.assertEqual(res["reallocated_sectors"], 0)
+        self.assertEqual(res["media_errors"], 0)
+        self.assertEqual(res["wear_level_percent"], 4)  # 100 - 96% lifetime remain
+        self.assertEqual(res["device_type"], "ssd")
+        self.assertEqual(res["status"], "passed")
+        self.assertIsInstance(res["raw_json"], dict)
+
+    def test_parse_smartctl_json_nvme_drive(self):
+        raw = {
+            "json_format_version": [1, 0],
+            "device": {"name": "/dev/nvme0n1", "info_name": "/dev/nvme0n1", "type": "nvme", "protocol": "NVMe"},
+            "model_name": "Samsung SSD 970 EVO Plus 1TB",
+            "serial_number": "S4EVNF0M123456",
+            "firmware_version": "2B2QEXM7",
+            "smart_status": {"passed": True},
+            "nvme_smart_health_information_log": {
+                "critical_warning": 0,
+                "temperature": 41,
+                "percentage_used": 5,
+                "power_on_hours": 9520,
+                "media_errors": 0,
+            },
+            "temperature": {"current": 41},
+            "power_on_time": {"hours": 9520},
+        }
+        res = main.parse_smartctl_json(raw, "/dev/nvme0n1")
+        self.assertEqual(res["device"], "/dev/nvme0n1")
+        self.assertEqual(res["model"], "Samsung SSD 970 EVO Plus 1TB")
+        self.assertEqual(res["serial_number"], "S4EVNF0M123456")
+        self.assertEqual(res["firmware_version"], "2B2QEXM7")
+        self.assertIs(res["passed"], True)
+        self.assertEqual(res["temperature_c"], 41)
+        self.assertEqual(res["power_on_hours"], 9520)
+        self.assertEqual(res["wear_level_percent"], 5)
+        self.assertEqual(res["media_errors"], 0)
+        self.assertEqual(res["reallocated_sectors"], 0)
+        self.assertEqual(res["device_type"], "nvme")
+        self.assertEqual(res["status"], "passed")
+
+    def test_parse_smartctl_json_failing_hdd(self):
+        raw = {
+            "json_format_version": [1, 0],
+            "device": {"name": "/dev/sdb", "info_name": "/dev/sdb", "type": "ata", "protocol": "ATA"},
+            "model_name": "WDC WD40EFRX-68N32N0",
+            "serial_number": "WD-WCC7K1234567",
+            "firmware_version": "82.00A82",
+            "smart_status": {"passed": False},
+            "power_on_time": {"hours": 28500},
+            "temperature": {"current": 58},
+            "ata_smart_attributes": {
+                "revision": 16,
+                "table": [
+                    {"id": 5, "name": "Reallocated_Sector_Ct", "raw": {"value": 145, "string": "145"}},
+                    {"id": 187, "name": "Reported_Uncorrect", "raw": {"value": 12, "string": "12"}},
+                    {"id": 194, "name": "Temperature_Celsius", "raw": {"value": 58, "string": "58"}},
+                ],
+            },
+        }
+        res = main.parse_smartctl_json(raw, "/dev/sdb")
+        self.assertIs(res["passed"], False)
+        self.assertEqual(res["temperature_c"], 58)
+        self.assertEqual(res["reallocated_sectors"], 145)
+        self.assertEqual(res["media_errors"], 12)
+        self.assertEqual(res["device_type"], "hdd")
+        self.assertEqual(res["status"], "failed")
+
+    def test_get_disk_smart_metrics_caching_and_force_refresh(self):
+        mock_proc_1 = MagicMock(
+            stdout=json.dumps({
+                "device": {"name": "/dev/sda"},
+                "model_name": "Drive One",
+                "serial_number": "S1",
+                "smart_status": {"passed": True},
+                "temperature": {"current": 32},
+            }),
+            stderr="",
+            returncode=0,
+        )
+        mock_proc_2 = MagicMock(
+            stdout=json.dumps({
+                "device": {"name": "/dev/sda"},
+                "model_name": "Drive One",
+                "serial_number": "S1",
+                "smart_status": {"passed": True},
+                "temperature": {"current": 37},
+            }),
+            stderr="",
+            returncode=0,
+        )
+
+        with patch("subprocess.run", return_value=mock_proc_1) as mock_run:
+            res1 = main.get_disk_smart_metrics("/dev/sda")
+            self.assertEqual(res1["temperature_c"], 32)
+            self.assertEqual(mock_run.call_count, 1)
+
+            # Second call within 60s should return cached result without calling subprocess
+            mock_run.return_value = mock_proc_2
+            res2 = main.get_disk_smart_metrics("/dev/sda")
+            self.assertEqual(res2["temperature_c"], 32)
+            self.assertEqual(mock_run.call_count, 1)
+
+            # Force refresh should bypass cache and call subprocess
+            res3 = main.get_disk_smart_metrics("/dev/sda", force_refresh=True)
+            self.assertEqual(res3["temperature_c"], 37)
+            self.assertEqual(mock_run.call_count, 2)
+
+    def test_get_disk_smart_metrics_fallback_on_missing_smartctl_or_error(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError("No smartctl")):
+            res = main.get_disk_smart_metrics("/dev/sdz")
+            self.assertEqual(res["device"], "/dev/sdz")
+            self.assertEqual(res["model"], "Unknown")
+            self.assertIs(res["passed"], True)
+            self.assertIsNone(res["temperature_c"])
+            self.assertIsNone(res["raw_json"])
+            self.assertIn(res["status"], ("unavailable", "error"))
+
+    def test_discover_physical_disks_sysfs(self):
+        fake_entries = [
+            Path("/sys/block/sda"),
+            Path("/sys/block/sdb"),
+            Path("/sys/block/nvme0n1"),
+            Path("/sys/block/loop0"),
+            Path("/sys/block/dm-0"),
+            Path("/sys/block/md0"),
+        ]
+        with (
+            patch("main.Path.is_dir", return_value=True),
+            patch("main.Path.iterdir", return_value=fake_entries),
+            patch("main.Path.exists", return_value=False),  # no 'partition' file
+        ):
+            disks = main.discover_physical_disks(force_refresh=True)
+            self.assertIn("/dev/sda", disks)
+            self.assertIn("/dev/sdb", disks)
+            self.assertIn("/dev/nvme0n1", disks)
+            self.assertNotIn("/dev/loop0", disks)
+            self.assertNotIn("/dev/dm-0", disks)
+            self.assertNotIn("/dev/md0", disks)
+
+    def test_get_hardware_thermal_metrics_extraction(self):
+        # Create a mock hwmon directory structure
+        hwmon_dir = Path(self.temp_dir.name) / "sys_hwmon"
+        h0 = hwmon_dir / "hwmon0"
+        h0.mkdir(parents=True, exist_ok=True)
+        (h0 / "name").write_text("coretemp\n")
+        (h0 / "temp1_input").write_text("45000\n")
+        (h0 / "temp1_label").write_text("Package id 0\n")
+        (h0 / "temp2_input").write_text("42000\n")
+        (h0 / "temp2_label").write_text("Core 0\n")
+        (h0 / "temp3_input").write_text("43000\n")
+        (h0 / "temp3_label").write_text("Core 1\n")
+        (h0 / "fan1_input").write_text("1350\n")
+        (h0 / "fan1_label").write_text("CPU Fan\n")
+
+        thermal_dir = Path(self.temp_dir.name) / "sys_thermal"
+        tz0 = thermal_dir / "thermal_zone0"
+        tz0.mkdir(parents=True, exist_ok=True)
+        (tz0 / "type").write_text("acpitz\n")
+        (tz0 / "temp").write_text("39000\n")
+
+        orig_path = Path
+        def mock_path(p, *args, **kwargs):
+            p_str = str(p)
+            if p_str == "/sys/class/hwmon":
+                return hwmon_dir
+            if p_str == "/sys/class/thermal":
+                return thermal_dir
+            return orig_path(p, *args, **kwargs)
+
+        with patch("main.Path", side_effect=mock_path):
+            thermals = main.get_hardware_thermal_metrics()
+            self.assertEqual(thermals["cpu_package_c"], 45.0)
+            self.assertEqual(len(thermals["cores"]), 2)
+            self.assertEqual(thermals["cores"][0]["label"], "Core 0")
+            self.assertEqual(thermals["cores"][0]["temp_c"], 42.0)
+            self.assertEqual(thermals["cores"][1]["label"], "Core 1")
+            self.assertEqual(thermals["cores"][1]["temp_c"], 43.0)
+            self.assertEqual(len(thermals["fans"]), 1)
+            self.assertEqual(thermals["fans"][0]["label"], "CPU Fan")
+            self.assertEqual(thermals["fans"][0]["rpm"], 1350)
+            self.assertTrue(any(s["name"] == "acpitz" for s in thermals["sensors"]))
+
+    def test_storage_metrics_and_raid_summary_enrichment(self):
+        mock_smart = [
+            {
+                "device": "/dev/sda",
+                "model": "Crucial CT1000MX500SSD1",
+                "passed": True,
+                "temperature_c": 34,
+                "wear_level_percent": 3,
+                "reallocated_sectors": 0,
+            },
+            {
+                "device": "/dev/sdb",
+                "model": "Crucial CT1000MX500SSD1",
+                "passed": True,
+                "temperature_c": 36,
+                "wear_level_percent": 4,
+                "reallocated_sectors": 0,
+            },
+        ]
+        with patch.object(main, "get_all_disks_smart_metrics", return_value=mock_smart):
+            storage = main.get_storage_metrics()
+            for disk in storage:
+                self.assertIn("temperature_c", disk)
+                self.assertIn("smart_passed", disk)
+                self.assertIn("smart_status", disk)
+                self.assertIn("model", disk)
+                self.assertIn("wear_level_percent", disk)
+
+            raid_sum = main._extract_raid_summary_data("clean", SAMPLE_DETAILS, SAMPLE_DUF)
+            for dev in raid_sum.get("devices", []):
+                self.assertIn("temperature_c", dev)
+                self.assertIn("passed", dev)
+                self.assertIn("smart_status", dev)
+                self.assertEqual(dev["smart_status"], "PASSED")
+
+            metrics = main.get_system_metrics_data()
+            self.assertIn("physical_disks", metrics)
+            self.assertIn("thermals", metrics)
+            self.assertIn("thermal", metrics)
+
+    def test_hardware_api_endpoints_disks_and_thermals(self):
+        # 1. Unauthenticated requests must fail with 401
+        res_unauth_disks = asgi_get(api.app, "/api/hardware/disks")
+        self.assertEqual(res_unauth_disks.status_code, 401)
+
+        res_unauth_thermals = asgi_get(api.app, "/api/hardware/thermals")
+        self.assertEqual(res_unauth_thermals.status_code, 401)
+
+        mock_disks = [
+            {
+                "device": "/dev/sda",
+                "model": "Samsung SSD 860",
+                "serial_number": "S123",
+                "firmware_version": "1.0",
+                "passed": True,
+                "temperature_c": 33,
+                "power_on_hours": 5000,
+                "wear_level_percent": 2,
+                "reallocated_sectors": 0,
+                "media_errors": 0,
+                "device_type": "ssd",
+                "raw_json": {"dummy": "data"},
+                "status": "passed",
+            }
+        ]
+        mock_thermals = {
+            "cpu_package_c": 44.5,
+            "cores": [{"label": "Core 0", "temp_c": 43.0}],
+            "sensors": [{"name": "CPU", "temp_c": 44.5}],
+            "fans": [{"label": "CPU Fan", "rpm": 1400}],
+        }
+
+        # 2. Authenticated GET /api/hardware/disks
+        with patch.object(main, "get_all_disks_smart_metrics", return_value=mock_disks):
+            res_disks = asgi_get(api.app, "/api/hardware/disks", cookies=self.auth_cookies)
+            self.assertEqual(res_disks.status_code, 200)
+            data_disks = res_disks.json()
+            self.assertIsInstance(data_disks, list)
+            self.assertEqual(len(data_disks), 1)
+            self.assertEqual(data_disks[0]["device"], "/dev/sda")
+            self.assertEqual(data_disks[0]["temperature_c"], 33)
+
+        # 3. Authenticated GET /api/hardware/disks/{disk_name}
+        with patch.object(main, "get_disk_smart_metrics", return_value=mock_disks[0]):
+            res_single = asgi_get(api.app, "/api/hardware/disks/sda", cookies=self.auth_cookies)
+            self.assertEqual(res_single.status_code, 200)
+            single_data = res_single.json()
+            self.assertEqual(single_data["device"], "/dev/sda")
+            self.assertEqual(single_data["raw_json"], {"dummy": "data"})
+
+        # 4. Authenticated GET /api/hardware/disks/{nonexistent} -> 404
+        with (
+            patch.object(main, "discover_physical_disks", return_value=["/dev/sda"]),
+            patch.object(main, "get_disk_smart_metrics", return_value={
+                "device": "/dev/unknown_ghost_99",
+                "model": "Unknown",
+                "raw_json": None,
+                "status": "not_found",
+                "error": "No such device",
+            }),
+        ):
+            res_404 = asgi_get(api.app, "/api/hardware/disks/unknown_ghost_99", cookies=self.auth_cookies)
+            self.assertEqual(res_404.status_code, 404)
+
+        # 5. Authenticated GET /api/hardware/thermals
+        with patch.object(main, "get_hardware_thermal_metrics", return_value=mock_thermals):
+            res_th = asgi_get(api.app, "/api/hardware/thermals", cookies=self.auth_cookies)
+            self.assertEqual(res_th.status_code, 200)
+            data_th = res_th.json()
+            self.assertEqual(data_th["cpu_package_c"], 44.5)
+            self.assertEqual(len(data_th["cores"]), 1)
+            self.assertEqual(len(data_th["fans"]), 1)
+
+        # 6. Authenticated GET /api/system/storage includes physical_disks
+        with patch.object(main, "get_all_disks_smart_metrics", return_value=mock_disks):
+            res_storage = asgi_get(api.app, "/api/system/storage", cookies=self.auth_cookies)
+            self.assertEqual(res_storage.status_code, 200)
+            data_st = res_storage.json()
+            self.assertIn("physical_disks", data_st)
+            self.assertEqual(len(data_st["physical_disks"]), 1)
+
+    def test_threshold_alerts_for_smart_failure_and_high_temperatures(self):
+        t0 = 1700000000.0
+        main.update_notification_center_config({
+            "channels": {
+                "discord": {"enabled": True, "bot_token": "dummy_token", "channel_id": "12345"},
+            },
+            "thresholds": {
+                "enabled": True,
+                "ram_percent": 99.0,
+                "cpu_percent": 99.0,
+                "disk_percent": 99.0,
+                "raid_degraded": False,
+                "smart_failure": True,
+                "disk_temp_hdd": 55.0,
+                "disk_temp_nvme": 70.0,
+                "cooldown_minutes": 60,
+            },
+        })
+
+        mock_disks = [
+            # 1. Normal drive (no alert)
+            {
+                "device": "/dev/sda",
+                "model": "Normal HDD",
+                "passed": True,
+                "temperature_c": 38,
+                "device_type": "hdd",
+                "reallocated_sectors": 0,
+            },
+            # 2. Failing SMART drive (should alert)
+            {
+                "device": "/dev/sdb",
+                "model": "Failing HDD",
+                "passed": False,
+                "temperature_c": 42,
+                "device_type": "hdd",
+                "reallocated_sectors": 128,
+                "media_errors": 5,
+            },
+            # 3. Overheating HDD >= 55C (should alert)
+            {
+                "device": "/dev/sdc",
+                "model": "Hot HDD",
+                "passed": True,
+                "temperature_c": 57,
+                "device_type": "hdd",
+                "reallocated_sectors": 0,
+            },
+            # 4. Overheating NVMe >= 70C (should alert)
+            {
+                "device": "/dev/nvme0n1",
+                "model": "Hot NVMe",
+                "passed": True,
+                "temperature_c": 73,
+                "device_type": "nvme",
+            },
+        ]
+
+        with (
+            patch.object(main, "get_all_disks_smart_metrics", return_value=mock_disks),
+            patch.object(main, "send_message", new=AsyncMock(return_value=True)) as mock_send,
+            patch("platform.node", return_value="vps-node-1"),
+        ):
+            # First run: 3 alerts triggered (sdb smart failure, sdc high temp, nvme0n1 high temp)
+            alerts = asyncio.run(main.evaluate_threshold_alerts(now=t0))
+            metrics_triggered = {a["metric"] for a in alerts}
+            self.assertEqual(len(alerts), 3)
+            self.assertIn("smart_fail_sdb", metrics_triggered)
+            self.assertIn("disk_temp_sdc", metrics_triggered)
+            self.assertIn("disk_temp_nvme0n1", metrics_triggered)
+            self.assertEqual(mock_send.await_count, 3)
+
+            # Check alert details
+            sdb_alert = next(a for a in alerts if a["metric"] == "smart_fail_sdb")
+            self.assertEqual(sdb_alert["embed"]["color"], 0xEF4444)
+            self.assertIn("S.M.A.R.T. Failure", sdb_alert["title"])
+
+            sdc_alert = next(a for a in alerts if a["metric"] == "disk_temp_sdc")
+            self.assertIn("57°C", sdc_alert["title"])
+
+            # Immediate second evaluation at t0 + 60s: all in cooldown, 0 alerts
+            alerts_cd = asyncio.run(main.evaluate_threshold_alerts(now=t0 + 60.0))
+            self.assertEqual(len(alerts_cd), 0)
+            self.assertEqual(mock_send.await_count, 3)
+
+    def test_hardware_health_cockpit_frontend_dom_and_ui_contracts(self):
+        """Validate Phase 2 Hardware Health Cockpit DOM elements, JS contracts, and CSS rules.
+
+        Verifies:
+        1. Constituent Member Disks table (#disks-table, #active-disks-table, #active-disks-tbody) with 6 columns.
+        2. Clickable S.M.A.R.T. badge and temperature pill generation in client JS.
+        3. S.M.A.R.T. Details Modal (#smart-modal) with headers, badges, metrics cards, table, and footer.
+        4. Overview View #cpu-temp-badge in CPU Telemetry header.
+        5. Client JS functions: fetchSmartDisks, fetchHardwareThermals, openSmartModal, closeSmartModal, updateCpuTempBadge.
+        6. CSS styling for smart badges, modals, and thermal indicators.
+        """
+        # 1. Inspect static/index.html DOM elements
+        index_resp = asgi_get(api.app, "/")
+        self.assertEqual(index_resp.status_code, 200)
+        html = index_resp.text
+
+        # 1a. Storage View (#view-raid) Member Disks Table with 6 columns
+        raid_start = html.find('id="view-raid"')
+        self.assertGreater(raid_start, -1, "Expected #view-raid container in index.html")
+        raid_end = html.find('id="view-containers"')
+        self.assertGreater(raid_end, raid_start)
+        raid_html = html[raid_start:raid_end]
+
+        self.assertIn('id="disks-table"', raid_html)
+        self.assertIn('id="active-disks-table"', raid_html)
+        self.assertIn('id="active-disks-tbody"', raid_html)
+        self.assertIn('id="disks-count-badge"', raid_html)
+
+        # Verify 6 required table columns in the header
+        self.assertIn("<th>Device</th>", raid_html)
+        self.assertIn("<th>Model</th>", raid_html)
+        self.assertIn("<th>State</th>", raid_html)
+        self.assertIn("<th>S.M.A.R.T. Health</th>", raid_html)
+        self.assertIn("<th>Temp</th>", raid_html)
+        self.assertIn("<th>Slot / Role</th>", raid_html)
+
+        # 1b. Overview View CPU Telemetry Temperature Badge
+        overview_start = html.find('id="view-overview"')
+        self.assertGreater(overview_start, -1)
+        overview_end = html.find('id="view-raid"')
+        self.assertGreater(overview_end, overview_start)
+        overview_html = html[overview_start:overview_end]
+
+        self.assertIn('id="cpu-temp-badge"', overview_html)
+        self.assertIn('id="cpu-cores-badge"', overview_html)
+        self.assertIn("CPU Telemetry", overview_html)
+
+        # 1c. S.M.A.R.T. Details Modal Structure (#smart-modal)
+        smart_modal_start = html.find('id="smart-modal"')
+        self.assertGreater(smart_modal_start, -1, "Expected #smart-modal container in index.html")
+        smart_modal_end = html.find('id="toast-container"', smart_modal_start)
+        self.assertGreater(smart_modal_end, smart_modal_start)
+        modal_html = html[smart_modal_start:smart_modal_end]
+
+        # Modal Header
+        self.assertIn('id="smart-modal-title"', modal_html)
+        self.assertIn('id="smart-modal-subtitle"', modal_html)
+        self.assertIn('id="btn-smart-modal-close"', modal_html)
+
+        # Modal Badges
+        self.assertIn('id="smart-modal-status"', modal_html)
+        self.assertIn('id="smart-modal-type"', modal_html)
+        self.assertIn('id="smart-modal-model"', modal_html)
+        self.assertIn('id="smart-modal-serial"', modal_html)
+        self.assertIn('id="smart-modal-firmware"', modal_html)
+
+        # Modal Key Metrics Cards
+        self.assertIn('id="smart-modal-temp"', modal_html)
+        self.assertIn('id="smart-modal-hours"', modal_html)
+        self.assertIn('id="smart-modal-reallocated"', modal_html)
+        self.assertIn('id="smart-modal-wear"', modal_html)
+        self.assertIn('id="smart-modal-errors"', modal_html)
+
+        # Modal Attributes Table
+        self.assertIn('id="smart-modal-attributes-container"', modal_html)
+        self.assertIn('id="smart-modal-attributes-table"', modal_html)
+        self.assertIn('id="smart-modal-attributes-tbody"', modal_html)
+
+        # Modal Footer Actions
+        self.assertIn('id="btn-smart-modal-cancel"', modal_html)
+
+        # 2. Inspect static/app.js client logic contracts
+        app_js = Path("static/app.js").read_text(encoding="utf-8")
+
+        # Function signatures
+        self.assertIn("async function fetchSmartDisks(", app_js)
+        self.assertIn("async function fetchHardwareThermals(", app_js)
+        self.assertIn("function updateCpuTempBadge(", app_js)
+        self.assertIn("async function openSmartModal(", app_js)
+        self.assertIn("function closeSmartModal(", app_js)
+
+        # Clickable S.M.A.R.T. badge and temp pill creation
+        self.assertIn("smart-badge", app_js)
+        self.assertIn('smartBtn.setAttribute("data-disk", cleanDev)', app_js)
+        self.assertIn("temp-badge", app_js)
+        self.assertIn("temp-ok", app_js)
+        self.assertIn("temp-warn", app_js)
+        self.assertIn("temp-crit", app_js)
+
+        # Event delegation and modal event listeners
+        self.assertIn('active-disks-tbody', app_js)
+        self.assertIn('button.smart-badge[data-disk]', app_js)
+        self.assertIn('btn-smart-modal-close', app_js)
+        self.assertIn('btn-smart-modal-cancel', app_js)
+        self.assertIn('smart-modal', app_js)
+
+        # 3. Inspect static/styles.css CSS rules
+        styles_css = Path("static/styles.css").read_text(encoding="utf-8")
+        self.assertIn(".smart-modal-card", styles_css)
+        self.assertIn(".smart-summary-banner", styles_css)
+        self.assertIn(".smart-metrics-grid", styles_css)
+        self.assertIn(".smart-metric-card", styles_css)
+        self.assertIn(".smart-badge", styles_css)
+        self.assertIn(".smart-passed", styles_css)
+        self.assertIn(".smart-failed", styles_css)
+        self.assertIn(".smart-unknown", styles_css)
+        self.assertIn(".temp-badge", styles_css)
+        self.assertIn(".temp-ok", styles_css)
+        self.assertIn(".temp-warn", styles_css)
+        self.assertIn(".temp-crit", styles_css)
+
+
 if __name__ == "__main__":
     unittest.main()

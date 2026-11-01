@@ -754,10 +754,66 @@ def api_system_storage(_user: str = Depends(require_auth)) -> dict[str, Any]:
             "filesystems": disks,
             "mounts": disks,
             "disk": root_usage or (disks[0] if disks else {}),
+            "physical_disks": main.get_all_disks_smart_metrics(),
         }
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Error fetching storage metrics: {exc}"
+        )
+
+
+@app.get("/api/hardware/disks")
+def api_hardware_disks(
+    refresh: bool = False,
+    _user: str = Depends(require_auth),
+) -> list[dict[str, Any]]:
+    try:
+        return main.get_all_disks_smart_metrics(force_refresh=refresh)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching SMART disk telemetry: {exc}"
+        )
+
+
+@app.get("/api/hardware/disks/{disk_name}")
+def api_hardware_disk_detail(
+    disk_name: str,
+    refresh: bool = False,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    cleaned = os.path.basename(disk_name.strip())
+    if not cleaned or ".." in cleaned or "/" in cleaned:
+        raise HTTPException(status_code=400, detail="Invalid disk name.")
+    device_path = f"/dev/{cleaned}"
+    try:
+        data = main.get_disk_smart_metrics(device_path, force_refresh=refresh)
+        # If device has no raw_json and does not exist on host/discovery, return 404
+        if data.get("raw_json") is None and data.get("status") in ("error", "unavailable", "not_found"):
+            discovered = main.discover_physical_disks()
+            if (
+                device_path not in discovered
+                and not Path(device_path).exists()
+                and not Path(f"/sys/block/{cleaned}").exists()
+            ):
+                raise HTTPException(status_code=404, detail=f"Disk '{disk_name}' not found.")
+        return data
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching disk telemetry for {disk_name}: {exc}"
+        )
+
+
+@app.get("/api/hardware/thermals")
+def api_hardware_thermals(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        return main.get_hardware_thermal_metrics()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching hardware thermals: {exc}"
         )
 
 

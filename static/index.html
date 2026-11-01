@@ -552,6 +552,7 @@
                       <span class="metric-title">CPU Telemetry</span>
                       <div class="metric-header-right">
                         <span id="cpu-cores-badge" class="kind-badge" title="Logical CPU Cores">-- Cores</span>
+                        <span id="cpu-temp-badge" class="kind-badge" title="CPU Package Temperature">--°C</span>
                         <span id="cpu-percent-value" class="metric-value">--%</span>
                       </div>
                     </div>
@@ -848,7 +849,7 @@
                 </dl>
 
                 <!-- Constituent Member Disks Section -->
-                <div class="raid-member-disks-section">
+                <div class="raid-member-disks-section" id="disks-table">
                   <div class="section-subheading-row">
                     <div>
                       <h4 class="subheading-title">Constituent Member Disks</h4>
@@ -862,13 +863,16 @@
                       <thead>
                         <tr>
                           <th>Device</th>
-                          <th>Path</th>
+                          <th>Model</th>
                           <th>State</th>
+                          <th>S.M.A.R.T. Health</th>
+                          <th>Temp</th>
+                          <th>Slot / Role</th>
                         </tr>
                       </thead>
                       <tbody id="active-disks-tbody">
                         <tr>
-                          <td colspan="3" class="empty-state">Loading disk devices...</td>
+                          <td colspan="6" class="empty-state">Loading disk devices...</td>
                         </tr>
                       </tbody>
                     </table>
@@ -3513,6 +3517,97 @@
           <button type="submit" id="btn-probe-modal-save" class="btn-primary">Save Probe</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- S.M.A.R.T. Disk Health Details Modal (#smart-modal) -->
+  <div id="smart-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="smart-modal-title">
+    <div class="modal-card smart-modal-card">
+      <div class="modal-header">
+        <div class="modal-title-with-icon">
+          <div>
+            <h3 id="smart-modal-title" class="modal-title">S.M.A.R.T. Diagnostics</h3>
+            <p id="smart-modal-subtitle" class="modal-subtitle">Disk telemetry and hardware health status</p>
+          </div>
+        </div>
+        <button id="btn-smart-modal-close" type="button" class="btn-icon-close" aria-label="Close S.M.A.R.T. diagnostics modal">&times;</button>
+      </div>
+
+      <div class="modal-body smart-modal-body">
+        <!-- Drive Summary Badges -->
+        <div class="smart-summary-banner">
+          <div class="smart-summary-badges">
+            <span id="smart-modal-status" class="smart-badge smart-passed">PASSED</span>
+            <span id="smart-modal-type" class="device-type-badge">NVMe</span>
+          </div>
+          <div class="smart-summary-info">
+            <div class="smart-info-row">
+              <span class="info-label">Model:</span>
+              <span id="smart-modal-model" class="info-value">--</span>
+            </div>
+            <div class="smart-info-row">
+              <span class="info-label">Serial:</span>
+              <span id="smart-modal-serial" class="info-value mono-text">--</span>
+            </div>
+            <div class="smart-info-row">
+              <span class="info-label">Firmware:</span>
+              <span id="smart-modal-firmware" class="info-value mono-text">--</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Key Metrics Grid -->
+        <div class="smart-metrics-grid">
+          <div class="smart-metric-card">
+            <span class="smart-metric-label">Temperature</span>
+            <span id="smart-modal-temp" class="smart-metric-value">--°C</span>
+          </div>
+          <div class="smart-metric-card">
+            <span class="smart-metric-label">Power-On Hours</span>
+            <span id="smart-modal-hours" class="smart-metric-value">--</span>
+          </div>
+          <div class="smart-metric-card">
+            <span class="smart-metric-label">Reallocated Sectors</span>
+            <span id="smart-modal-reallocated" class="smart-metric-value">--</span>
+          </div>
+          <div class="smart-metric-card">
+            <span class="smart-metric-label">Wear Level</span>
+            <span id="smart-modal-wear" class="smart-metric-value">--%</span>
+          </div>
+          <div class="smart-metric-card">
+            <span class="smart-metric-label">Media Errors</span>
+            <span id="smart-modal-errors" class="smart-metric-value">--</span>
+          </div>
+        </div>
+
+        <!-- Raw Attributes Table Container -->
+        <div id="smart-modal-attributes-container" class="smart-attributes-container">
+          <h4 class="smart-section-title">Raw Telemetry Attributes</h4>
+          <div class="table-container smart-table-scroll">
+            <table id="smart-modal-attributes-table" class="data-table smart-attributes-table">
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Attribute Name</th>
+                  <th>Current</th>
+                  <th>Worst</th>
+                  <th>Threshold</th>
+                  <th>Raw Value</th>
+                </tr>
+              </thead>
+              <tbody id="smart-modal-attributes-tbody">
+                <tr>
+                  <td colspan="6" class="empty-state">No attribute records available</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button id="btn-smart-modal-cancel" type="button" class="btn-secondary">Close</button>
+      </div>
     </div>
   </div>
 
