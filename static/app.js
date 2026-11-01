@@ -791,6 +791,13 @@ function renderSystemMetrics(system) {
     cpuCoresBadge.textContent = `${logicalCores} ${logicalCores === 1 ? "Core" : "Cores"}`;
   }
 
+  // CPU Package Temperature Badge
+  if (system.thermal || system.thermals) {
+    updateCpuTempBadge(system.thermal || system.thermals);
+  } else {
+    fetchHardwareThermals();
+  }
+
   const cpuLoadEl = document.getElementById("cpu-load-detail");
   if (cpuLoadEl) {
     if (Array.isArray(system.load_avg) && system.load_avg.length > 0) {
@@ -1072,11 +1079,322 @@ function renderSystemMetrics(system) {
   }
 }
 
+// ==========================================================================
+// Hardware Health Cockpit: S.M.A.R.T. Disks & Thermal Telemetry
+// ==========================================================================
+
+let smartDisksCache = {};
+let cachedRaidData = null;
+
+/**
+ * Fetch physical disk SMART metrics and cache them.
+ */
+async function fetchSmartDisks() {
+  try {
+    const disks = await apiFetch("/api/hardware/disks");
+    if (Array.isArray(disks)) {
+      smartDisksCache = {};
+      disks.forEach((d) => {
+        if (d && d.device) {
+          const raw = d.device;
+          const clean = raw.replace("/dev/", "");
+          smartDisksCache[raw] = d;
+          smartDisksCache[clean] = d;
+        }
+      });
+      if (cachedRaidData) {
+        renderRaidDetails(cachedRaidData);
+      }
+      return disks;
+    }
+  } catch (err) {
+    console.debug("Failed to fetch SMART disk metrics:", err);
+  }
+  return [];
+}
+
+/**
+ * Fetch hardware thermal sensors telemetry and update overview CPU temperature badge.
+ */
+async function fetchHardwareThermals() {
+  try {
+    const data = await apiFetch("/api/hardware/thermals");
+    updateCpuTempBadge(data);
+    return data;
+  } catch (err) {
+    console.debug("Failed to fetch hardware thermals:", err);
+  }
+  return null;
+}
+
+/**
+ * Update the CPU temperature badge with appropriate color classes based on temperature thresholds.
+ */
+function updateCpuTempBadge(thermalData) {
+  const badge = document.getElementById("cpu-temp-badge");
+  if (!badge) return;
+
+  let tempVal = null;
+  if (thermalData) {
+    if (thermalData.cpu_package_c !== null && thermalData.cpu_package_c !== undefined) {
+      tempVal = thermalData.cpu_package_c;
+    } else if (Array.isArray(thermalData.cores) && thermalData.cores.length > 0 && thermalData.cores[0]?.temp_c !== undefined) {
+      tempVal = thermalData.cores[0].temp_c;
+    } else if (Array.isArray(thermalData.sensors) && thermalData.sensors.length > 0 && thermalData.sensors[0]?.temp_c !== undefined) {
+      tempVal = thermalData.sensors[0].temp_c;
+    }
+  }
+
+  if (tempVal !== null && tempVal !== undefined) {
+    const num = typeof tempVal === "number" ? tempVal : parseFloat(tempVal);
+    if (!isNaN(num)) {
+      badge.textContent = `${num.toFixed(1)}°C`;
+      badge.classList.remove("temp-ok", "temp-warn", "temp-crit");
+      if (num > 60) {
+        badge.classList.add("temp-crit");
+      } else if (num > 50) {
+        badge.classList.add("temp-warn");
+      } else {
+        badge.classList.add("temp-ok");
+      }
+      return;
+    }
+  }
+  badge.textContent = "--°C";
+  badge.classList.remove("temp-ok", "temp-warn", "temp-crit");
+}
+
+/**
+ * Open S.M.A.R.T. details modal for a specific disk device.
+ */
+async function openSmartModal(diskName) {
+  const modal = document.getElementById("smart-modal");
+  if (!modal) return;
+
+  const cleanName = (diskName || "").replace("/dev/", "").trim();
+  const titleEl = document.getElementById("smart-modal-title");
+  if (titleEl) {
+    titleEl.textContent = cleanName ? `S.M.A.R.T. Diagnostics - /dev/${cleanName}` : "S.M.A.R.T. Diagnostics";
+  }
+
+  const statusBadge = document.getElementById("smart-modal-status");
+  const typeBadge = document.getElementById("smart-modal-type");
+  const modelEl = document.getElementById("smart-modal-model");
+  const serialEl = document.getElementById("smart-modal-serial");
+  const firmwareEl = document.getElementById("smart-modal-firmware");
+  const tempEl = document.getElementById("smart-modal-temp");
+  const hoursEl = document.getElementById("smart-modal-hours");
+  const reallocatedEl = document.getElementById("smart-modal-reallocated");
+  const wearEl = document.getElementById("smart-modal-wear");
+  const errorsEl = document.getElementById("smart-modal-errors");
+  const attrTbody = document.getElementById("smart-modal-attributes-tbody");
+
+  if (statusBadge) {
+    statusBadge.className = "smart-badge smart-unknown";
+    statusBadge.textContent = "LOADING...";
+  }
+  if (typeBadge) typeBadge.textContent = "--";
+  if (modelEl) modelEl.textContent = "Loading...";
+  if (serialEl) serialEl.textContent = "--";
+  if (firmwareEl) firmwareEl.textContent = "--";
+  if (tempEl) tempEl.textContent = "--°C";
+  if (hoursEl) hoursEl.textContent = "--";
+  if (reallocatedEl) reallocatedEl.textContent = "--";
+  if (wearEl) wearEl.textContent = "--";
+  if (errorsEl) errorsEl.textContent = "--";
+  if (attrTbody) {
+    attrTbody.innerHTML = `<tr><td colspan="6" class="empty-state">Loading attribute telemetry...</td></tr>`;
+  }
+
+  modal.classList.remove("hidden");
+
+  try {
+    const disk = await apiFetch("/api/hardware/disks/" + encodeURIComponent(cleanName));
+    if (!disk) {
+      if (modelEl) modelEl.textContent = "No data returned";
+      return;
+    }
+
+    if (statusBadge) {
+      const isPassed = disk.passed === true || disk.status === "passed";
+      const isFailed = disk.passed === false || disk.status === "failed";
+      if (isPassed) {
+        statusBadge.className = "smart-badge smart-passed";
+        statusBadge.textContent = "PASSED";
+      } else if (isFailed) {
+        statusBadge.className = "smart-badge smart-failed";
+        statusBadge.textContent = "FAILED";
+      } else {
+        statusBadge.className = "smart-badge smart-unknown";
+        statusBadge.textContent = (disk.status || "UNKNOWN").toUpperCase();
+      }
+    }
+
+    if (typeBadge) {
+      typeBadge.textContent = (disk.device_type || "DISK").toUpperCase();
+    }
+
+    if (modelEl) modelEl.textContent = disk.model || "Unknown";
+    if (serialEl) serialEl.textContent = disk.serial_number || "Unknown";
+    if (firmwareEl) firmwareEl.textContent = disk.firmware_version || "Unknown";
+
+    if (tempEl) {
+      if (disk.temperature_c !== null && disk.temperature_c !== undefined) {
+        tempEl.textContent = `${disk.temperature_c}°C`;
+      } else {
+        tempEl.textContent = "--°C";
+      }
+    }
+
+    if (hoursEl) {
+      hoursEl.textContent =
+        disk.power_on_hours !== null && disk.power_on_hours !== undefined
+          ? `${Number(disk.power_on_hours).toLocaleString()} hrs`
+          : "--";
+    }
+
+    if (reallocatedEl) {
+      reallocatedEl.textContent =
+        disk.reallocated_sectors !== null && disk.reallocated_sectors !== undefined
+          ? String(disk.reallocated_sectors)
+          : "--";
+    }
+
+    if (wearEl) {
+      wearEl.textContent =
+        disk.wear_level_percent !== null && disk.wear_level_percent !== undefined
+          ? `${disk.wear_level_percent}%`
+          : "--";
+    }
+
+    if (errorsEl) {
+      errorsEl.textContent =
+        disk.media_errors !== null && disk.media_errors !== undefined
+          ? String(disk.media_errors)
+          : "--";
+    }
+
+    if (attrTbody) {
+      attrTbody.innerHTML = "";
+      const raw = disk.raw_json || {};
+      const ataTable =
+        raw.ata_smart_attributes && Array.isArray(raw.ata_smart_attributes.table)
+          ? raw.ata_smart_attributes.table
+          : null;
+      const nvmeLog =
+        raw.nvme_smart_health_information_log && typeof raw.nvme_smart_health_information_log === "object"
+          ? raw.nvme_smart_health_information_log
+          : null;
+
+      if (ataTable && ataTable.length > 0) {
+        ataTable.forEach((attr) => {
+          const tr = document.createElement("tr");
+
+          const tdId = document.createElement("td");
+          tdId.className = "mono-text";
+          tdId.textContent = attr.id !== undefined ? String(attr.id) : "--";
+
+          const tdName = document.createElement("td");
+          tdName.textContent = attr.name || "--";
+
+          const tdVal = document.createElement("td");
+          tdVal.className = "mono-text";
+          tdVal.textContent = attr.value !== undefined ? String(attr.value) : "--";
+
+          const tdWorst = document.createElement("td");
+          tdWorst.className = "mono-text";
+          tdWorst.textContent = attr.worst !== undefined ? String(attr.worst) : "--";
+
+          const tdThresh = document.createElement("td");
+          tdThresh.className = "mono-text";
+          tdThresh.textContent = attr.thresh !== undefined ? String(attr.thresh) : "--";
+
+          const tdRaw = document.createElement("td");
+          tdRaw.className = "mono-text";
+          let rawStr = "--";
+          if (attr.raw && attr.raw.string !== undefined) {
+            rawStr = String(attr.raw.string);
+          } else if (attr.raw && attr.raw.value !== undefined) {
+            rawStr = String(attr.raw.value);
+          }
+          tdRaw.textContent = rawStr;
+
+          tr.appendChild(tdId);
+          tr.appendChild(tdName);
+          tr.appendChild(tdVal);
+          tr.appendChild(tdWorst);
+          tr.appendChild(tdThresh);
+          tr.appendChild(tdRaw);
+          attrTbody.appendChild(tr);
+        });
+      } else if (nvmeLog && Object.keys(nvmeLog).length > 0) {
+        Object.entries(nvmeLog).forEach(([k, v]) => {
+          const tr = document.createElement("tr");
+
+          const tdId = document.createElement("td");
+          tdId.className = "mono-text";
+          tdId.textContent = "--";
+
+          const tdName = document.createElement("td");
+          tdName.textContent = k.replace(/_/g, " ");
+
+          const tdVal = document.createElement("td");
+          tdVal.className = "mono-text";
+          tdVal.textContent = typeof v === "object" ? JSON.stringify(v) : String(v);
+
+          const tdWorst = document.createElement("td");
+          tdWorst.className = "mono-text";
+          tdWorst.textContent = "--";
+
+          const tdThresh = document.createElement("td");
+          tdThresh.className = "mono-text";
+          tdThresh.textContent = "--";
+
+          const tdRaw = document.createElement("td");
+          tdRaw.className = "mono-text";
+          tdRaw.textContent = typeof v === "object" ? JSON.stringify(v) : String(v);
+
+          tr.appendChild(tdId);
+          tr.appendChild(tdName);
+          tr.appendChild(tdVal);
+          tr.appendChild(tdWorst);
+          tr.appendChild(tdThresh);
+          tr.appendChild(tdRaw);
+          attrTbody.appendChild(tr);
+        });
+      } else {
+        attrTbody.innerHTML = `<tr><td colspan="6" class="empty-state">No raw S.M.A.R.T. telemetry attributes available for this disk</td></tr>`;
+      }
+    }
+  } catch (err) {
+    console.error("Failed to fetch SMART disk detail:", err);
+    if (modelEl) modelEl.textContent = "Error loading telemetry";
+    if (statusBadge) {
+      statusBadge.className = "smart-badge smart-failed";
+      statusBadge.textContent = "ERROR";
+    }
+    if (attrTbody) {
+      attrTbody.innerHTML = `<tr><td colspan="6" class="empty-state">Failed to load S.M.A.R.T. details: ${escapeHtml(err.message || String(err))}</td></tr>`;
+    }
+  }
+}
+
+/**
+ * Close S.M.A.R.T. details modal.
+ */
+function closeSmartModal() {
+  const modal = document.getElementById("smart-modal");
+  if (modal) {
+    modal.classList.add("hidden");
+  }
+}
+
 /**
  * Render RAID Array Details card and Active Disks table.
  */
 function renderRaidDetails(raid) {
   if (!raid) return;
+  cachedRaidData = raid;
 
   const status = raid.status || "unknown";
   const isNoRaid = normalizeRaidState(status) === "none";
@@ -1218,7 +1536,7 @@ function renderRaidDetails(raid) {
   if (isNoRaid || devices.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 3;
+    td.colSpan = 6;
     td.className = "empty-state";
     td.textContent = isNoRaid
       ? "No RAID array configured or detected on this host"
@@ -1231,17 +1549,25 @@ function renderRaidDetails(raid) {
   devices.forEach((item) => {
     const tr = document.createElement("tr");
 
+    // 1. Device name with mono font
     const tdDev = document.createElement("td");
     tdDev.className = "mono-text";
-    tdDev.textContent = item.device || "unknown";
+    const rawDev = item.device || "unknown";
+    tdDev.textContent = rawDev;
 
-    const tdPath = document.createElement("td");
-    tdPath.className = "mono-text";
-    const devName = item.device || "";
-    tdPath.textContent = devName.startsWith("/dev/")
-      ? devName
-      : `/dev/${devName}`;
+    // Resolve smart data from cache if present
+    const cleanDev = rawDev.replace("/dev/", "");
+    const smartData =
+      smartDisksCache[cleanDev] ||
+      smartDisksCache[rawDev] ||
+      smartDisksCache[`/dev/${cleanDev}`] ||
+      {};
 
+    // 2. Model name
+    const tdModel = document.createElement("td");
+    tdModel.textContent = item.model || smartData.model || "Unknown";
+
+    // 3. State
     const tdState = document.createElement("td");
     const stateBadge = document.createElement("span");
     const stateStr = String(item.state || "unknown").toLowerCase();
@@ -1264,9 +1590,83 @@ function renderRaidDetails(raid) {
     stateBadge.textContent = item.state || "unknown";
     tdState.appendChild(stateBadge);
 
+    // 4. S.M.A.R.T. Health (clickable button/pill)
+    const tdSmart = document.createElement("td");
+    const smartBtn = document.createElement("button");
+    smartBtn.type = "button";
+    const isPassed =
+      item.passed === true ||
+      smartData.passed === true ||
+      (item.smart_status && item.smart_status.toUpperCase() === "PASSED");
+    const isFailed =
+      item.passed === false ||
+      smartData.passed === false ||
+      (item.smart_status && item.smart_status.toUpperCase() === "FAILED");
+
+    let smartClass = "smart-unknown";
+    let smartText = "UNKNOWN";
+    if (isPassed) {
+      smartClass = "smart-passed";
+      smartText = "PASSED";
+    } else if (isFailed) {
+      smartClass = "smart-failed";
+      smartText = "FAILED";
+    } else if (item.smart_status) {
+      smartText = item.smart_status.toUpperCase();
+    }
+    smartBtn.className = `smart-badge ${smartClass}`;
+    smartBtn.setAttribute("data-disk", cleanDev);
+    smartBtn.title = `View S.M.A.R.T. diagnostics for ${cleanDev}`;
+    smartBtn.textContent = smartText;
+    tdSmart.appendChild(smartBtn);
+
+    // 5. Temperature badge
+    const tdTemp = document.createElement("td");
+    const tempVal =
+      item.temperature_c !== undefined && item.temperature_c !== null
+        ? item.temperature_c
+        : smartData.temperature_c !== undefined &&
+            smartData.temperature_c !== null
+          ? smartData.temperature_c
+          : null;
+
+    if (tempVal !== null && tempVal !== undefined) {
+      const tempBadge = document.createElement("span");
+      const tempNum = Number(tempVal);
+      const tempClass =
+        tempNum > 60 ? "temp-crit" : tempNum > 50 ? "temp-warn" : "temp-ok";
+      tempBadge.className = `temp-badge ${tempClass}`;
+      tempBadge.textContent = `${tempNum}°C`;
+      tdTemp.appendChild(tempBadge);
+    } else {
+      const noTemp = document.createElement("span");
+      noTemp.className = "text-muted";
+      noTemp.textContent = "--";
+      tdTemp.appendChild(noTemp);
+    }
+
+    // 6. Slot / Role
+    const tdSlot = document.createElement("td");
+    const slotRoleVal =
+      item.slot !== undefined && item.slot !== null && item.slot !== ""
+        ? item.slot === "-"
+          ? "Spare"
+          : `Slot ${item.slot}`
+        : item.role ||
+          (item.state && item.state.includes("spare")
+            ? "Spare"
+            : item.state
+              ? item.state.split(" ")[0]
+              : "--") ||
+          "--";
+    tdSlot.textContent = slotRoleVal;
+
     tr.appendChild(tdDev);
-    tr.appendChild(tdPath);
+    tr.appendChild(tdModel);
     tr.appendChild(tdState);
+    tr.appendChild(tdSmart);
+    tr.appendChild(tdTemp);
+    tr.appendChild(tdSlot);
     tbody.appendChild(tr);
   });
 
@@ -2587,6 +2987,8 @@ function onAuthenticatedSuccess(username) {
   fetchSystemUsers();
   fetchSystemGroups();
   fetchProbes();
+  fetchSmartDisks();
+  fetchHardwareThermals();
   startSystemUpdatePolling();
 }
 
@@ -4047,6 +4449,9 @@ function switchViewTab(tabName, updateHash = true) {
     }
 
     renderStorageMounts(cachedStorageDisks);
+    if (isAuthenticated) {
+      fetchSmartDisks();
+    }
   } else if (isNotifications) {
     notificationsTab?.classList.add("active");
     notificationsTab?.setAttribute("aria-selected", "true");
@@ -8662,6 +9067,7 @@ function initDashboard() {
       closeNotifChannelsModal();
       closeNotifScheduleModal();
       closeNotifThresholdsModal();
+      closeSmartModal();
     }
   });
 
@@ -9226,6 +9632,29 @@ function initDashboard() {
   if (!localTickerTimerId) {
     localTickerTimerId = window.setInterval(updateLiveTickers, 1000);
   }
+
+  // S.M.A.R.T. Health Diagnostics Modal & Member Disks Table Delegation
+  const disksTbody = document.getElementById("active-disks-tbody");
+  disksTbody?.addEventListener("click", (e) => {
+    const btn = e.target.closest("button.smart-badge[data-disk]");
+    if (btn) {
+      const disk = btn.getAttribute("data-disk");
+      if (disk) openSmartModal(disk);
+    }
+  });
+
+  document
+    .getElementById("btn-smart-modal-close")
+    ?.addEventListener("click", closeSmartModal);
+
+  document
+    .getElementById("btn-smart-modal-cancel")
+    ?.addEventListener("click", closeSmartModal);
+
+  const smartModal = document.getElementById("smart-modal");
+  smartModal?.addEventListener("click", (e) => {
+    if (e.target === smartModal) closeSmartModal();
+  });
 
   checkAuthStatus();
 }

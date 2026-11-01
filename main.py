@@ -660,6 +660,9 @@ DEFAULT_NOTIFICATION_CENTER_CONFIG: dict[str, Any] = {
         "cpu_percent": 90.0,
         "disk_percent": 85.0,
         "raid_degraded": True,
+        "smart_failure": True,
+        "disk_temp_hdd": 55.0,
+        "disk_temp_nvme": 70.0,
         "cooldown_minutes": 60,
     },
 }
@@ -1625,6 +1628,8 @@ def get_masked_notification_center_config(
         thresholds["disk"] = {"enabled": thresholds.get("enabled", True), "value": int(thresholds["disk_percent"])}
     if "raid_degraded" in thresholds and "raid" not in thresholds:
         thresholds["raid"] = {"enabled": bool(thresholds["raid_degraded"])}
+    if "smart_failure" in thresholds and "smart" not in thresholds:
+        thresholds["smart"] = {"enabled": bool(thresholds["smart_failure"])}
 
     schedule = result.setdefault("schedule", {})
     if "day_of_week" in schedule and "day" not in schedule:
@@ -1682,6 +1687,14 @@ def update_notification_center_config(updates: dict[str, Any]) -> dict[str, Any]
             current["thresholds"]["disk_percent"] = float(in_t["disk"]["value"])
         if "raid" in in_t and isinstance(in_t["raid"], dict) and "enabled" in in_t["raid"]:
             current["thresholds"]["raid_degraded"] = bool(in_t["raid"]["enabled"])
+        if "smart" in in_t and isinstance(in_t["smart"], dict) and "enabled" in in_t["smart"]:
+            current["thresholds"]["smart_failure"] = bool(in_t["smart"]["enabled"])
+        if "smart_failure" in in_t:
+            current["thresholds"]["smart_failure"] = bool(in_t["smart_failure"])
+        if "disk_temp_hdd" in in_t:
+            current["thresholds"]["disk_temp_hdd"] = float(in_t["disk_temp_hdd"])
+        if "disk_temp_nvme" in in_t:
+            current["thresholds"]["disk_temp_nvme"] = float(in_t["disk_temp_nvme"])
         current["thresholds"].update(in_t)
 
     json_val = json.dumps(current)
@@ -2194,6 +2207,99 @@ async def evaluate_threshold_alerts(
         except Exception as exc:
             logging.debug(f"RAID threshold check error: {exc}")
 
+    # S.M.A.R.T. disk health and thermal early warning
+    if thresholds.get("enabled", True):
+        try:
+            disks_smart = get_all_disks_smart_metrics()
+            smart_fail_enabled = bool(thresholds.get("smart_failure", True))
+            hdd_temp_limit = float(thresholds.get("disk_temp_hdd", 55.0))
+            nvme_temp_limit = float(thresholds.get("disk_temp_nvme", 70.0))
+
+            for d in disks_smart:
+                dev_path = d.get("device", "unknown")
+                short_name = os.path.basename(dev_path)
+                model = d.get("model") or "Disk"
+                serial = d.get("serial_number") or "N/A"
+                passed = d.get("passed")
+                temp = d.get("temperature_c")
+                is_nvme = "nvme" in dev_path.lower() or d.get("device_type") == "nvme"
+                temp_limit = nvme_temp_limit if is_nvme else hdd_temp_limit
+
+                # 1. SMART Failure Alert
+                if smart_fail_enabled and passed is False:
+                    key = f"smart_fail_{short_name}"
+                    entry = get_notification_state_entry(f"threshold_{key}")
+                    in_cooldown = entry is not None and current_time < entry[1]
+                    if not in_cooldown:
+                        realloc = d.get("reallocated_sectors")
+                        media_err = d.get("media_errors")
+                        wear = d.get("wear_level_percent")
+                        title = f"Alert: S.M.A.R.T. Failure on {dev_path}"
+                        msg = f"Disk {dev_path} ({model}) reported S.M.A.R.T. health failure! Attention is required immediately."
+                        embed = {
+                            "title": f"🚨 [CRITICAL] S.M.A.R.T. Failure: {dev_path}",
+                            "description": f"Drive `{dev_path}` reported a S.M.A.R.T. health failure status. Drive replacement or backup is advised immediately.",
+                            "color": 0xEF4444,
+                            "author": author_info,
+                            "footer": footer_info,
+                            "timestamp": iso_timestamp,
+                            "fields": [
+                                {"name": "Device", "value": f"`{dev_path}`", "inline": True},
+                                {"name": "Model", "value": f"`{model}`", "inline": True},
+                                {"name": "Serial", "value": f"`{serial}`", "inline": True},
+                                {"name": "Status", "value": "🔴 **FAILED**", "inline": True},
+                                {"name": "Reallocated Sectors", "value": f"`{realloc if realloc is not None else 'N/A'}`", "inline": True},
+                                {"name": "Media Errors", "value": f"`{media_err if media_err is not None else 'N/A'}`", "inline": True},
+                                {"name": "Wear Level", "value": f"`{wear}%`" if wear is not None else "N/A", "inline": True},
+                                {"name": "Host", "value": f"`{hostname}`", "inline": True},
+                                {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
+                            ],
+                        }
+                        alerts.append({
+                            "metric": key,
+                            "title": title,
+                            "message": msg,
+                            "embed": embed,
+                            "value": "FAILED",
+                        })
+
+                # 2. Thermal Early-Warning Alert
+                if temp is not None and float(temp) >= temp_limit:
+                    key = f"disk_temp_{short_name}"
+                    entry = get_notification_state_entry(f"threshold_{key}")
+                    in_cooldown = entry is not None and current_time < entry[1]
+                    if not in_cooldown:
+                        is_critical = float(temp) >= (temp_limit + 10.0)
+                        color = 0xEF4444 if is_critical else 0xF59E0B
+                        severity = "CRITICAL" if is_critical else "WARNING"
+                        title = f"Alert: High Disk Temperature on {dev_path} ({temp}°C)"
+                        msg = f"Disk {dev_path} ({model}) temperature is at {temp}°C, exceeding safe threshold of {int(temp_limit)}°C."
+                        embed = {
+                            "title": f"🌡️ [{severity}] High Disk Temperature: {dev_path} ({temp}°C)",
+                            "description": f"Disk `{dev_path}` has reached **{temp}°C**, exceeding threshold of **{int(temp_limit)}°C**.",
+                            "color": color,
+                            "author": author_info,
+                            "footer": footer_info,
+                            "timestamp": iso_timestamp,
+                            "fields": [
+                                {"name": "Device", "value": f"`{dev_path}`", "inline": True},
+                                {"name": "Model", "value": f"`{model}`", "inline": True},
+                                {"name": "Temperature", "value": f"🔥 **{temp}°C**", "inline": True},
+                                {"name": "Threshold", "value": f"⚠️ **{int(temp_limit)}°C** ({'NVMe' if is_nvme else 'HDD'})", "inline": True},
+                                {"name": "Host", "value": f"`{hostname}`", "inline": True},
+                                {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
+                            ],
+                        }
+                        alerts.append({
+                            "metric": key,
+                            "title": title,
+                            "message": msg,
+                            "embed": embed,
+                            "value": f"{temp}C",
+                        })
+        except Exception as exc:
+            logging.debug(f"SMART/Thermal threshold check error: {exc}")
+
     # Send alerts and record cooldowns
     if alerts:
         mgr = NotificationManager(config_dict)
@@ -2435,6 +2541,518 @@ def resolve_raid_device(configured_device: Optional[str] = None) -> Optional[str
     if discovered:
         return discovered[0]
     return None
+
+
+_SMART_CACHE_TTL = 60.0
+_smart_cache_lock = threading.Lock()
+_smart_cache_store: dict[str, tuple[float, dict[str, Any]]] = {}
+_discovered_disks_cache: tuple[float, list[str]] = (0.0, [])
+
+
+def clear_smart_cache() -> None:
+    """Clear SMART telemetry cache (useful for testing or forced resets)."""
+    global _smart_cache_store, _discovered_disks_cache
+    with _smart_cache_lock:
+        _smart_cache_store.clear()
+        _discovered_disks_cache = (0.0, [])
+
+
+def _build_smart_fallback(device_path: str, error: str = "") -> dict[str, Any]:
+    """Return fallback SMART data dictionary when smartctl is missing, fails, or has no permissions."""
+    dev_name = device_path or "/dev/unknown"
+    is_nvme = "nvme" in dev_name.lower()
+    return {
+        "device": dev_name,
+        "model": "Unknown",
+        "serial_number": "Unknown",
+        "firmware_version": "Unknown",
+        "passed": True,
+        "temperature_c": None,
+        "power_on_hours": None,
+        "reallocated_sectors": 0,
+        "wear_level_percent": None,
+        "media_errors": 0,
+        "device_type": "nvme" if is_nvme else "hdd",
+        "raw_json": None,
+        "status": "unavailable" if not error else "error",
+        "error": error or None,
+    }
+
+
+def parse_smartctl_json(raw: dict[str, Any], device_path: str) -> dict[str, Any]:
+    """Parse JSON output from smartctl -j -a into a structured disk telemetry object."""
+    if not isinstance(raw, dict):
+        return _build_smart_fallback(device_path, error="Invalid JSON response")
+
+    dev_info = raw.get("device", {})
+    dev_name = device_path
+    dev_type = ""
+    if isinstance(dev_info, dict):
+        dev_name = dev_info.get("name") or dev_info.get("info_name") or device_path
+        dev_type = str(dev_info.get("type", "")).lower()
+
+    model = (
+        raw.get("model_name")
+        or raw.get("model_family")
+        or raw.get("device_model")
+        or raw.get("scsi_model_name")
+        or "Unknown"
+    )
+    if isinstance(model, str):
+        model = model.strip()
+
+    serial_number = str(raw.get("serial_number") or "Unknown").strip()
+    firmware_version = str(raw.get("firmware_version") or "Unknown").strip()
+
+    smart_status = raw.get("smart_status")
+    nvme_log = raw.get("nvme_smart_health_information_log")
+    if isinstance(smart_status, dict) and "passed" in smart_status:
+        passed = bool(smart_status["passed"])
+    elif isinstance(nvme_log, dict) and "critical_warning" in nvme_log:
+        passed = bool(nvme_log.get("critical_warning", 0) == 0)
+    else:
+        exit_status = raw.get("smartctl", {}).get("exit_status", 0)
+        passed = not bool(exit_status & 8)
+
+    temperature_c: Optional[int] = None
+    temp_obj = raw.get("temperature", {})
+    if isinstance(temp_obj, dict) and temp_obj.get("current") is not None:
+        try:
+            temperature_c = int(round(float(temp_obj["current"])))
+        except (ValueError, TypeError):
+            pass
+
+    if temperature_c is None and isinstance(nvme_log, dict) and nvme_log.get("temperature") is not None:
+        try:
+            raw_t = float(nvme_log["temperature"])
+            temperature_c = int(round(raw_t - 273.15 if raw_t > 200 else raw_t))
+        except (ValueError, TypeError):
+            pass
+
+    ata_table = raw.get("ata_smart_attributes", {}).get("table", [])
+    if temperature_c is None and isinstance(ata_table, list):
+        for attr in ata_table:
+            if isinstance(attr, dict) and attr.get("id") in (194, 190):
+                raw_attr = attr.get("raw", {})
+                val = raw_attr.get("value") if isinstance(raw_attr, dict) else attr.get("value")
+                if val is not None:
+                    try:
+                        v = int(val)
+                        temperature_c = v & 0xFFFF if v > 255 else v
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+    power_on_hours: Optional[int] = None
+    pot_obj = raw.get("power_on_time", {})
+    if isinstance(pot_obj, dict) and pot_obj.get("hours") is not None:
+        try:
+            power_on_hours = int(pot_obj["hours"])
+        except (ValueError, TypeError):
+            pass
+
+    if power_on_hours is None and isinstance(nvme_log, dict) and nvme_log.get("power_on_hours") is not None:
+        try:
+            power_on_hours = int(nvme_log["power_on_hours"])
+        except (ValueError, TypeError):
+            pass
+
+    if power_on_hours is None and isinstance(ata_table, list):
+        for attr in ata_table:
+            if isinstance(attr, dict) and attr.get("id") == 9:
+                raw_attr = attr.get("raw", {})
+                val = raw_attr.get("value") if isinstance(raw_attr, dict) else attr.get("value")
+                if val is not None:
+                    try:
+                        power_on_hours = int(val)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+    reallocated_sectors: Optional[int] = None
+    if isinstance(ata_table, list):
+        for attr in ata_table:
+            if isinstance(attr, dict) and attr.get("id") == 5:
+                raw_attr = attr.get("raw", {})
+                val = raw_attr.get("value") if isinstance(raw_attr, dict) else attr.get("value")
+                if val is not None:
+                    try:
+                        reallocated_sectors = int(val)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+    if reallocated_sectors is None:
+        reallocated_sectors = 0
+
+    wear_level_percent: Optional[int] = None
+    if isinstance(nvme_log, dict) and nvme_log.get("percentage_used") is not None:
+        try:
+            wear_level_percent = int(nvme_log["percentage_used"])
+        except (ValueError, TypeError):
+            pass
+
+    if wear_level_percent is None and isinstance(raw.get("ssd_endurance"), dict):
+        try:
+            wear_level_percent = int(raw["ssd_endurance"].get("percentage_used", 0))
+        except (ValueError, TypeError):
+            pass
+
+    if wear_level_percent is None and isinstance(ata_table, list):
+        for attr in ata_table:
+            if isinstance(attr, dict) and attr.get("id") in (177, 231, 233, 202):
+                raw_attr = attr.get("raw", {})
+                val = raw_attr.get("value") if isinstance(raw_attr, dict) else attr.get("value")
+                if val is not None:
+                    try:
+                        v = int(val)
+                        attr_name = str(attr.get("name", "")).lower()
+                        if "lifetime" in attr_name or "life_left" in attr_name:
+                            wear_level_percent = max(0, min(100, 100 - v))
+                        else:
+                            wear_level_percent = v
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+    media_errors: Optional[int] = None
+    if isinstance(nvme_log, dict):
+        err_val = nvme_log.get("media_errors")
+        if err_val is None:
+            err_val = nvme_log.get("media_and_data_integrity_errors")
+        if err_val is not None:
+            try:
+                media_errors = int(err_val)
+            except (ValueError, TypeError):
+                pass
+
+    if media_errors is None and isinstance(ata_table, list):
+        total_errs = 0
+        found_err = False
+        for attr in ata_table:
+            if isinstance(attr, dict) and attr.get("id") in (187, 197, 198):
+                raw_attr = attr.get("raw", {})
+                val = raw_attr.get("value") if isinstance(raw_attr, dict) else attr.get("value")
+                if val is not None:
+                    try:
+                        total_errs += int(val)
+                        found_err = True
+                    except (ValueError, TypeError):
+                        pass
+        if found_err:
+            media_errors = total_errs
+
+    if media_errors is None:
+        media_errors = 0
+
+    is_nvme = "nvme" in dev_name.lower() or dev_type == "nvme"
+    device_type = "nvme" if is_nvme else ("ssd" if wear_level_percent is not None or "ssd" in model.lower() else "hdd")
+
+    return {
+        "device": dev_name,
+        "model": model,
+        "serial_number": serial_number,
+        "firmware_version": firmware_version,
+        "passed": passed,
+        "temperature_c": temperature_c,
+        "power_on_hours": power_on_hours,
+        "reallocated_sectors": reallocated_sectors,
+        "wear_level_percent": wear_level_percent,
+        "media_errors": media_errors,
+        "device_type": device_type,
+        "raw_json": raw,
+        "status": "passed" if passed else "failed",
+    }
+
+
+def get_disk_smart_metrics(device_path: str, force_refresh: bool = False) -> dict[str, Any]:
+    """Collect S.M.A.R.T. telemetry for a single device via smartctl -j -a with 60-second caching."""
+    global _smart_cache_store
+    current_time = time.time()
+
+    if not device_path.startswith("/dev/"):
+        device_path = f"/dev/{device_path}"
+
+    if not force_refresh:
+        with _smart_cache_lock:
+            if device_path in _smart_cache_store:
+                ts, data = _smart_cache_store[device_path]
+                if current_time - ts < _SMART_CACHE_TTL:
+                    return copy.deepcopy(data)
+
+    smartctl_bin = shutil.which("smartctl") or "smartctl"
+
+    raw_data: Optional[dict[str, Any]] = None
+    proc = None
+    try:
+        proc = subprocess.run(
+            [smartctl_bin, "-j", "-a", device_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        stdout = proc.stdout.strip() if proc and proc.stdout else ""
+        if stdout:
+            try:
+                raw_data = json.loads(stdout)
+            except json.JSONDecodeError:
+                raw_data = None
+    except (subprocess.TimeoutExpired, OSError, PermissionError) as exc:
+        logging.debug(f"smartctl execution failed for {device_path}: {exc}")
+        result = _build_smart_fallback(device_path, error=str(exc))
+        with _smart_cache_lock:
+            _smart_cache_store[device_path] = (current_time, result)
+        return copy.deepcopy(result)
+
+    if raw_data and isinstance(raw_data, dict):
+        result = parse_smartctl_json(raw_data, device_path)
+    else:
+        err_msg = ""
+        if proc and proc.stderr:
+            err_msg = proc.stderr.strip()
+        elif proc and proc.stdout:
+            err_msg = proc.stdout.strip()
+        else:
+            err_msg = "smartctl utility not found or returned invalid output"
+        result = _build_smart_fallback(device_path, error=err_msg)
+
+    with _smart_cache_lock:
+        _smart_cache_store[device_path] = (current_time, result)
+    return copy.deepcopy(result)
+
+
+def discover_physical_disks(force_refresh: bool = False) -> list[str]:
+    """Discover active physical drives from /sys/block/ or raid member disks and block mounts."""
+    global _discovered_disks_cache
+    current_time = time.time()
+    if not force_refresh:
+        with _smart_cache_lock:
+            ts, cached_disks = _discovered_disks_cache
+            if current_time - ts < _SMART_CACHE_TTL and cached_disks:
+                return list(cached_disks)
+
+    disks: list[str] = []
+    seen: set[str] = set()
+
+    # 1. /sys/block/
+    sys_block = Path("/sys/block")
+    if sys_block.is_dir():
+        try:
+            for entry in sorted(sys_block.iterdir()):
+                name = entry.name
+                if name.startswith(("loop", "ram", "dm-", "dm", "md", "sr", "zram")):
+                    continue
+                if (entry / "partition").exists():
+                    continue
+                dev_path = f"/dev/{name}"
+                if dev_path not in seen:
+                    seen.add(dev_path)
+                    disks.append(dev_path)
+        except Exception as exc:
+            logging.debug(f"Error reading /sys/block: {exc}")
+
+    # 2. Check RAID member disks from /sys/block/md*/md/ or mdstat
+    if not disks:
+        try:
+            for raid_dev in discover_raid_devices():
+                dev_base = Path(raid_dev).name
+                md_dir = Path(f"/sys/block/{dev_base}/md")
+                if md_dir.is_dir():
+                    for dev_entry in md_dir.glob("dev-*"):
+                        subdev = dev_entry.name.replace("dev-", "")
+                        base_subdev = re.sub(r"p?\d+$", "", subdev)
+                        sub_path = f"/dev/{base_subdev}"
+                        if sub_path not in seen:
+                            seen.add(sub_path)
+                            disks.append(sub_path)
+        except Exception:
+            pass
+
+    # 3. Check mounted block devices via psutil
+    if not disks:
+        try:
+            for p in psutil.disk_partitions(all=False):
+                dev = p.device
+                if dev.startswith("/dev/"):
+                    base_name = os.path.basename(dev)
+                    if base_name.startswith(("loop", "ram", "dm-", "dm", "md", "sr", "zram")):
+                        continue
+                    nvme_m = re.match(r"^(nvme\d+n\d+)", base_name)
+                    if nvme_m:
+                        base_dev = f"/dev/{nvme_m.group(1)}"
+                    else:
+                        ata_m = re.match(r"^([a-zA-Z]+)", base_name)
+                        base_dev = f"/dev/{ata_m.group(1)}" if ata_m else dev
+                    if base_dev not in seen:
+                        seen.add(base_dev)
+                        disks.append(base_dev)
+        except Exception:
+            pass
+
+    with _smart_cache_lock:
+        _discovered_disks_cache = (current_time, disks)
+    return disks
+
+
+def get_all_disks_smart_metrics(force_refresh: bool = False) -> list[dict[str, Any]]:
+    """Gather SMART data for all active physical drives with 60-second caching."""
+    disk_paths = discover_physical_disks(force_refresh=force_refresh)
+    results: list[dict[str, Any]] = []
+    for d in disk_paths:
+        metrics = get_disk_smart_metrics(d, force_refresh=force_refresh)
+        results.append(metrics)
+    return results
+
+
+def get_hardware_thermal_metrics() -> dict[str, Any]:
+    """Scan Linux kernel interfaces /sys/class/thermal/ and /sys/class/hwmon/
+    to extract CPU package temperature, core temperatures, and fan speeds (RPM).
+    """
+    cpu_package_c: Optional[float] = None
+    cores: list[dict[str, Any]] = []
+    sensors: list[dict[str, Any]] = []
+    fans: list[dict[str, Any]] = []
+
+    # 1. Scan /sys/class/hwmon/hwmon*/
+    hwmon_base = Path("/sys/class/hwmon")
+    if hwmon_base.is_dir():
+        try:
+            hwmon_dirs = sorted(hwmon_base.glob("hwmon*"))
+            for hdir in hwmon_dirs:
+                target_dir = (
+                    hdir / "device"
+                    if (hdir / "device").is_dir() and not (hdir / "name").exists()
+                    else hdir
+                )
+                name_file = target_dir / "name"
+                hw_name = (
+                    name_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    if name_file.exists()
+                    else hdir.name
+                )
+
+                for temp_input in sorted(target_dir.glob("temp*_input")):
+                    prefix = temp_input.name[:-6]  # e.g. "temp1"
+                    label_file = target_dir / f"{prefix}_label"
+                    label = (
+                        label_file.read_text(encoding="utf-8", errors="ignore").strip()
+                        if label_file.exists()
+                        else f"{hw_name} {prefix}"
+                    )
+                    try:
+                        raw_temp = float(
+                            temp_input.read_text(encoding="utf-8", errors="ignore").strip()
+                        )
+                        temp_c = round(raw_temp / 1000.0 if abs(raw_temp) > 200 else raw_temp, 1)
+                    except (ValueError, TypeError):
+                        continue
+
+                    sensors.append({"name": label, "temp_c": temp_c})
+
+                    lower_label = label.lower()
+                    if cpu_package_c is None and any(
+                        k in lower_label
+                        for k in ("package id", "cpu package", "package", "tdie", "tctl")
+                    ):
+                        cpu_package_c = temp_c
+
+                    if "core" in lower_label and not any(
+                        k in lower_label for k in ("coretemp", "package")
+                    ):
+                        cores.append({"label": label, "temp_c": temp_c})
+                    elif re.search(r"core\s*\d+", lower_label):
+                        cores.append({"label": label, "temp_c": temp_c})
+
+                for fan_input in sorted(target_dir.glob("fan*_input")):
+                    prefix = fan_input.name[:-6]  # e.g. "fan1"
+                    label_file = target_dir / f"{prefix}_label"
+                    label = (
+                        label_file.read_text(encoding="utf-8", errors="ignore").strip()
+                        if label_file.exists()
+                        else f"{hw_name} {prefix}"
+                    )
+                    try:
+                        rpm = int(
+                            float(fan_input.read_text(encoding="utf-8", errors="ignore").strip())
+                        )
+                        fans.append({"label": label, "rpm": rpm})
+                    except (ValueError, TypeError):
+                        continue
+        except Exception as exc:
+            logging.debug(f"Error scanning /sys/class/hwmon: {exc}")
+
+    # 2. Scan /sys/class/thermal/thermal_zone*/
+    thermal_base = Path("/sys/class/thermal")
+    if thermal_base.is_dir():
+        try:
+            zone_dirs = sorted(thermal_base.glob("thermal_zone*"))
+            for zdir in zone_dirs:
+                type_file = zdir / "type"
+                temp_file = zdir / "temp"
+                if not temp_file.exists():
+                    continue
+                ztype = (
+                    type_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    if type_file.exists()
+                    else zdir.name
+                )
+                try:
+                    raw_val = float(
+                        temp_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    )
+                    temp_c = round(raw_val / 1000.0 if abs(raw_val) > 200 else raw_val, 1)
+                except (ValueError, TypeError):
+                    continue
+
+                if not any(s["name"] == ztype for s in sensors):
+                    sensors.append({"name": ztype, "temp_c": temp_c})
+
+                if cpu_package_c is None and any(
+                    k in ztype.lower() for k in ("pkg", "cpu", "soc", "x86_pkg_temp")
+                ):
+                    cpu_package_c = temp_c
+        except Exception as exc:
+            logging.debug(f"Error scanning /sys/class/thermal: {exc}")
+
+    # 3. Fallback to psutil sensors if sysfs didn't find sensors/cores
+    if cpu_package_c is None and not cores and not sensors:
+        try:
+            if hasattr(psutil, "sensors_temperatures"):
+                temps = psutil.sensors_temperatures() or {}
+                for chip_name, entries in temps.items():
+                    for entry in entries:
+                        label = entry.label or chip_name
+                        temp_c = round(float(entry.current), 1)
+                        sensors.append({"name": label, "temp_c": temp_c})
+                        lower_label = label.lower()
+                        if cpu_package_c is None and any(
+                            k in lower_label for k in ("package", "tdie", "tctl", "cpu")
+                        ):
+                            cpu_package_c = temp_c
+                        if "core" in lower_label:
+                            cores.append({"label": label, "temp_c": temp_c})
+        except Exception:
+            pass
+
+    if not fans:
+        try:
+            if hasattr(psutil, "sensors_fans"):
+                fan_data = psutil.sensors_fans() or {}
+                for chip_name, entries in fan_data.items():
+                    for entry in entries:
+                        label = entry.label or chip_name
+                        fans.append({"label": label, "rpm": int(entry.current)})
+        except Exception:
+            pass
+
+    if cpu_package_c is None and cores:
+        cpu_package_c = max(c["temp_c"] for c in cores)
+
+    return {
+        "cpu_package_c": cpu_package_c,
+        "cores": cores,
+        "sensors": sensors,
+        "fans": fans,
+    }
 
 
 def _format_bytes(bytes_val: int | float) -> str:
@@ -3000,6 +3618,39 @@ def _extract_raid_summary_data(
                 device_name = parts[-1].replace("/dev/", "")
                 device_state = " ".join(parts[4:-1])
                 devices.append({"device": device_name, "state": device_state})
+
+    if devices:
+        try:
+            smart_list = get_all_disks_smart_metrics()
+            smart_map: dict[str, dict[str, Any]] = {}
+            for s in smart_list:
+                dev_str = s.get("device", "")
+                smart_map[dev_str] = s
+                smart_map[os.path.basename(dev_str)] = s
+
+            for d in devices:
+                d_name = d.get("device", "")
+                nvme_m = re.match(r"^(nvme\d+n\d+)", d_name)
+                if nvme_m:
+                    base_k = nvme_m.group(1)
+                else:
+                    ata_m = re.match(r"^([a-zA-Z]+)", d_name)
+                    base_k = ata_m.group(1) if ata_m else d_name
+
+                sm = (
+                    smart_map.get(d_name)
+                    or smart_map.get(f"/dev/{d_name}")
+                    or smart_map.get(base_k)
+                    or smart_map.get(f"/dev/{base_k}")
+                )
+                if sm:
+                    d["temperature_c"] = sm.get("temperature_c")
+                    d["passed"] = sm.get("passed")
+                    d["smart_status"] = "PASSED" if sm.get("passed") is True else ("FAILED" if sm.get("passed") is False else "UNKNOWN")
+                    d["wear_level_percent"] = sm.get("wear_level_percent")
+                    d["model"] = sm.get("model")
+        except Exception:
+            pass
 
     storage_info = "N/A"
     if duf_output:
@@ -6109,10 +6760,20 @@ def kill_process(pid: int, signal_name: str = "SIGTERM") -> dict[str, Any]:
 
 
 def get_storage_metrics() -> list[dict[str, Any]]:
-    """Collect mounted partition metrics via psutil."""
+    """Collect mounted partition metrics via psutil enriched with SMART disk telemetry."""
     partitions = psutil.disk_partitions(all=False)
     seen_mountpoints: set[str] = set()
     disks: list[dict[str, Any]] = []
+
+    smart_map: dict[str, dict[str, Any]] = {}
+    try:
+        for sm in get_all_disks_smart_metrics():
+            dev_str = sm.get("device", "")
+            smart_map[dev_str] = sm
+            smart_map[os.path.basename(dev_str)] = sm
+    except Exception:
+        pass
+
     for p in partitions:
         if p.mountpoint in seen_mountpoints:
             continue
@@ -6129,6 +6790,16 @@ def get_storage_metrics() -> list[dict[str, Any]]:
             free = 0
             percent = 0.0
 
+        base_name = os.path.basename(p.device)
+        nvme_m = re.match(r"^(nvme\d+n\d+)", base_name)
+        if nvme_m:
+            base_k = nvme_m.group(1)
+        else:
+            ata_m = re.match(r"^([a-zA-Z]+)", base_name)
+            base_k = ata_m.group(1) if ata_m else base_name
+
+        sm = smart_map.get(p.device) or smart_map.get(f"/dev/{base_k}") or smart_map.get(base_k) or {}
+
         disks.append(
             {
                 "mountpoint": p.mountpoint,
@@ -6140,6 +6811,11 @@ def get_storage_metrics() -> list[dict[str, Any]]:
                 "used": used,
                 "free": free,
                 "percent": percent,
+                "temperature_c": sm.get("temperature_c"),
+                "smart_passed": sm.get("passed"),
+                "smart_status": "PASSED" if sm.get("passed") is True else ("FAILED" if sm.get("passed") is False else "UNKNOWN"),
+                "model": sm.get("model"),
+                "wear_level_percent": sm.get("wear_level_percent"),
             }
         )
     if not disks:
@@ -6156,6 +6832,11 @@ def get_storage_metrics() -> list[dict[str, Any]]:
                     "used": usage.used,
                     "free": usage.free,
                     "percent": usage.percent,
+                    "temperature_c": None,
+                    "smart_passed": True,
+                    "smart_status": "UNKNOWN",
+                    "model": None,
+                    "wear_level_percent": None,
                 }
             )
         except (PermissionError, OSError):
@@ -6401,6 +7082,8 @@ def get_system_metrics_data() -> dict[str, Any]:
     storage_metrics = get_storage_metrics()
     services_summary = get_services_summary()
     network_metrics = get_network_metrics()
+    physical_disks = get_all_disks_smart_metrics()
+    thermals = get_hardware_thermal_metrics()
 
     os_distro = ""
     try:
@@ -6436,6 +7119,9 @@ def get_system_metrics_data() -> dict[str, Any]:
         "disks": storage_metrics,
         "filesystems": storage_metrics,
         "mounts": storage_metrics,
+        "physical_disks": physical_disks,
+        "thermals": thermals,
+        "thermal": thermals,
         "services_summary": services_summary,
         "network": network_metrics,
         "boot_time": boot_time,
