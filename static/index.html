@@ -697,14 +697,7 @@
                 <p class="section-subtitle">RAID Arrays, Block Disks &amp; Filesystems</p>
               </div>
               <div class="module-toolbar">
-                <span id="raid-adaptive-badge" class="adaptive-badge hidden">5s Rebuild Boost</span>
-                <select id="raid-interval-select" class="module-interval-select" aria-label="Storage refresh rate">
-                  <option value="5">5s</option>
-                  <option value="15">15s (Adaptive)</option>
-                  <option value="30">30s</option>
-                  <option value="60">60s</option>
-                  <option value="0">Paused</option>
-                </select>
+                <span class="module-status-dot" title="Live stream active"></span>
                 <span id="raid-last-updated" class="module-last-updated">--</span>
                 <button id="refresh-raid-btn" class="btn-module-refresh" type="button" aria-label="Refresh Storage" title="Refresh Storage">
                   <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
@@ -825,16 +818,12 @@
                     <dd id="raid-uuid" class="mono-text">--</dd>
                   </div>
                   <div class="detail-item">
-                    <dt>Update Time</dt>
-                    <dd id="raid-update-time">--</dd>
-                  </div>
-                  <div class="detail-item">
                     <dt>Layout / Chunk</dt>
                     <dd id="raid-layout-chunk">--</dd>
                   </div>
                   <div class="detail-item">
-                    <dt>Consistency / Events</dt>
-                    <dd id="raid-consistency-events">--</dd>
+                    <dt>Consistency Policy</dt>
+                    <dd id="raid-consistency-policy">--</dd>
                   </div>
                 </dl>
 

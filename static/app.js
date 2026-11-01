@@ -1155,8 +1155,8 @@ function renderRaidDetails(raid) {
     setField("raid-full-state", "No RAID array detected");
     setField("raid-persistence", "--");
     setField("raid-uuid", "--");
-    setField("raid-update-time", "--");
     setField("raid-layout-chunk", "--");
+    setField("raid-consistency-policy", "--");
     setField("raid-consistency-events", "--");
   } else {
     setField("raid-device", raid.raid_device);
@@ -1170,16 +1170,38 @@ function renderRaidDetails(raid) {
     setField("raid-check-status", raid.check_status);
     setField("raid-full-state", raid.full_state || status);
     setField("raid-persistence", raid.persistence);
-    setField("raid-uuid", raid.uuid);
-    setField("raid-update-time", raid.update_time);
+
+    // UUID
     setField(
-      "raid-layout-chunk",
-      `${raid.layout || "unknown"} / ${raid.chunk_size || "unknown"}`
+      "raid-uuid",
+      raid.uuid && raid.uuid !== "unknown" ? raid.uuid : "N/A"
     );
-    setField(
-      "raid-consistency-events",
-      `${raid.consistency_policy || "unknown"} (Events: ${raid.events || "unknown"})`
-    );
+
+    // Layout / Chunk
+    const levelStr = String(raid.raid_level || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-_]/g, "");
+    let layoutChunkVal = "N/A";
+    if (levelStr === "raid1" || levelStr === "1") {
+      layoutChunkVal = "N/A (Mirrored)";
+    } else if (
+      raid.layout &&
+      raid.layout !== "unknown" &&
+      raid.chunk_size &&
+      raid.chunk_size !== "unknown"
+    ) {
+      layoutChunkVal = `${raid.layout} / ${raid.chunk_size}`;
+    }
+    setField("raid-layout-chunk", layoutChunkVal);
+
+    // Consistency Policy
+    const consistencyPolicyVal =
+      raid.consistency_policy && raid.consistency_policy !== "unknown"
+        ? raid.consistency_policy
+        : "N/A";
+    setField("raid-consistency-policy", consistencyPolicyVal);
+    setField("raid-consistency-events", consistencyPolicyVal);
   }
 
   // Active Disks table
