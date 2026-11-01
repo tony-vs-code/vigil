@@ -7057,6 +7057,109 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         for elem in net_elements:
             self.assertIn(elem, self.index_html)
 
+    def test_overview_page_redesign_layout_and_chromeless_invariants(self):
+        """Assert full cross-tier contracts and CSS invariants for Overview redesign.
+        
+        Requirements:
+        1. No container/card chrome on overview telemetry objects (CPU, Memory, Host Platform, Ribbon).
+        2. Cohesive flow layout without bucketed section chrome.
+        3. No internal scrollbar in .cpu-cores-grid (all cores displayed without overflow scrolling).
+        4. No text truncation in overview status ribbon descriptions (fully readable).
+        5. Balanced 2-column desktop grid collapsing cleanly on responsive viewports.
+        6. Full preservation of all 58+ DOM IDs and hidden storage card contract.
+        """
+        css_text = (Path(__file__).parent / "static" / "styles.css").read_text(encoding="utf-8")
+
+        # 1. Flow container & header structure in HTML
+        self.assertIn('class="overview-flow"', self.index_html)
+        self.assertIn('class="overview-inline-toolbar"', self.index_html)
+        self.assertIn('id="system-metrics-heading" class="sr-only"', self.index_html)
+        self.assertIn('class="metrics-grid overview-flow-grid"', self.index_html)
+
+        # 2. Absence of card chrome on overview metric cards in HTML (no .card class)
+        self.assertIn('<article class="metric-card" id="cpu-metric-card">', self.index_html)
+        self.assertNotIn('<article class="card metric-card" id="cpu-metric-card">', self.index_html)
+        self.assertIn('<article class="metric-card" id="memory-metric-card">', self.index_html)
+        self.assertNotIn('<article class="card metric-card" id="memory-metric-card">', self.index_html)
+        self.assertIn('<article class="metric-card" id="host-platform-card">', self.index_html)
+        self.assertNotIn('<article class="card metric-card" id="host-platform-card">', self.index_html)
+
+        # 3. Flat Status Ribbon (no card chrome)
+        self.assertIn('class="overview-status-ribbon overview-cockpit-grid overview-ribbon-flat"', self.index_html)
+
+        # 4. Storage card preserved with hidden class and style for contract compatibility
+        self.assertIn('id="storage-metric-card"', self.index_html)
+        self.assertIn('class="card metric-card hidden" id="storage-metric-card" style="display: none;" aria-hidden="true"', self.index_html)
+
+        # 5. CSS Invariants: Chrome-less styling for overview telemetry objects
+        self.assertIn(".overview-flow-grid > .metric-card", css_text)
+        metric_card_rule = re.search(r'\.overview-flow-grid > \.metric-card\s*\{([^}]+)\}', css_text)
+        self.assertIsNotNone(metric_card_rule, ".overview-flow-grid > .metric-card rule must be defined in CSS")
+        rule_content = metric_card_rule.group(1)
+        self.assertIn("background: transparent;", rule_content)
+        self.assertIn("border: none;", rule_content)
+        self.assertIn("box-shadow: none;", rule_content)
+
+        ribbon_rule = re.search(r'\.overview-status-ribbon\.overview-ribbon-flat\s*\{([^}]+)\}', css_text)
+        self.assertIsNotNone(ribbon_rule, ".overview-status-ribbon.overview-ribbon-flat rule must be defined in CSS")
+        ribbon_content = ribbon_rule.group(1)
+        self.assertIn("background: transparent;", ribbon_content)
+        self.assertIn("box-shadow: none;", ribbon_content)
+
+        # 6. CSS Invariants: Status ribbon description readability (no ellipsis / no overflow hidden)
+        ribbon_desc_rule = re.search(r'\.overview-ribbon-flat \.status-ribbon-desc\s*\{([^}]+)\}', css_text)
+        self.assertIsNotNone(ribbon_desc_rule, ".overview-ribbon-flat .status-ribbon-desc rule must be defined")
+        desc_content = ribbon_desc_rule.group(1)
+        self.assertIn("white-space: normal;", desc_content)
+        self.assertIn("overflow: visible;", desc_content)
+        self.assertIn("text-overflow: unset;", desc_content)
+
+        # 7. CSS Invariants: No internal scrollbar in .cpu-cores-grid
+        cores_grid_rule = re.search(r'(?<![#.-])\.cpu-cores-grid\s*\{([^}]+)\}', css_text)
+        self.assertIsNotNone(cores_grid_rule, ".cpu-cores-grid rule must be defined")
+        grid_content = cores_grid_rule.group(1)
+        self.assertNotIn("overflow-y", grid_content, ".cpu-cores-grid must not have internal scrollbar overflow-y")
+        self.assertNotIn("max-height", grid_content, ".cpu-cores-grid must not constrain height with max-height")
+
+        # 8. CSS Invariants: 2-column balanced flow layout and mobile collapse
+        self.assertIn("grid-template-columns: 1.15fr 1fr;", css_text)
+        self.assertIn(".overview-flow-grid > #cpu-metric-card", css_text)
+        self.assertIn("grid-column: 1;", css_text)
+        self.assertIn("grid-row: 1 / span 2;", css_text)
+        self.assertIn(".overview-flow-grid > #memory-metric-card", css_text)
+        self.assertIn("grid-column: 2;", css_text)
+        self.assertIn("grid-row: 1;", css_text)
+        self.assertIn(".overview-flow-grid > #host-platform-card", css_text)
+        self.assertIn("grid-column: 2;", css_text)
+        self.assertIn("grid-row: 2;", css_text)
+        self.assertIn(".overview-flow-grid > #storage-metric-card", css_text)
+        self.assertIn("display: none !important;", css_text)
+
+        # 9. All 59 Overview DOM IDs preserved in index.html
+        overview_dom_ids = [
+            "system-metrics-heading", "system-last-updated", "refresh-system-btn",
+            "overview-raid-status-badge", "overview-raid-summary", "btn-goto-raid",
+            "overview-docker-badge", "overview-docker-summary", "btn-goto-containers",
+            "overview-discord-badge", "overview-discord-summary", "btn-goto-notifications",
+            "overview-services-badge", "overview-services-summary", "btn-goto-services",
+            "overview-packages-badge", "overview-packages-summary", "btn-goto-packages",
+            "cpu-metric-card", "cpu-cores-badge", "cpu-percent-value", "cpu-progress-bar",
+            "cpu-load-detail", "cpu-subtitle", "btn-toggle-cpu-cores", "cpu-cores-drilldown",
+            "cpu-cores-unified-canvas", "cpu-cores-grid",
+            "memory-metric-card", "memory-percent-value", "memory-progress-bar",
+            "memory-chart-container", "memory-history-chart", "memChartGrad",
+            "memory-chart-area", "memory-chart-line", "memory-detail",
+            "memory-breakdown-chips", "memory-chip-used", "memory-chip-cached", "memory-chip-free",
+            "storage-metric-card", "disk-percent-value", "disk-detail", "disk-progress-bar",
+            "btn-goto-storage", "overview-mounts-container", "overview-mounts-list",
+            "host-platform-card", "uptime-value", "uptime-load-badge", "host-os-detail",
+            "host-kernel-detail", "boot-time-detail", "host-network-status",
+            "host-network-interface", "host-network-ip", "host-network-rx", "host-network-tx",
+        ]
+        self.assertEqual(len(overview_dom_ids), 59)
+        for dom_id in overview_dom_ids:
+            self.assertIn(f'id="{dom_id}"', self.index_html, f"Expected DOM element id '{dom_id}' to be present in index.html")
+
     def test_windows_task_manager_style_cpu_per_core_charts(self):
         """Verify Windows Task Manager style rolling time-series graph for CPU cores."""
         css_text = (Path(__file__).parent / "static" / "styles.css").read_text(encoding="utf-8")

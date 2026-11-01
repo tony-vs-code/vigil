@@ -1747,6 +1747,58 @@ body {
 }
 
 /* Section Layout */
+/* ── Overview Flow Layout ────────────────────────────────────────────── */
+.overview-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* Inline toolbar for overview (replaces section-header) */
+.overview-inline-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+/* Thin divider between overview sections */
+hr.overview-flow-divider {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: 20px 0;
+  opacity: 0.6;
+}
+
+/* Strip card chrome from metric-cards inside overview flow */
+.overview-flow-grid > .metric-card {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* Give visible metric-cards some vertical breathing room */
+.overview-flow-grid > .metric-card:not(.hidden) {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+/* Visually hidden heading (still accessible, keeps ID for JS) */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .section-block {
   margin-bottom: 28px;
 }
@@ -1901,6 +1953,53 @@ body {
   margin-bottom: 24px;
 }
 
+/* Flat ribbon variant for overview flow layout — no container chrome */
+.overview-status-ribbon.overview-ribbon-flat {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0 0 18px 0;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+}
+
+.overview-ribbon-flat .status-ribbon-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.overview-ribbon-flat .status-ribbon-badge-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.overview-ribbon-flat .status-ribbon-desc {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  white-space: normal;
+  overflow: visible;
+  line-height: 1.25;
+  text-overflow: unset;
+}
+
+.overview-ribbon-flat .status-ribbon-divider {
+  width: 1px;
+  height: auto;
+  align-self: stretch;
+  background: var(--border-subtle);
+  flex-shrink: 0;
+}
+
 .status-ribbon-item {
   display: flex;
   align-items: center;
@@ -1963,12 +2062,14 @@ body {
 }
 
 @media (max-width: 900px) {
-  .overview-status-ribbon {
+  .overview-status-ribbon,
+  .overview-status-ribbon.overview-ribbon-flat {
     flex-direction: column;
     align-items: stretch;
     gap: 12px;
   }
-  .status-ribbon-divider {
+  .status-ribbon-divider,
+  .overview-ribbon-flat .status-ribbon-divider {
     width: 100%;
     height: 1px;
   }
@@ -1980,6 +2081,61 @@ body {
   grid-template-columns: repeat(2, 1fr);
   gap: 20px;
   align-items: start;
+}
+
+/* Overview flow variant — 2-column balanced flow, no card chrome */
+.metrics-grid.overview-flow-grid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  column-gap: 40px;
+  row-gap: 24px;
+  align-items: start;
+}
+
+.overview-flow-grid > #cpu-metric-card {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
+
+.overview-flow-grid > #memory-metric-card {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.overview-flow-grid > #storage-metric-card {
+  display: none !important;
+}
+
+.overview-flow-grid > #host-platform-card {
+  grid-column: 2;
+  grid-row: 2;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 20px;
+}
+
+.overview-flow-grid > hr.overview-flow-divider {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  .metrics-grid.overview-flow-grid {
+    grid-template-columns: 1fr;
+    row-gap: 28px;
+  }
+  .overview-flow-grid > #cpu-metric-card {
+    grid-column: 1;
+    grid-row: auto;
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: 24px;
+  }
+  .overview-flow-grid > #memory-metric-card {
+    grid-column: 1;
+    grid-row: auto;
+  }
+  .overview-flow-grid > #host-platform-card {
+    grid-column: 1;
+    grid-row: auto;
+  }
 }
 
 .metric-card {
@@ -2137,8 +2293,6 @@ body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(115px, 1fr));
   gap: 6px;
-  max-height: 180px;
-  overflow-y: auto;
   padding-right: 2px;
 }
 

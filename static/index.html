@@ -435,25 +435,25 @@
 
         <!-- View Panel: Overview (#view-overview) -->
         <div id="view-overview" class="view-panel" role="tabpanel" aria-labelledby="nav-tab-overview">
-          <!-- System Metrics Section -->
-          <section class="section-block" aria-labelledby="system-metrics-heading">
-            <div class="section-header">
-              <h2 id="system-metrics-heading" class="section-title">System Metrics</h2>
-              <div class="module-toolbar">
-                <span class="module-status-dot" title="Live stream active"></span>
-                <span id="system-last-updated" class="module-last-updated">--</span>
-                <button id="refresh-system-btn" class="btn-module-refresh" type="button" aria-label="Refresh System Metrics" title="Refresh System Metrics">
-                  <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                    <polyline points="23 4 23 10 17 10"></polyline>
-                    <polyline points="1 20 1 14 7 14"></polyline>
-                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-                  </svg>
-                </button>
-              </div>
+          <!-- Overview Flow Layout -->
+          <section class="overview-flow" aria-labelledby="system-metrics-heading">
+            <h2 id="system-metrics-heading" class="sr-only">System Metrics</h2>
+
+            <!-- Inline toolbar: status dot, timestamp, refresh -->
+            <div class="overview-inline-toolbar">
+              <span class="module-status-dot" title="Live stream active"></span>
+              <span id="system-last-updated" class="module-last-updated">--</span>
+              <button id="refresh-system-btn" class="btn-module-refresh" type="button" aria-label="Refresh System Metrics" title="Refresh System Metrics">
+                <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="23 4 23 10 17 10"></polyline>
+                  <polyline points="1 20 1 14 7 14"></polyline>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                </svg>
+              </button>
             </div>
 
-            <!-- Health Status Ribbon: Compact, visual overview bar integrated directly above metrics -->
-            <div class="overview-status-ribbon overview-cockpit-grid" role="region" aria-label="Quick System Health">
+            <!-- Health Status Ribbon: Inline status items without container background -->
+            <div class="overview-status-ribbon overview-cockpit-grid overview-ribbon-flat" role="region" aria-label="Quick System Health">
               <div class="status-ribbon-item">
                 <div class="status-ribbon-badge-group">
                   <span class="status-ribbon-label">Storage</span>
@@ -523,9 +523,9 @@
               </div>
             </div>
 
-            <div class="metrics-grid">
-              <!-- Row 1, Card 1: CPU Telemetry -->
-              <article class="card metric-card" id="cpu-metric-card">
+            <div class="metrics-grid overview-flow-grid">
+              <!-- CPU Telemetry -->
+              <article class="metric-card" id="cpu-metric-card">
                 <div class="metric-header">
                   <span class="metric-title">CPU Telemetry</span>
                   <div class="metric-header-right">
@@ -557,8 +557,10 @@
                 </div>
               </article>
 
-              <!-- Row 1, Card 2: Memory Telemetry -->
-              <article class="card metric-card" id="memory-metric-card">
+              <hr class="overview-flow-divider" aria-hidden="true" />
+
+              <!-- Memory Telemetry -->
+              <article class="metric-card" id="memory-metric-card">
                 <div class="metric-header">
                   <span class="metric-title">Memory Telemetry</span>
                   <span id="memory-percent-value" class="metric-value">--%</span>
@@ -612,8 +614,10 @@
                 </div>
               </article>
 
-              <!-- Row 2, Card 4: Host Platform & System Telemetry -->
-              <article class="card metric-card" id="host-platform-card">
+              <hr class="overview-flow-divider" aria-hidden="true" />
+
+              <!-- Host Platform & System Telemetry -->
+              <article class="metric-card" id="host-platform-card">
                 <div class="metric-header">
                   <span class="metric-title">Host Platform &amp; Telemetry</span>
                   <span id="uptime-value" class="metric-value metric-value-uptime">--</span>
