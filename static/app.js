@@ -986,14 +986,21 @@ function renderSystemMetrics(system) {
   const net = system.network || {};
   const ifaces = Array.isArray(net.interfaces) ? net.interfaces : [];
   const primaryIface =
+    ifaces.find((i) => i.is_physical && i.is_up && i.ip) ||
+    ifaces.find((i) => !i.is_virtual && i.is_up && i.ip) ||
+    ifaces.find((i) => i.is_physical && i.is_up) ||
+    ifaces.find((i) => !i.is_virtual && i.is_up) ||
     ifaces.find((i) => i.is_up && i.ip) ||
-    ifaces.find((i) => i.is_up) ||
     ifaces[0] ||
     {};
 
   const ifaceNameEl = document.getElementById("host-network-interface");
   if (ifaceNameEl) {
-    ifaceNameEl.textContent = primaryIface.interface || (ifaces.length > 0 ? ifaces[0].interface : "--");
+    const rawName = primaryIface.interface || (ifaces.length > 0 ? ifaces[0].interface : "--");
+    const typeLabel = primaryIface.adapter_type && primaryIface.adapter_type !== "virtual" && primaryIface.adapter_type !== "docker"
+      ? ` (${primaryIface.adapter_type})`
+      : "";
+    ifaceNameEl.textContent = `${rawName}${typeLabel}`;
   }
 
   const ifaceIpEl = document.getElementById("host-network-ip");
@@ -1338,29 +1345,6 @@ function renderNotificationHistory(historyPayload) {
     countBadge.textContent = `${records.length} ${records.length === 1 ? "record" : "records"}`;
   }
 
-  const drawerCount = document.getElementById("drawer-notif-count");
-  if (drawerCount) {
-    drawerCount.textContent = `${records.length} recent`;
-  }
-
-  const notifBadge = document.getElementById("notif-drawer-badge");
-  if (notifBadge) {
-    const alertCount = records.filter(
-      (r) => r.status === "degraded" || r.status === "critical" || r.status === "failed"
-    ).length;
-    if (alertCount > 0) {
-      notifBadge.textContent = String(alertCount);
-      notifBadge.classList.remove("hidden");
-      notifBadge.classList.add("has-alerts");
-    } else if (records.length > 0) {
-      notifBadge.textContent = String(records.length);
-      notifBadge.classList.remove("hidden");
-      notifBadge.classList.remove("has-alerts");
-    } else {
-      notifBadge.classList.add("hidden");
-    }
-  }
-
   renderDrawerNotificationList(records);
 
   const tbody = document.getElementById("notification-history-tbody");
@@ -1481,12 +1465,23 @@ function renderDrawerNotificationList(records) {
   const badgeAll = document.getElementById("drawer-badge-all");
   const badgeAlerts = document.getElementById("drawer-badge-alerts");
   const badgeApp = document.getElementById("drawer-badge-app");
-  const countBadge = document.getElementById("drawer-notif-count");
+  const notifBadge = document.getElementById("notif-drawer-badge");
 
   if (badgeAll) badgeAll.textContent = String(activeRecords.length);
   if (badgeAlerts) badgeAlerts.textContent = String(alertsCount);
   if (badgeApp) badgeApp.textContent = String(appCount);
-  if (countBadge) countBadge.textContent = `${activeRecords.length} active`;
+
+  if (notifBadge) {
+    if (alertsCount > 0) {
+      notifBadge.textContent = String(alertsCount);
+      notifBadge.classList.remove("hidden");
+      notifBadge.classList.add("has-alerts");
+    } else {
+      notifBadge.textContent = "0";
+      notifBadge.classList.add("hidden");
+      notifBadge.classList.remove("has-alerts");
+    }
+  }
 
   let displayedRecords = activeRecords;
   if (currentDrawerFilter === "alerts") {
@@ -2557,6 +2552,8 @@ function onAuthenticatedSuccess(username) {
   fetchDockerUpdates({ background: true });
   fetchPackageUpdates();
   fetchInstalledPackages("", 1);
+  fetchSystemUsers();
+  fetchSystemGroups();
   startSystemUpdatePolling();
 }
 
@@ -4062,6 +4059,8 @@ function switchViewTab(tabName, updateHash = true) {
 
     if (isAuthenticated) {
       switchUsersSubtab(currentUsersSubtab);
+      fetchSystemUsers();
+      fetchSystemGroups();
     }
   } else if (isAudit) {
     auditTab?.classList.add("active");
@@ -8149,10 +8148,6 @@ function initDashboard() {
       servicesFilterState = e.target.value;
       if (cachedServicesData) renderSystemServices(cachedServicesData);
     });
-
-  document
-    .getElementById("btn-topbar-vigil-logs")
-    ?.addEventListener("click", openVigilLogsModal);
 
   document
     .getElementById("btn-sidebar-vigil-logs")
