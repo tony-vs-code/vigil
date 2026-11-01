@@ -2120,7 +2120,7 @@ async def evaluate_threshold_alerts(
     if thresholds.get("raid_degraded", True):
         try:
             status, details = check_raid_status()
-            if status not in ("clean", "active", "none"):
+            if status in ("degraded", "failed", "faulty", "error"):
                 key = "raid_degraded"
                 entry = get_notification_state_entry(f"threshold_{key}")
                 in_cooldown = entry is not None and current_time < entry[1]
@@ -2453,6 +2453,67 @@ def get_disk_usage_statvfs(mount_path: str) -> dict[str, Any]:
         }
 
 
+def get_mdstat_sync_progress(dev_name_or_path: str) -> dict[str, Any]:
+    """Parse active resync/recovery/check progress from /proc/mdstat for a device (e.g. md0 or /dev/md0)."""
+    mdstat_path = Path("/proc/mdstat")
+    try:
+        if not mdstat_path.exists():
+            return {}
+        dev_base = Path(dev_name_or_path).name
+        content = mdstat_path.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+        for i, line in enumerate(lines):
+            match_header = re.match(r"^(\w+)\s*:", line.strip())
+            if match_header and match_header.group(1) == dev_base:
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    sub = lines[j].strip()
+                    if ":" in sub and not sub.startswith("["):
+                        break
+                    sync_m = re.search(
+                        r"(\w+)\s*=\s*(\d+(?:\.\d+)?)%\s*\(([0-9]+)/([0-9]+)\)\s+finish=([^\s]+)\s+speed=([^\s]+)",
+                        sub,
+                    )
+                    if sync_m:
+                        speed_val = sync_m.group(6)
+                        if speed_val.endswith("K/sec"):
+                            try:
+                                speed_kb = float(speed_val[:-5])
+                                speed_val = (
+                                    f"{speed_kb / 1024.0:.1f} MB/s"
+                                    if speed_kb >= 1024.0
+                                    else speed_val
+                                )
+                            except ValueError:
+                                pass
+                        return {
+                            "action": sync_m.group(1).lower(),
+                            "percent": float(sync_m.group(2)),
+                            "completed": sync_m.group(3),
+                            "total": sync_m.group(4),
+                            "eta": sync_m.group(5),
+                            "speed": speed_val,
+                        }
+                    simple_m = re.search(r"(\w+)\s*=\s*(\d+(?:\.\d+)?)%", sub)
+                    if simple_m and simple_m.group(1).lower() in (
+                        "resync",
+                        "recovery",
+                        "recover",
+                        "check",
+                        "repair",
+                    ):
+                        return {
+                            "action": simple_m.group(1).lower(),
+                            "percent": float(simple_m.group(2)),
+                            "completed": "",
+                            "total": "",
+                            "eta": "",
+                            "speed": "",
+                        }
+    except Exception as exc:
+        logging.debug(f"Error reading /proc/mdstat for {dev_name_or_path}: {exc}")
+    return {}
+
+
 def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
     """Read Linux kernel sysfs raid state directly from /sys/block/<dev>/md/."""
     try:
@@ -2493,13 +2554,50 @@ def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
         if sync_completed_file.exists():
             sync_completed = sync_completed_file.read_text(encoding="utf-8").strip()
 
-        # Determine normalized status
-        if degraded > 0:
-            status = "degraded"
+        # sync_speed from sysfs
+        sync_speed = ""
+        sync_speed_file = md_dir / "sync_speed"
+        if sync_speed_file.exists():
+            try:
+                speed_raw = sync_speed_file.read_text(encoding="utf-8").strip()
+                if speed_raw.isdigit():
+                    speed_kb = float(speed_raw)
+                    sync_speed = (
+                        f"{speed_kb / 1024.0:.1f} MB/s"
+                        if speed_kb >= 1024.0
+                        else f"{int(speed_kb)} KB/s"
+                    )
+            except Exception:
+                sync_speed = ""
+
+        # Query /proc/mdstat for richer real-time sync telemetry
+        mdstat_info = get_mdstat_sync_progress(dev_name)
+        if not sync_action and mdstat_info.get("action"):
+            sync_action = mdstat_info["action"]
+        if not sync_speed and mdstat_info.get("speed"):
+            sync_speed = mdstat_info["speed"]
+        sync_eta = mdstat_info.get("eta", "")
+
+        sync_percent = 0.0
+        if mdstat_info.get("percent") is not None:
+            sync_percent = float(mdstat_info["percent"])
+        elif sync_completed and "/" in sync_completed:
+            try:
+                parts = sync_completed.split("/")
+                comp = float(parts[0].strip())
+                tot = float(parts[1].strip())
+                if tot > 0:
+                    sync_percent = round((comp / tot) * 100.0, 1)
+            except (ValueError, IndexError):
+                pass
+
+        # Determine normalized status: resyncing and recovering are active sync operations, not degraded
+        if sync_action in ("resync", "resyncing", "repair", "check", "checking"):
+            status = "resyncing"
         elif sync_action in ("recover", "recovering"):
             status = "recovering"
-        elif sync_action in ("resync", "resyncing", "repair", "check"):
-            status = "resyncing"
+        elif degraded > 0:
+            status = "degraded"
         elif raw_array_state in ("clean", "active-idle"):
             status = "clean"
         elif raw_array_state in ("active", "write-pending"):
@@ -2579,10 +2677,20 @@ def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
             f"        Failed Devices : {failed_count}",
             f"        Spare Devices : {spare_count}",
             f"        Check Status : {check_status}",
+        ]
+        if status == "resyncing" or sync_action in ("resync", "resyncing", "repair", "check", "checking"):
+            details_lines.append(f"        Resync Status : {sync_percent:.1f}% complete")
+        elif status == "recovering" or sync_action in ("recover", "recovering"):
+            details_lines.append(f"        Rebuild Status : {sync_percent:.1f}% complete")
+        if sync_speed:
+            details_lines.append(f"        Sync Speed : {sync_speed}")
+        if sync_eta:
+            details_lines.append(f"        Sync ETA : {sync_eta}")
+        details_lines.extend([
             "        Events : 0",
             "",
             "        Number   Major   Minor   RaidDevice State",
-        ]
+        ])
         if devices_info:
             details_lines.extend(devices_info)
         else:
@@ -2610,18 +2718,21 @@ def check_raid_status() -> Tuple[str, str]:
         result = check_output(
             ["mdadm", "--detail", raid_device], stderr=STDOUT
         ).decode()
-        if "State : clean" in result:
-            return "clean", result
-        elif "State : active" in result:
-            return "active", result
-        elif "State : degraded" in result:
-            return "degraded", result
-        elif "State : recovering" in result:
-            return "recovering", result
-        elif "State : resyncing" in result:
+        state_match = re.search(r"\bState\s*:\s*([^\n]+)", result)
+        state_str = state_match.group(1).lower() if state_match else result.lower()
+
+        if "resync" in state_str or "checking" in state_str:
             return "resyncing", result
-        elif "State : failed" in result:
+        elif "recover" in state_str or "rebuild" in state_str:
+            return "recovering", result
+        elif "degraded" in state_str:
+            return "degraded", result
+        elif "failed" in state_str or "faulty" in state_str:
             return "failed", result
+        elif "clean" in state_str:
+            return "clean", result
+        elif "active" in state_str:
+            return "active", result
         else:
             return "unknown", result
     except (CalledProcessError, FileNotFoundError, OSError) as e:
@@ -2683,6 +2794,59 @@ def _extract_raid_summary_data(
     uuid_match = re.search(r"UUID : (.+)", details)
     creation_time_match = re.search(r"Creation Time : (.+)", details)
     version_match = re.search(r"Version : (.+)", details)
+    resync_status_match = re.search(r"Resync Status\s*:\s*(\d+(?:\.\d+)?)%", details)
+    rebuild_status_match = re.search(r"Rebuild Status\s*:\s*(\d+(?:\.\d+)?)%", details)
+    check_status_pct_match = re.search(r"Check Status\s*:\s*(\d+(?:\.\d+)?)%", details)
+    sync_speed_match = re.search(r"Sync Speed\s*:\s*(.+)", details)
+    sync_eta_match = re.search(r"Sync ETA\s*:\s*(.+)", details)
+
+    sync_percent = 0.0
+    sync_action = ""
+    sync_completed = ""
+    sync_speed = sync_speed_match.group(1).strip() if sync_speed_match else ""
+    sync_eta = sync_eta_match.group(1).strip() if sync_eta_match else ""
+
+    if resync_status_match:
+        sync_percent = float(resync_status_match.group(1))
+        sync_action = "resync"
+    elif rebuild_status_match:
+        sync_percent = float(rebuild_status_match.group(1))
+        sync_action = "recover"
+    elif check_status_pct_match:
+        sync_percent = float(check_status_pct_match.group(1))
+        sync_action = "check"
+
+    raw_check_status = (
+        check_status_match.group(1).strip() if check_status_match else "N/A"
+    )
+    if "/" in raw_check_status:
+        sync_completed = raw_check_status
+        if sync_percent == 0.0:
+            parts = raw_check_status.split("/")
+            try:
+                c = float(parts[0].strip())
+                t = float(parts[1].strip())
+                if t > 0:
+                    sync_percent = round((c / t) * 100.0, 1)
+            except (ValueError, IndexError):
+                pass
+
+    if status in ("resyncing", "recovering", "rebuilding") and not sync_action:
+        sync_action = "recover" if "recover" in status or "rebuild" in status else "resync"
+
+    if status in ("resyncing", "recovering", "rebuilding") or sync_action:
+        mdstat_info = get_mdstat_sync_progress(raid_device)
+        if mdstat_info:
+            if not sync_action and mdstat_info.get("action"):
+                sync_action = mdstat_info["action"]
+            if sync_percent == 0.0 and mdstat_info.get("percent") is not None:
+                sync_percent = float(mdstat_info["percent"])
+            if not sync_completed and mdstat_info.get("completed") and mdstat_info.get("total"):
+                sync_completed = f"{mdstat_info['completed']} / {mdstat_info['total']}"
+            if not sync_speed and mdstat_info.get("speed"):
+                sync_speed = mdstat_info["speed"]
+            if not sync_eta and mdstat_info.get("eta"):
+                sync_eta = mdstat_info["eta"]
 
     devices = []
     device_section = False
@@ -2743,6 +2907,11 @@ def _extract_raid_summary_data(
         "persistence": persistence_match.group(1) if persistence_match else "unknown",
         "full_state": full_state,
         "check_status": check_status_match.group(1) if check_status_match else "N/A",
+        "sync_action": sync_action,
+        "sync_completed": sync_completed,
+        "sync_percent": sync_percent,
+        "sync_speed": sync_speed,
+        "sync_eta": sync_eta,
         "events": events_match.group(1) if events_match else "unknown",
         "layout": layout_match.group(1) if layout_match else "unknown",
         "chunk_size": chunk_size_match.group(1) if chunk_size_match else "unknown",
@@ -2818,6 +2987,17 @@ def build_raid_embed(status: str, details: str, duf_output: str) -> discord.Embe
         value=f"Active: **{data['active_devices']}** | Failed: **{data['failed_devices']}** | Spare: **{data['spare_devices']}**",
         inline=True,
     )
+    if data.get("sync_action") and data.get("sync_percent", 0.0) > 0:
+        action_name = data["sync_action"].capitalize()
+        speed_str = (
+            f" • Speed: `{data['sync_speed']}`" if data.get("sync_speed") else ""
+        )
+        eta_str = f" • ETA: `{data['sync_eta']}`" if data.get("sync_eta") else ""
+        embed.add_field(
+            name=f"{action_name} Progress",
+            value=f"**{data['sync_percent']:.1f}%** complete{speed_str}{eta_str}",
+            inline=True,
+        )
     if data.get("storage_info") and data["storage_info"] != "N/A":
         embed.add_field(
             name="Storage Usage",

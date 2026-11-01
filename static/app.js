@@ -189,7 +189,8 @@ function getRaidSyncInfo(raid) {
     ["recovering", "resyncing"].includes(statusStr) ||
     checkStatus.includes("sync") ||
     checkStatus.includes("recover") ||
-    checkStatus.includes("check");
+    checkStatus.includes("check") ||
+    (checkStatus.includes("/") && checkStatus !== "N/A");
 
   let percent = null;
   if (raid.sync_percent !== undefined && raid.sync_percent !== null && raid.sync_percent !== "") {
@@ -211,6 +212,13 @@ function getRaidSyncInfo(raid) {
     const match = combined.match(/(\d+(?:\.\d+)?)%/);
     if (match) {
       percent = parseFloat(match[1]);
+    }
+  }
+
+  if (percent === null && checkStatus.includes("/")) {
+    const parts = checkStatus.split("/").map((s) => parseFloat(s.trim()));
+    if (parts.length === 2 && parts[1] > 0 && Number.isFinite(parts[0])) {
+      percent = Math.max(0, Math.min(100, (parts[0] / parts[1]) * 100));
     }
   }
 
@@ -906,10 +914,16 @@ function renderSystemMetrics(system) {
   }
 
   // Memory breakdown chips
+  const memTotalBadge = document.getElementById("memory-total-badge");
+  if (memTotalBadge && mem.total) {
+    memTotalBadge.textContent = `${formatBytes(mem.total)} Total`;
+  }
   const chipUsed = document.getElementById("memory-chip-used");
+  const chipAvailable = document.getElementById("memory-chip-available");
   const chipCached = document.getElementById("memory-chip-cached");
   const chipFree = document.getElementById("memory-chip-free");
-  if (chipUsed) chipUsed.textContent = `Used: ${formatBytes(mem.used)}`;
+  if (chipUsed) chipUsed.textContent = `In use: ${formatBytes(mem.used)}`;
+  if (chipAvailable) chipAvailable.textContent = `Available: ${formatBytes(mem.available || 0)}`;
   if (chipCached) chipCached.textContent = `Cached: ${formatBytes(mem.cached || 0)}`;
   if (chipFree) chipFree.textContent = `Free: ${formatBytes(mem.free || 0)}`;
 
@@ -1236,6 +1250,11 @@ function renderRaidDetails(raid) {
   if (overviewRaidSummary) {
     if (isNoRaid) {
       overviewRaidSummary.textContent = "No RAID array configured or detected";
+    } else if (syncInfo && ["resyncing", "recovering"].includes(status)) {
+      const level = (raid.raid_level || "RAID").toUpperCase();
+      const speedText = syncInfo.speed ? ` • ${syncInfo.speed}` : "";
+      const etaText = syncInfo.eta ? ` (ETA: ${syncInfo.eta})` : "";
+      overviewRaidSummary.textContent = `${level} • ${syncInfo.action} ${syncInfo.percent.toFixed(1)}%${speedText}${etaText}`;
     } else {
       const level = (raid.raid_level || "RAID").toUpperCase();
       const size = raid.array_size || "--";
@@ -1406,28 +1425,105 @@ function renderNotificationHistory(historyPayload) {
   });
 }
 
+let currentDrawerFilter = "all";
+let cachedDrawerRecords = [];
+let dismissedNotificationIds = new Set();
+try {
+  const savedDismissed = localStorage.getItem("vigil_dismissed_notifications");
+  if (savedDismissed) {
+    dismissedNotificationIds = new Set(JSON.parse(savedDismissed));
+  }
+} catch (e) {}
+
+function saveDismissedNotifications() {
+  try {
+    localStorage.setItem(
+      "vigil_dismissed_notifications",
+      JSON.stringify(Array.from(dismissedNotificationIds))
+    );
+  } catch (e) {}
+}
+
 /**
  * Render recent dispatches stream in the slide-over notification drawer.
  */
 function renderDrawerNotificationList(records) {
+  if (Array.isArray(records)) {
+    cachedDrawerRecords = records;
+  }
   const listEl = document.getElementById("drawer-notification-list");
   if (!listEl) return;
 
-  if (!records || records.length === 0) {
+  const allRecords = cachedDrawerRecords || [];
+  const activeRecords = allRecords.filter((entry) => {
+    const id = String(entry.id ?? entry.sent_at ?? entry.timestamp ?? "");
+    return id ? !dismissedNotificationIds.has(id) : true;
+  });
+
+  const alertsCount = activeRecords.filter((entry) => {
+    const st = String(entry.status || "").toLowerCase();
+    const kd = String(entry.kind || "").toLowerCase();
+    return (
+      st === "degraded" ||
+      st === "critical" ||
+      st === "failed" ||
+      st === "warning" ||
+      kd.includes("alert")
+    );
+  }).length;
+
+  const appCount = activeRecords.filter((entry) => {
+    const isWeekly = Boolean(entry.weekly) || entry.kind === "weekly summary";
+    const isTest = entry.kind === "test notification" || entry.status === "test";
+    return isWeekly || isTest;
+  }).length;
+
+  const badgeAll = document.getElementById("drawer-badge-all");
+  const badgeAlerts = document.getElementById("drawer-badge-alerts");
+  const badgeApp = document.getElementById("drawer-badge-app");
+  const countBadge = document.getElementById("drawer-notif-count");
+
+  if (badgeAll) badgeAll.textContent = String(activeRecords.length);
+  if (badgeAlerts) badgeAlerts.textContent = String(alertsCount);
+  if (badgeApp) badgeApp.textContent = String(appCount);
+  if (countBadge) countBadge.textContent = `${activeRecords.length} active`;
+
+  let displayedRecords = activeRecords;
+  if (currentDrawerFilter === "alerts") {
+    displayedRecords = activeRecords.filter((entry) => {
+      const st = String(entry.status || "").toLowerCase();
+      const kd = String(entry.kind || "").toLowerCase();
+      return (
+        st === "degraded" ||
+        st === "critical" ||
+        st === "failed" ||
+        st === "warning" ||
+        kd.includes("alert")
+      );
+    });
+  } else if (currentDrawerFilter === "application") {
+    displayedRecords = activeRecords.filter((entry) => {
+      const isWeekly = Boolean(entry.weekly) || entry.kind === "weekly summary";
+      const isTest = entry.kind === "test notification" || entry.status === "test";
+      return isWeekly || isTest;
+    });
+  }
+
+  if (displayedRecords.length === 0) {
     listEl.innerHTML = `
       <div class="drawer-empty-state">
         <svg viewBox="0 0 24 24" width="32" height="32" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
-          <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+          <polyline points="20 6 9 17 4 12"></polyline>
         </svg>
-        <p>No notifications dispatched yet</p>
+        <p>All caught up! No active notifications.</p>
       </div>
     `;
     return;
   }
 
-  listEl.innerHTML = records
+  listEl.innerHTML = displayedRecords
     .map((entry) => {
+      const entryId = String(entry.id ?? entry.sent_at ?? entry.timestamp ?? "");
       const timeStr = entry.sent_at_formatted || formatTimestampLocal(entry.sent_at);
       const isWeekly = Boolean(entry.weekly) || entry.kind === "weekly summary";
       const isTest = entry.kind === "test notification" || entry.status === "test";
@@ -1469,13 +1565,34 @@ function renderDrawerNotificationList(records) {
             <span class="kind-badge ${kindClass}">${escapeHtml(kindText)}</span>
             <span class="${statusBadgeClass}">${escapeHtml(statusText)}</span>
           </div>
-          <time class="drawer-item-time mono-text">${escapeHtml(timeStr)}</time>
+          <div style="display:flex;align-items:center;gap:0.4rem;">
+            <time class="drawer-item-time mono-text">${escapeHtml(timeStr)}</time>
+            ${
+              entryId
+                ? `<button class="btn-icon-subtle btn-dismiss-item" data-id="${escapeHtml(
+                    entryId
+                  )}" title="Dismiss notification" aria-label="Dismiss notification" style="padding:2px 4px;font-size:1rem;line-height:1;opacity:0.6;">&times;</button>`
+                : ""
+            }
+          </div>
         </div>
         <div class="drawer-item-message">${escapeHtml(details)}</div>
       </div>
     `;
     })
     .join("");
+
+  listEl.querySelectorAll(".btn-dismiss-item").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = btn.getAttribute("data-id");
+      if (id) {
+        dismissedNotificationIds.add(id);
+        saveDismissedNotifications();
+        renderDrawerNotificationList();
+      }
+    });
+  });
 }
 
 /**
@@ -5098,6 +5215,35 @@ let auditSearchTerm = "";
 let auditLimit = 50;
 let auditOffset = 0;
 
+let currentAuditSubtab = "security";
+
+function switchAuditSubtab(subtab) {
+  currentAuditSubtab = subtab;
+  const isSecurity = subtab === "security";
+  const secBtn = document.getElementById("subtab-audit-security-btn");
+  const alertsBtn = document.getElementById("subtab-audit-alerts-btn");
+  const secPanel = document.getElementById("audit-security-subtab-panel");
+  const alertsPanel = document.getElementById("audit-alerts-subtab-panel");
+
+  if (isSecurity) {
+    secBtn?.classList.add("active");
+    secBtn?.setAttribute("aria-selected", "true");
+    alertsBtn?.classList.remove("active");
+    alertsBtn?.setAttribute("aria-selected", "false");
+    secPanel?.classList.remove("hidden");
+    alertsPanel?.classList.add("hidden");
+    fetchAuditLogs();
+  } else {
+    alertsBtn?.classList.add("active");
+    alertsBtn?.setAttribute("aria-selected", "true");
+    secBtn?.classList.remove("active");
+    secBtn?.setAttribute("aria-selected", "false");
+    alertsPanel?.classList.remove("hidden");
+    secPanel?.classList.add("hidden");
+    fetchNotificationHistory();
+  }
+}
+
 async function fetchAuditLogs() {
   const refreshBtn = document.getElementById("refresh-audit-btn");
   if (refreshBtn) refreshBtn.classList.add("loading");
@@ -5140,6 +5286,8 @@ function renderAuditLogs(data) {
 
   const totalEl = document.getElementById("audit-total-count");
   if (totalEl) totalEl.textContent = String(total);
+  const secBadge = document.getElementById("subtab-audit-security-badge");
+  if (secBadge) secBadge.textContent = String(total);
 
   const securityCount = logs.filter((l) => ["warning", "security"].includes(String(l.severity || "").toLowerCase())).length;
   const secEl = document.getElementById("audit-security-count");
@@ -8380,6 +8528,48 @@ function initDashboard() {
   document
     .getElementById("btn-drawer-refresh-history")
     ?.addEventListener("click", fetchNotificationHistoryDrawer);
+
+  document
+    .getElementById("btn-drawer-dismiss-all")
+    ?.addEventListener("click", () => {
+      const allRecords = cachedDrawerRecords || [];
+      allRecords.forEach((entry) => {
+        const id = String(entry.id ?? entry.sent_at ?? entry.timestamp ?? "");
+        if (id) dismissedNotificationIds.add(id);
+      });
+      saveDismissedNotifications();
+      renderDrawerNotificationList();
+    });
+
+  const setupDrawerFilterTab = (tabId, filterName) => {
+    document.getElementById(tabId)?.addEventListener("click", () => {
+      currentDrawerFilter = filterName;
+      ["drawer-tab-all", "drawer-tab-alerts", "drawer-tab-app"].forEach((id) => {
+        const el = document.getElementById(id);
+        const isActive = id === tabId;
+        el?.classList.toggle("active", isActive);
+        el?.setAttribute("aria-selected", isActive ? "true" : "false");
+      });
+      renderDrawerNotificationList();
+    });
+  };
+  setupDrawerFilterTab("drawer-tab-all", "all");
+  setupDrawerFilterTab("drawer-tab-alerts", "alerts");
+  setupDrawerFilterTab("drawer-tab-app", "application");
+
+  // Audit view subtabs & redirect banner
+  document
+    .getElementById("subtab-audit-security-btn")
+    ?.addEventListener("click", () => switchAuditSubtab("security"));
+  document
+    .getElementById("subtab-audit-alerts-btn")
+    ?.addEventListener("click", () => switchAuditSubtab("alerts"));
+  document
+    .getElementById("btn-goto-alert-logs")
+    ?.addEventListener("click", () => {
+      switchViewTab("audit", true);
+      switchAuditSubtab("alerts");
+    });
 
   document
     .getElementById("btn-drawer-channels")

@@ -5273,5 +5273,133 @@ hr.overview-flow-divider {
   word-break: break-word;
 }
 
+/* Windows Task Manager Memory Breakdown Grid */
+.memory-taskmgr-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.35rem 0.6rem;
+}
+@media (min-width: 640px) {
+  .memory-taskmgr-grid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+.breakdown-chip.chip-available {
+  background: rgba(14, 165, 233, 0.12);
+  color: #38bdf8;
+  border: 1px solid rgba(14, 165, 233, 0.25);
+}
+
+/* Dispatched Alert Logs Redirect Banner */
+.notif-history-redirect-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 1rem 1.25rem;
+  margin-top: 1.5rem;
+}
+.redirect-banner-content {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+  flex-wrap: wrap;
+}
+.redirect-banner-icon {
+  color: var(--accent-primary);
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.redirect-banner-text {
+  flex: 1;
+  min-width: 200px;
+}
+.redirect-banner-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  display: block;
+  font-size: 0.95rem;
+}
+.redirect-banner-desc {
+  color: var(--text-secondary);
+  font-size: 0.825rem;
+  margin: 0.15rem 0 0;
+}
+.redirect-banner-btn {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* Notification Drawer Filter Pills & Dismiss Actions */
+.btn-drawer-dismiss-all {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.btn-drawer-dismiss-all:hover {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.drawer-categories-bar {
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-surface);
+}
+.drawer-category-pills {
+  display: flex;
+  gap: 0.35rem;
+}
+.drawer-category-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: 9999px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.drawer-category-pill:hover {
+  color: var(--text-primary);
+  border-color: var(--accent-primary);
+}
+.drawer-category-pill.active {
+  background: var(--accent-primary);
+  color: #fff;
+  border-color: var(--accent-primary);
+}
+.drawer-pill-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.1rem;
+  height: 1.1rem;
+  padding: 0 0.25rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.2);
+  color: inherit;
+  font-size: 0.675rem;
+  font-weight: 600;
+}
+.drawer-category-pill:not(.active) .drawer-pill-badge {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+
 
 
