@@ -2081,7 +2081,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertIn('id="auth-overlay"', index_resp.text)
         self.assertIn('id="settings-modal"', index_resp.text)
         self.assertNotIn('id="system-interval-select"', index_resp.text)
-        self.assertIn('id="raid-interval-select"', index_resp.text)
+        self.assertNotIn('id="raid-interval-select"', index_resp.text)
         self.assertIn('id="notifications-interval-select"', index_resp.text)
 
         # Navigation tabs and view panels (verifying System Level: Overview, RAID & Storage, then Containers, Notifications)
@@ -2304,6 +2304,8 @@ class FastAPIEndpointTests(unittest.TestCase):
             "live-stream-text",
             "auto-refresh-indicator",
             "system-interval-select",
+            "raid-interval-select",
+            "raid-adaptive-badge",
         }
         for elem_id in direct_ids:
             if elem_id not in permissible_fallbacks:
@@ -2385,7 +2387,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertIn('id="raid-card-badge"', raid_view_html)
         self.assertIn('id="active-disks-table"', raid_view_html)
         self.assertIn('id="raid-sync-container"', raid_view_html)
-        self.assertIn('id="raid-interval-select"', raid_view_html)
+        self.assertNotIn('id="raid-interval-select"', raid_view_html)
         self.assertIn('id="refresh-raid-btn"', raid_view_html)
 
         # Verify Storage Volumes & Filesystems card is positioned above the RAID Array Details grid
@@ -4634,6 +4636,119 @@ class DirectSystemStreamsTests(unittest.TestCase):
 
         # Non-existent device returns None
         self.assertIsNone(main.read_sysfs_raid_state("/dev/md_nonexistent"))
+
+    def test_read_sysfs_raid_state_uuid_layout_chunk_consistency(self):
+        sysfs_base = Path(self.temp_dir.name) / "sys_block_rich"
+        md0_dir = sysfs_base / "md0" / "md"
+        md0_dir.mkdir(parents=True, exist_ok=True)
+
+        (md0_dir / "array_state").write_text("clean\n", encoding="utf-8")
+        (md0_dir / "degraded").write_text("0\n", encoding="utf-8")
+        (md0_dir / "level").write_text("raid1\n", encoding="utf-8")
+        (md0_dir / "raid_disks").write_text("2\n", encoding="utf-8")
+        (md0_dir / "uuid").write_text("e70a9de9:6c4e4b9a:28d5d415:7eb75962\n", encoding="utf-8")
+        (md0_dir / "consistency_policy").write_text("resync\n", encoding="utf-8")
+
+        sda1_dir = md0_dir / "dev-sda1"
+        sda1_dir.mkdir(parents=True, exist_ok=True)
+        (sda1_dir / "state").write_text("in_sync\n", encoding="utf-8")
+        (sda1_dir / "slot").write_text("0\n", encoding="utf-8")
+
+        with patch("main.Path", side_effect=lambda p: Path(str(p).replace("/sys/block", str(sysfs_base)))):
+            # RAID 1 checks
+            status, details = main.read_sysfs_raid_state("/dev/md0")
+            self.assertEqual(status, "clean")
+            self.assertIn("UUID : e70a9de9:6c4e4b9a:28d5d415:7eb75962", details)
+            self.assertIn("Layout : N/A (Mirroring)", details)
+            self.assertIn("Chunk Size : N/A", details)
+            self.assertIn("Consistency Policy : resync", details)
+            self.assertIn("Update Time : N/A (Live Sysfs Stream)", details)
+
+            data = main._extract_raid_summary_data(status, details)
+            self.assertEqual(data["uuid"], "e70a9de9:6c4e4b9a:28d5d415:7eb75962")
+            self.assertEqual(data["layout"], "N/A (Mirroring)")
+            self.assertEqual(data["chunk_size"], "N/A")
+            self.assertEqual(data["consistency_policy"], "resync")
+            self.assertEqual(data["update_time"], "N/A (Live Sysfs Stream)")
+
+            # RAID 5 checks with chunk size and layout mapping
+            (md0_dir / "level").write_text("raid5\n", encoding="utf-8")
+            (md0_dir / "layout").write_text("2\n", encoding="utf-8")
+            (md0_dir / "chunk_size").write_text("524288\n", encoding="utf-8")
+            (md0_dir / "consistency_policy").write_text("ppl\n", encoding="utf-8")
+
+            status, details = main.read_sysfs_raid_state("/dev/md0")
+            self.assertIn("Layout : left-symmetric", details)
+            self.assertIn("Chunk Size : 512K", details)
+            self.assertIn("Consistency Policy : ppl", details)
+
+            data_r5 = main._extract_raid_summary_data(status, details)
+            self.assertEqual(data_r5["layout"], "left-symmetric")
+            self.assertEqual(data_r5["chunk_size"], "512K")
+            self.assertEqual(data_r5["consistency_policy"], "ppl")
+
+    def test_extract_raid_summary_data_clean_fallbacks(self):
+        # When status is "none" or details are empty
+        data_none = main._extract_raid_summary_data("none", "")
+        self.assertEqual(data_none["uuid"], "N/A")
+        self.assertEqual(data_none["layout"], "N/A")
+        self.assertEqual(data_none["chunk_size"], "N/A")
+        self.assertEqual(data_none["consistency_policy"], "N/A")
+        self.assertEqual(data_none["update_time"], "N/A")
+
+        # When fields explicitly contain "unknown"
+        details_with_unknowns = """/dev/md0:
+        Raid Level : raid1
+        Layout : unknown
+        Chunk Size : unknown
+        Consistency Policy : unknown
+        UUID : unknown
+        Update Time : unknown
+"""
+        data_clean = main._extract_raid_summary_data("active", details_with_unknowns)
+        self.assertEqual(data_clean["uuid"], "N/A")
+        self.assertEqual(data_clean["layout"], "N/A")
+        self.assertEqual(data_clean["chunk_size"], "N/A")
+        self.assertEqual(data_clean["consistency_policy"], "N/A")
+        self.assertEqual(data_clean["update_time"], "N/A")
+
+    def test_read_sysfs_raid_state_uuid_fallbacks(self):
+        sysfs_base = Path(self.temp_dir.name) / "sys_block_fallback"
+        md0_dir = sysfs_base / "md0" / "md"
+        md0_dir.mkdir(parents=True, exist_ok=True)
+        (md0_dir / "array_state").write_text("clean\n", encoding="utf-8")
+        (md0_dir / "degraded").write_text("0\n", encoding="utf-8")
+        (md0_dir / "level").write_text("raid1\n", encoding="utf-8")
+
+        # Fallback 1: via /dev/disk/by-id/md-uuid-*
+        mock_by_id_link = MagicMock()
+        mock_by_id_link.name = "md-uuid-11112222-3333-4444-5555-666677778888"
+        mock_by_id_link.resolve.return_value.name = "md0"
+
+        mock_by_id_dir = MagicMock()
+        mock_by_id_dir.exists.return_value = True
+        mock_by_id_dir.glob.return_value = [mock_by_id_link]
+
+        def path_side_effect(p):
+            sp = str(p)
+            if sp == "/dev/disk/by-id":
+                return mock_by_id_dir
+            return Path(sp.replace("/sys/block", str(sysfs_base)))
+
+        with patch("main.Path", side_effect=path_side_effect):
+            status, details = main.read_sysfs_raid_state("/dev/md0")
+            self.assertIn("UUID : 11112222-3333-4444-5555-666677778888", details)
+
+        # Fallback 2: via blkid
+        mock_by_id_dir.glob.return_value = []
+        with (
+            patch("main.Path", side_effect=path_side_effect),
+            patch("os.path.exists", return_value=True),
+            patch("shutil.which", return_value="/usr/sbin/blkid"),
+            patch("subprocess.check_output", return_value=b"99998888-7777-6666-5555-444433332222\n"),
+        ):
+            status, details = main.read_sysfs_raid_state("/dev/md0")
+            self.assertIn("UUID : 99998888-7777-6666-5555-444433332222", details)
 
     def test_check_raid_status_prioritizes_sysfs(self):
         with (
@@ -7025,6 +7140,32 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         self.assertIn('id="raid-working-devices"', self.index_html)
         self.assertIn('id="raid-failed-devices"', self.index_html)
         self.assertIn('id="raid-spare-devices"', self.index_html)
+
+        # Storage view toolbar: live streaming pulse dot replaces redundant boost badge & interval select
+        raid_view_start = self.index_html.find('id="view-raid"')
+        raid_view_end = self.index_html.find('id="view-containers"')
+        self.assertGreater(raid_view_start, -1)
+        self.assertGreater(raid_view_end, raid_view_start)
+        storage_toolbar = self.index_html[raid_view_start:raid_view_end]
+        self.assertIn('<span class="module-status-dot" title="Live stream active"></span>', storage_toolbar)
+        self.assertNotIn('id="raid-adaptive-badge"', self.index_html)
+        self.assertNotIn('id="raid-interval-select"', self.index_html)
+
+        # RAID details list: UUID, Layout / Chunk, Consistency Policy present; Update Time removed
+        self.assertIn('id="raid-uuid"', storage_toolbar)
+        self.assertIn('id="raid-layout-chunk"', storage_toolbar)
+        self.assertIn('id="raid-consistency-policy"', storage_toolbar)
+        self.assertNotIn('id="raid-update-time"', self.index_html)
+        self.assertNotIn('<dt>Update Time</dt>', storage_toolbar)
+
+        # Frontend JS contract: app.js formatting and backwards compatibility
+        self.assertIn('raid.uuid && raid.uuid !== "unknown" ? raid.uuid : "N/A"', self.app_js)
+        self.assertIn('layoutChunkVal = "N/A (Mirrored)";', self.app_js)
+        self.assertIn('raid.layout} / ${raid.chunk_size}', self.app_js)
+        self.assertIn('raid.consistency_policy && raid.consistency_policy !== "unknown"', self.app_js)
+        self.assertIn('setField("raid-consistency-policy", consistencyPolicyVal);', self.app_js)
+        self.assertIn('setField("raid-consistency-events", consistencyPolicyVal);', self.app_js)
+
 
     def test_overview_tab_overhaul_invariants(self):
         # Jump buttons removed from visible ribbon (hidden)

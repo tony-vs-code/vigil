@@ -2619,6 +2619,105 @@ def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
         if raid_disks_file.exists():
             raid_disks = raid_disks_file.read_text(encoding="utf-8").strip()
 
+        # UUID
+        uuid_val = ""
+        uuid_file = md_dir / "uuid"
+        if uuid_file.exists():
+            try:
+                uuid_val = uuid_file.read_text(encoding="utf-8").strip()
+            except Exception:
+                uuid_val = ""
+        if not uuid_val:
+            try:
+                by_id_dir = Path("/dev/disk/by-id")
+                if by_id_dir.exists():
+                    for link in by_id_dir.glob("md-uuid-*"):
+                        try:
+                            if link.resolve().name == dev_name:
+                                uuid_val = link.name.replace("md-uuid-", "")
+                                break
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+        if not uuid_val and os.path.exists(f"/dev/{dev_name}") and shutil.which("blkid"):
+            try:
+                raw_out = (
+                    subprocess.check_output(
+                        ["blkid", "-s", "UUID", "-o", "value", f"/dev/{dev_name}"],
+                        stderr=subprocess.DEVNULL,
+                        timeout=1,
+                    )
+                    .decode()
+                    .strip()
+                )
+                if raw_out:
+                    uuid_val = raw_out
+            except Exception:
+                pass
+
+        # Layout & Chunk Size
+        norm_level = level.lower().strip()
+        layout = "N/A"
+        chunk_size = "N/A"
+
+        if norm_level in ("raid1", "1", "mirror"):
+            layout = "N/A (Mirroring)"
+            chunk_size = "N/A"
+        else:
+            layout_file = md_dir / "layout"
+            if layout_file.exists():
+                try:
+                    raw_layout = layout_file.read_text(encoding="utf-8").strip()
+                    if norm_level in ("raid5", "5", "raid6", "6"):
+                        layout_map = {
+                            "0": "left-asymmetric",
+                            "1": "right-asymmetric",
+                            "2": "left-symmetric",
+                            "3": "right-symmetric",
+                        }
+                        layout = layout_map.get(raw_layout, raw_layout)
+                    elif raw_layout:
+                        layout = raw_layout
+                except Exception:
+                    pass
+
+            chunk_size_file = md_dir / "chunk_size"
+            if chunk_size_file.exists():
+                try:
+                    raw_chunk = chunk_size_file.read_text(encoding="utf-8").strip()
+                    if raw_chunk.isdigit():
+                        chunk_bytes = int(raw_chunk)
+                        if chunk_bytes > 0:
+                            if chunk_bytes % 1024 == 0:
+                                chunk_size = f"{chunk_bytes // 1024}K"
+                            else:
+                                chunk_size = f"{chunk_bytes}B"
+                    elif raw_chunk:
+                        chunk_size = raw_chunk
+                except Exception:
+                    pass
+
+        if not layout:
+            layout = "N/A"
+        if not chunk_size:
+            chunk_size = "N/A"
+
+        # Consistency Policy
+        consistency_policy = "none"
+        consistency_policy_file = md_dir / "consistency_policy"
+        if consistency_policy_file.exists():
+            try:
+                pol = consistency_policy_file.read_text(encoding="utf-8").strip()
+                if pol:
+                    consistency_policy = pol
+            except Exception:
+                pass
+        elif (md_dir / "bitmap").exists():
+            consistency_policy = "bitmap"
+        elif status in ("resyncing", "recovering", "rebuilding"):
+            consistency_policy = "resync"
+
         # Member devices
         devices_info: list[str] = []
         active_count = 0
@@ -2671,6 +2770,7 @@ def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
             f"        Raid Devices : {raid_disks}",
             f"        Total Devices : {active_count + failed_count + spare_count}",
             "        Persistence : Superblock is persistent",
+            "        Update Time : N/A (Live Sysfs Stream)",
             f"        State : {status}",
             f"        Active Devices : {active_count}",
             f"        Working Devices : {working_count}",
@@ -2686,6 +2786,11 @@ def read_sysfs_raid_state(raid_device: str) -> Optional[Tuple[str, str]]:
             details_lines.append(f"        Sync Speed : {sync_speed}")
         if sync_eta:
             details_lines.append(f"        Sync ETA : {sync_eta}")
+        details_lines.append(f"        Layout : {layout}")
+        details_lines.append(f"        Chunk Size : {chunk_size}")
+        details_lines.append(f"        Consistency Policy : {consistency_policy}")
+        if uuid_val:
+            details_lines.append(f"        UUID : {uuid_val}")
         details_lines.extend([
             "        Events : 0",
             "",
@@ -2888,6 +2993,29 @@ def _extract_raid_summary_data(
         else (state_match.group(1) if state_match else "unknown")
     )
 
+    def _clean_raid_field(val: Optional[str], default: str = "N/A") -> str:
+        if not val:
+            return default
+        s = val.strip()
+        if not s or s.lower() == "unknown":
+            return default
+        return s
+
+    clean_uuid = _clean_raid_field(uuid_match.group(1) if uuid_match else None)
+    clean_layout = _clean_raid_field(layout_match.group(1) if layout_match else None)
+    clean_chunk = _clean_raid_field(chunk_size_match.group(1) if chunk_size_match else None)
+    clean_consistency = _clean_raid_field(
+        consistency_policy_match.group(1) if consistency_policy_match else None
+    )
+    clean_update_time = _clean_raid_field(
+        update_time_match.group(1) if update_time_match else None
+    )
+    clean_events = (
+        events_match.group(1).strip()
+        if events_match
+        else ("0" if status != "none" and "sysfs" in details else "N/A")
+    )
+
     return {
         "raid_device": raid_device,
         "status": status,
@@ -2903,7 +3031,7 @@ def _extract_raid_summary_data(
         if failed_devices_match
         else "0",
         "spare_devices": spare_devices_match.group(1) if spare_devices_match else "0",
-        "update_time": update_time_match.group(1) if update_time_match else "unknown",
+        "update_time": clean_update_time,
         "persistence": persistence_match.group(1) if persistence_match else "unknown",
         "full_state": full_state,
         "check_status": check_status_match.group(1) if check_status_match else "N/A",
@@ -2912,13 +3040,11 @@ def _extract_raid_summary_data(
         "sync_percent": sync_percent,
         "sync_speed": sync_speed,
         "sync_eta": sync_eta,
-        "events": events_match.group(1) if events_match else "unknown",
-        "layout": layout_match.group(1) if layout_match else "unknown",
-        "chunk_size": chunk_size_match.group(1) if chunk_size_match else "unknown",
-        "consistency_policy": (
-            consistency_policy_match.group(1) if consistency_policy_match else "unknown"
-        ),
-        "uuid": uuid_match.group(1) if uuid_match else "unknown",
+        "events": clean_events,
+        "layout": clean_layout,
+        "chunk_size": clean_chunk,
+        "consistency_policy": clean_consistency,
+        "uuid": clean_uuid,
         "creation_time": creation_time_match.group(1)
         if creation_time_match
         else "unknown",
