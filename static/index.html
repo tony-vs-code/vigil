@@ -3263,6 +3263,12 @@
         <span id="drawer-notif-count" class="pill-counter">0 active</span>
       </div>
       <div class="drawer-header-actions">
+        <button id="btn-drawer-goto-notifications" class="btn-drawer-manage" type="button" title="Open Notification Center Settings">
+          <span>Manage</span>
+          <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
+        </button>
         <button id="btn-drawer-dismiss-all" class="btn-drawer-dismiss-all" type="button" title="Dismiss all active notifications" aria-label="Dismiss all active notifications">
           Dismiss All
         </button>
@@ -3279,56 +3285,6 @@
             <line x1="6" y1="6" x2="18" y2="18"></line>
           </svg>
         </button>
-      </div>
-    </div>
-
-    <!-- Quick Action Bar -->
-    <div class="drawer-quick-actions" aria-label="Notification Center Actions">
-      <button id="btn-drawer-channels" class="btn-drawer-action" type="button" title="Configure notification delivery channels">
-        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path>
-          <polyline points="22,6 12,13 2,6"></polyline>
-        </svg>
-        <span>Channels</span>
-      </button>
-      <button id="btn-drawer-schedule" class="btn-drawer-action" type="button" title="Configure report schedule">
-        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"></circle>
-          <polyline points="12 6 12 12 16 14"></polyline>
-        </svg>
-        <span>Schedule</span>
-      </button>
-      <button id="btn-drawer-thresholds" class="btn-drawer-action" type="button" title="Configure metric alert thresholds">
-        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-        </svg>
-        <span>Thresholds</span>
-      </button>
-      <button id="btn-drawer-send-test" class="btn-drawer-action btn-drawer-action-primary" type="button" title="Send a test notification">
-        <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-          <line x1="22" y1="2" x2="11" y2="13"></line>
-          <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
-        </svg>
-        <span>Send Test</span>
-      </button>
-    </div>
-
-    <!-- Status Overview Strip -->
-    <div class="drawer-status-strip" aria-label="Notification System Overview">
-      <div class="drawer-status-item">
-        <span class="drawer-status-label">Discord Status</span>
-        <div id="drawer-discord-status" class="drawer-status-value">
-          <span class="status-dot status-dot-active"></span>
-          <span>Ready</span>
-        </div>
-      </div>
-      <div class="drawer-status-item">
-        <span class="drawer-status-label">Thresholds</span>
-        <span id="drawer-threshold-summary" class="drawer-status-value mono-text">CPU 90% | RAM 90% | Disk 85%</span>
-      </div>
-      <div class="drawer-status-item">
-        <span class="drawer-status-label">Report Schedule</span>
-        <span id="drawer-schedule-summary" class="drawer-status-value">Sunday 09:00</span>
       </div>
     </div>
 
@@ -3364,6 +3320,18 @@
           <p>All caught up! No active notifications.</p>
         </div>
       </div>
+    </div>
+
+    <!-- Drawer Footer Navigation Banner -->
+    <div class="drawer-footer-banner">
+      <button id="btn-drawer-footer-settings" class="btn-drawer-footer-link" type="button" title="Open full Notification Center">
+        <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+          <polyline points="15 3 21 3 21 9"></polyline>
+          <line x1="10" y1="14" x2="21" y2="3"></line>
+        </svg>
+        <span>Notification Center Settings &amp; Channels &rarr;</span>
+      </button>
     </div>
   </aside>
 

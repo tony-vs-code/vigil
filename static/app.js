@@ -1656,53 +1656,6 @@ async function fetchNotificationHistoryDrawer() {
   }
 }
 
-async function handleDrawerSendTest() {
-  const btn = document.getElementById("btn-drawer-send-test");
-  if (!btn || btn.disabled) return;
-  const originalHtml = btn.innerHTML;
-  btn.disabled = true;
-  btn.classList.add("loading");
-
-  showToast({
-    title: "Sending Test Notification",
-    message: "Dispatching test message to configured delivery channels...",
-    type: "info",
-  });
-
-  try {
-    const testSelect = document.getElementById("notif-test-channel-select");
-    const selectedChannel = testSelect ? testSelect.value : "all";
-    const resp = await apiFetch("/api/notifications/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ channel: selectedChannel }),
-    });
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      throw new Error(data.detail || `Test notification failed (${resp.status})`);
-    }
-
-    showToast({
-      title: "Test Alert Dispatched",
-      message: data.message || "Test notification successfully sent.",
-      type: "success",
-    });
-
-    await fetchNotificationHistoryDrawer();
-  } catch (err) {
-    showToast({
-      title: "Test Alert Failed",
-      message: err.message,
-      type: "error",
-    });
-  } finally {
-    btn.disabled = false;
-    btn.classList.remove("loading");
-    btn.innerHTML = originalHtml;
-  }
-}
-
 /**
  * Show or hide the error banner.
  */
@@ -3568,35 +3521,6 @@ function populateNotificationCenter(config) {
   if (ribbonCpu) ribbonCpu.textContent = `${cpuVal}%`;
   const ribbonDisk = document.getElementById("ribbon-thresh-disk-val");
   if (ribbonDisk) ribbonDisk.textContent = `${diskVal}%`;
-
-  // Update Notification Drawer Status Overview Strip
-  const drawerDiscordEl = document.getElementById("drawer-discord-status");
-  if (drawerDiscordEl) {
-    if (discordEnabled && isTokenConfigured) {
-      drawerDiscordEl.innerHTML = `<span class="status-dot status-dot-active"></span><span>Connected</span>`;
-    } else if (discordEnabled) {
-      drawerDiscordEl.innerHTML = `<span class="status-dot status-dot-active"></span><span>Enabled</span>`;
-    } else {
-      drawerDiscordEl.innerHTML = `<span class="status-dot status-dot-inactive"></span><span>Disabled</span>`;
-    }
-  }
-
-  const drawerThresholdEl = document.getElementById("drawer-threshold-summary");
-  if (drawerThresholdEl) {
-    drawerThresholdEl.textContent = `CPU ${cpuVal}% | RAM ${ramVal}% | Disk ${diskVal}%`;
-  }
-
-  const drawerScheduleEl = document.getElementById("drawer-schedule-summary");
-  if (drawerScheduleEl) {
-    const isSchedOn = schedule.enabled !== undefined ? Boolean(schedule.enabled) : true;
-    if (isSchedOn) {
-      const day = schedule.day || "Sunday";
-      const time = schedule.time || "09:00";
-      drawerScheduleEl.textContent = `${day} ${time}`;
-    } else {
-      drawerScheduleEl.textContent = "Disabled";
-    }
-  }
 }
 
 /* =========================================================================
@@ -7719,10 +7643,7 @@ function initDashboard() {
 
   document
     .getElementById("nav-tab-notifications")
-    ?.addEventListener("click", () => {
-      switchViewTab("notifications", true);
-      openNotificationDrawer();
-    });
+    ?.addEventListener("click", () => switchViewTab("notifications", true));
 
   document
     .getElementById("nav-tab-audit")
@@ -8571,21 +8492,18 @@ function initDashboard() {
       switchAuditSubtab("alerts");
     });
 
-  document
-    .getElementById("btn-drawer-channels")
-    ?.addEventListener("click", openNotifChannelsModal);
+  const navigateDrawerToCenter = () => {
+    closeNotificationDrawer();
+    switchViewTab("notifications", true);
+  };
 
   document
-    .getElementById("btn-drawer-schedule")
-    ?.addEventListener("click", openNotifScheduleModal);
+    .getElementById("btn-drawer-goto-notifications")
+    ?.addEventListener("click", navigateDrawerToCenter);
 
   document
-    .getElementById("btn-drawer-thresholds")
-    ?.addEventListener("click", openNotifThresholdsModal);
-
-  document
-    .getElementById("btn-drawer-send-test")
-    ?.addEventListener("click", handleDrawerSendTest);
+    .getElementById("btn-drawer-footer-settings")
+    ?.addEventListener("click", navigateDrawerToCenter);
 
   // System Update Notice Bar Handlers
   document

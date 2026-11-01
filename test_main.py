@@ -7214,31 +7214,43 @@ class TestModernizedUIContractsAndTelemetry(unittest.TestCase):
         self.assertIn('id="drawer-notif-count"', self.index_html)
         self.assertIn('id="btn-drawer-refresh-history"', self.index_html)
         self.assertIn('id="btn-close-notification-drawer"', self.index_html)
+        self.assertIn('id="btn-drawer-dismiss-all"', self.index_html)
 
-        # Quick action bar modal launch buttons
-        self.assertIn('id="btn-drawer-channels"', self.index_html)
-        self.assertIn('id="btn-drawer-schedule"', self.index_html)
-        self.assertIn('id="btn-drawer-thresholds"', self.index_html)
-        self.assertIn('id="btn-drawer-send-test"', self.index_html)
+        # Navigation links to Notification Center (replaces redundant modals)
+        self.assertIn('id="btn-drawer-goto-notifications"', self.index_html)
+        self.assertIn('id="btn-drawer-footer-settings"', self.index_html)
 
-        # Status overview strip
-        self.assertIn('id="drawer-discord-status"', self.index_html)
-        self.assertIn('id="drawer-threshold-summary"', self.index_html)
-        self.assertIn('id="drawer-schedule-summary"', self.index_html)
+        # Redundant modal buttons and status strip are removed from drawer
+        self.assertNotIn('id="btn-drawer-channels"', self.index_html)
+        self.assertNotIn('id="btn-drawer-schedule"', self.index_html)
+        self.assertNotIn('id="btn-drawer-thresholds"', self.index_html)
+        self.assertNotIn('id="btn-drawer-send-test"', self.index_html)
+        self.assertNotIn('id="drawer-discord-status"', self.index_html)
+        self.assertNotIn('id="drawer-threshold-summary"', self.index_html)
+        self.assertNotIn('id="drawer-schedule-summary"', self.index_html)
 
-        # Live scrollable stream list
+        # Live scrollable stream list and category filter tabs
         self.assertIn('id="drawer-notification-list"', self.index_html)
+        self.assertIn('id="drawer-tab-all"', self.index_html)
+        self.assertIn('id="drawer-tab-alerts"', self.index_html)
+        self.assertIn('id="drawer-tab-app"', self.index_html)
 
         # JS handlers & functions
         self.assertIn("openNotificationDrawer", self.app_js)
         self.assertIn("closeNotificationDrawer", self.app_js)
         self.assertIn("renderDrawerNotificationList", self.app_js)
         self.assertIn("fetchNotificationHistoryDrawer", self.app_js)
-        self.assertIn("handleDrawerSendTest", self.app_js)
+        self.assertIn("btn-drawer-goto-notifications", self.app_js)
+        self.assertIn("btn-drawer-footer-settings", self.app_js)
 
-        # Sidebar nav-tab-notifications interaction
-        self.assertIn('document.getElementById("nav-tab-notifications")', self.app_js)
-        self.assertIn("openNotificationDrawer()", self.app_js)
+        # Topbar opens drawer; Sidebar nav-tab only navigates to view without opening drawer
+        self.assertIn('"btn-topbar-notifications"', self.app_js)
+        self.assertIn('"nav-tab-notifications"', self.app_js)
+        nav_tab_idx = self.app_js.rfind('"nav-tab-notifications"')
+        self.assertGreater(nav_tab_idx, -1)
+        nav_tab_snippet = self.app_js[nav_tab_idx:nav_tab_idx + 150]
+        self.assertIn('switchViewTab("notifications", true)', nav_tab_snippet)
+        self.assertNotIn("openNotificationDrawer", nav_tab_snippet)
 
     def test_system_update_notice_bar_and_polling_contracts(self):
         """Verify dismissible system update notice bar, package nav badges, and background polling."""
