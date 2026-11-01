@@ -7579,6 +7579,561 @@ unused devices: <none>
         self.assertIn("fetchSystemGroups()", users_snippet)
 
 
+class TestVigilSentinelProbes(unittest.TestCase):
+    """Comprehensive test suite for Vigil Sentinel: Service Uptime & Health Probes."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "sentinel_test.db"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+
+        main._sentinel_alert_queue.clear()
+        main._probe_last_run.clear()
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_sentinel_db_schema_and_crud(self):
+        """Test probe table creation, insert, read, update, and delete."""
+        probe = main.create_sentinel_probe(
+            name="Primary API",
+            type="http",
+            target="https://api.example.com/health",
+            interval_seconds=30,
+            timeout_seconds=5,
+            expected_status=200,
+            keyword="ok",
+            ssl_check=True,
+            enabled=True,
+        )
+        self.assertIsNotNone(probe)
+        probe_id = probe["id"]
+        self.assertEqual(probe["name"], "Primary API")
+        self.assertEqual(probe["type"], "http")
+        self.assertEqual(probe["target"], "https://api.example.com/health")
+        self.assertEqual(probe["interval_seconds"], 30)
+        self.assertTrue(probe["ssl_check"])
+        self.assertTrue(probe["enabled"])
+
+        # Fetch single
+        fetched = main.get_sentinel_probe(probe_id)
+        self.assertEqual(fetched, probe)
+
+        # Update
+        updated = main.update_sentinel_probe(
+            probe_id, {"name": "Primary API v2", "interval_seconds": 60, "enabled": False}
+        )
+        self.assertEqual(updated["name"], "Primary API v2")
+        self.assertEqual(updated["interval_seconds"], 60)
+        self.assertFalse(updated["enabled"])
+
+        # Fetch all
+        all_probes = main.get_all_sentinel_probes(enabled_only=False)
+        self.assertEqual(len(all_probes), 1)
+        enabled_probes = main.get_all_sentinel_probes(enabled_only=True)
+        self.assertEqual(len(enabled_probes), 0)
+
+        # Delete
+        deleted = main.delete_sentinel_probe(probe_id)
+        self.assertTrue(deleted)
+        self.assertIsNone(main.get_sentinel_probe(probe_id))
+
+    def test_execute_probe_http(self):
+        """Test HTTP probe execution including status matching, keyword check, and error paths."""
+        probe = {
+            "name": "Test Web",
+            "type": "http",
+            "target": "http://example.com/health",
+            "timeout_seconds": 5,
+            "expected_status": 200,
+            "keyword": "healthy",
+            "ssl_check": False,
+        }
+
+        # 1. Success case
+        class MockContent:
+            async def read(self, n):
+                return b"System is healthy and active"
+
+        class MockResponse:
+            status = 200
+            content = MockContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+        class MockSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+            def get(self, url, **kwargs):
+                return MockResponse()
+
+        with patch("aiohttp.ClientSession", side_effect=MockSession):
+            result = asyncio.run(main.execute_probe(probe))
+            self.assertEqual(result["status"], "up")
+            self.assertEqual(result["http_status"], 200)
+            self.assertEqual(result["error_message"], "")
+
+        # 2. Keyword missing -> down
+        probe_with_bad_kw = dict(probe, keyword="nonexistent_string")
+        with patch("aiohttp.ClientSession", side_effect=MockSession):
+            result = asyncio.run(main.execute_probe(probe_with_bad_kw))
+            self.assertEqual(result["status"], "down")
+            self.assertIn("Keyword 'nonexistent_string' not found", result["error_message"])
+
+        # 3. Status mismatch -> down
+        class Mock500Response(MockResponse):
+            status = 500
+
+        class Mock500Session(MockSession):
+            def get(self, url, **kwargs):
+                return Mock500Response()
+
+        with patch("aiohttp.ClientSession", side_effect=Mock500Session):
+            result = asyncio.run(main.execute_probe(probe))
+            self.assertEqual(result["status"], "down")
+            self.assertEqual(result["http_status"], 500)
+            self.assertIn("Expected HTTP 200, received 500", result["error_message"])
+
+        # 4. Timeout -> down
+        class MockTimeoutSession(MockSession):
+            def get(self, url, **kwargs):
+                raise asyncio.TimeoutError()
+
+        with patch("aiohttp.ClientSession", side_effect=MockTimeoutSession):
+            result = asyncio.run(main.execute_probe(probe))
+            self.assertEqual(result["status"], "down")
+            self.assertIn("timed out", result["error_message"])
+
+    def test_execute_probe_ssl_check(self):
+        """Test SSL certificate parsing and degraded threshold for expiring certs."""
+        # Test SSL helper date calculation with mock socket and wrap_socket
+        mock_cert = {
+            "notAfter": "Nov 10 00:00:00 2026 GMT"
+        }
+        mock_ssock = MagicMock()
+        mock_ssock.getpeercert.return_value = mock_cert
+        mock_sock = MagicMock()
+
+        with patch("socket.create_connection", return_value=mock_sock), \
+             patch("ssl.create_default_context") as mock_ctx:
+            mock_ctx.return_value.wrap_socket.return_value.__enter__.return_value = mock_ssock
+            days = main.get_ssl_days_remaining("example.com", 443)
+            self.assertIsNotNone(days)
+            self.assertIsInstance(days, int)
+
+        # Test degraded state when cert has <= 14 days remaining
+        probe = {
+            "name": "HTTPS Test",
+            "type": "http",
+            "target": "https://secure.example.com",
+            "timeout_seconds": 5,
+            "expected_status": 200,
+            "ssl_check": True,
+        }
+
+        class MockContent:
+            async def read(self, n):
+                return b"OK"
+
+        class MockResponse:
+            status = 200
+            content = MockContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+        class MockSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+            def get(self, url, **kwargs):
+                return MockResponse()
+
+        with patch("aiohttp.ClientSession", side_effect=MockSession), \
+             patch.object(main, "get_ssl_days_remaining", return_value=7):
+            result = asyncio.run(main.execute_probe(probe))
+            self.assertEqual(result["status"], "degraded")
+            self.assertEqual(result["ssl_days_remaining"], 7)
+            self.assertIn("SSL certificate expires in 7 day(s)", result["error_message"])
+
+    def test_execute_probe_tcp(self):
+        """Test TCP port probe execution with success and connection failures."""
+        # 1. Success
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
+        with patch("asyncio.open_connection", new=AsyncMock(return_value=(mock_reader, mock_writer))):
+            result = asyncio.run(main.execute_probe({
+                "type": "tcp",
+                "target": "127.0.0.1:5432",
+                "timeout_seconds": 5,
+            }))
+            self.assertEqual(result["status"], "up")
+            self.assertGreaterEqual(result["response_time_ms"], 0.0)
+
+        # 2. Connection refused / failure
+        with patch("asyncio.open_connection", side_effect=ConnectionRefusedError("Connection refused")):
+            result = asyncio.run(main.execute_probe({
+                "type": "tcp",
+                "target": "127.0.0.1:5432",
+                "timeout_seconds": 5,
+            }))
+            self.assertEqual(result["status"], "down")
+            self.assertIn("Connection refused", result["error_message"])
+
+        # 3. Invalid target without port
+        result = asyncio.run(main.execute_probe({
+            "type": "tcp",
+            "target": "127.0.0.1",
+            "timeout_seconds": 5,
+        }))
+        self.assertEqual(result["status"], "down")
+        self.assertIn("host:port format required", result["error_message"])
+
+    def test_execute_probe_ping(self):
+        """Test ping probe execution with subprocess mock and fallback check."""
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.communicate.return_value = (
+            b"64 bytes from 1.1.1.1: icmp_seq=1 ttl=58 time=14.2 ms\n",
+            b"",
+        )
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc)):
+            result = asyncio.run(main.execute_probe({
+                "type": "ping",
+                "target": "1.1.1.1",
+                "timeout_seconds": 3,
+            }))
+            self.assertEqual(result["status"], "up")
+            self.assertEqual(result["response_time_ms"], 14.2)
+
+        # Ping failure returncode 1
+        mock_proc.returncode = 1
+        mock_proc.communicate.return_value = (b"", b"Destination Host Unreachable\n")
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc)):
+            result = asyncio.run(main.execute_probe({
+                "type": "ping",
+                "target": "1.1.1.1",
+                "timeout_seconds": 3,
+            }))
+            self.assertEqual(result["status"], "down")
+            self.assertIn("Destination Host Unreachable", result["error_message"])
+
+    def test_record_probe_check_history_and_pruning(self):
+        """Verify history entries are stored, limited, and pruned to 200 items."""
+        probe = main.create_sentinel_probe("History Probe", "http", "http://test.local")
+        probe_id = probe["id"]
+
+        for i in range(210):
+            main.record_probe_check(probe_id, {
+                "status": "up",
+                "response_time_ms": 10.0 + i,
+                "http_status": 200,
+                "error_message": "",
+                "ssl_days_remaining": None,
+            })
+
+        history = main.get_probe_history(probe_id, limit=300)
+        self.assertEqual(len(history), 200, "History must be pruned to max 200 records")
+        # Ensure latest records are returned first (timestamp DESC)
+        self.assertGreaterEqual(history[0]["timestamp"], history[-1]["timestamp"])
+
+    def test_state_transitions_audit_and_alert_queue(self):
+        """Verify UP -> DOWN and DOWN -> UP trigger audit logs and queue alerts."""
+        probe = main.create_sentinel_probe("Alert Probe", "http", "http://test.local")
+        probe_id = probe["id"]
+
+        # Initial check (UP) -> no alert queue (since no prior state)
+        main.record_probe_check(probe_id, {"status": "up", "response_time_ms": 15.0})
+        self.assertEqual(len(main._sentinel_alert_queue), 0)
+
+        # UP -> DOWN transition
+        main.record_probe_check(
+            probe_id,
+            {"status": "down", "response_time_ms": 0.0, "error_message": "Connection timed out"},
+        )
+        self.assertEqual(len(main._sentinel_alert_queue), 1)
+        alert = main._sentinel_alert_queue[0]
+        self.assertEqual(alert["old_status"], "up")
+        self.assertEqual(alert["new_status"], "down")
+        self.assertIn("Connection timed out", alert["result"]["error_message"])
+
+        # Check audit log
+        logs, total = main.get_audit_logs(event_type="sentinel.probe.down")
+        self.assertEqual(total, 1)
+        self.assertIn("transitioned from UP to DOWN", logs[0]["description"])
+
+        # DOWN -> DOWN (no new transition alert)
+        main.record_probe_check(
+            probe_id,
+            {"status": "down", "response_time_ms": 0.0, "error_message": "Still down"},
+        )
+        self.assertEqual(len(main._sentinel_alert_queue), 1)
+
+        # DOWN -> UP transition
+        main.record_probe_check(probe_id, {"status": "up", "response_time_ms": 12.0})
+        self.assertEqual(len(main._sentinel_alert_queue), 2)
+        recovered_alert = main._sentinel_alert_queue[1]
+        self.assertEqual(recovered_alert["old_status"], "down")
+        self.assertEqual(recovered_alert["new_status"], "up")
+
+        up_logs, total_up = main.get_audit_logs(event_type="sentinel.probe.up")
+        self.assertEqual(total_up, 1)
+        self.assertIn("recovered", up_logs[0]["description"])
+
+    def test_get_probes_summary(self):
+        """Verify get_probes_summary calculates uptime_24h_percent, recent_checks, and avg latency."""
+        probe = main.create_sentinel_probe("Summary Probe", "tcp", "127.0.0.1:8080")
+        probe_id = probe["id"]
+
+        # 1. No checks yet -> pending
+        summary = main.get_probes_summary()
+        self.assertEqual(len(summary), 1)
+        p = summary[0]
+        self.assertEqual(p["last_status"], "pending")
+        self.assertEqual(p["uptime_24h_percent"], 100.0)
+        self.assertEqual(p["recent_checks"], [])
+
+        # 2. Add 3 UP and 1 DOWN check
+        main.record_probe_check(probe_id, {"status": "up", "response_time_ms": 20.0})
+        main.record_probe_check(probe_id, {"status": "up", "response_time_ms": 30.0})
+        main.record_probe_check(probe_id, {"status": "down", "response_time_ms": 0.0})
+        main.record_probe_check(probe_id, {"status": "up", "response_time_ms": 10.0})
+
+        summary2 = main.get_probes_summary()
+        p2 = summary2[0]
+        self.assertEqual(p2["last_status"], "up")
+        self.assertEqual(p2["last_response_time_ms"], 10.0)
+        self.assertEqual(p2["uptime_24h_percent"], 75.0)  # 3 up out of 4 total
+        self.assertEqual(p2["recent_checks"], ["up", "up", "down", "up"])
+        self.assertEqual(p2["avg_response_time_ms"], 15.0)  # (20+30+0+10)/4 = 15.0
+
+    def test_sentinel_probes_worker(self):
+        """Verify sentinel_probes_worker executes enabled probes according to intervals."""
+        probe = main.create_sentinel_probe("Worker Probe", "tcp", "127.0.0.1:9000", interval_seconds=5)
+
+        async def run_worker_briefly():
+            worker_task = asyncio.create_task(main.sentinel_probes_worker(sleep_interval=0.01))
+            await asyncio.sleep(0.05)
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+        with patch.object(
+            main, "execute_probe", new=AsyncMock(return_value={"status": "up", "response_time_ms": 5.0})
+        ) as mock_exec:
+            asyncio.run(run_worker_briefly())
+            self.assertGreaterEqual(mock_exec.await_count, 1)
+
+        history = main.get_probe_history(probe["id"])
+        self.assertGreaterEqual(len(history), 1)
+        self.assertEqual(history[0]["status"], "up")
+
+    def test_api_probes_crud_endpoints(self):
+        """Test /api/probes REST API: GET, POST, GET/{id}, PUT/{id}, DELETE/{id}."""
+        # 1. Unauthenticated request -> 401
+        res = asgi_get(api.app, "/api/probes")
+        self.assertEqual(res.status_code, 401)
+
+        # 2. Authenticated GET (empty list)
+        res = asgi_get(api.app, "/api/probes", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertIn("probes", data)
+        self.assertIn("summary", data)
+        self.assertEqual(data["summary"]["total"], 0)
+
+        # 3. Create probe via POST
+        create_payload = {
+            "name": "API Service",
+            "type": "http",
+            "target": "http://127.0.0.1:8080/health",
+            "interval_seconds": 30,
+            "timeout_seconds": 5,
+            "expected_status": 200,
+            "keyword": "OK",
+            "ssl_check": False,
+            "enabled": True,
+        }
+        with patch.object(
+            main, "execute_probe", new=AsyncMock(return_value={"status": "up", "response_time_ms": 12.5, "http_status": 200})
+        ):
+            res = asgi_post(api.app, "/api/probes", json_body=create_payload, cookies=self.auth_cookies)
+            self.assertEqual(res.status_code, 200)
+            created = res.json()
+            self.assertEqual(created["name"], "API Service")
+            probe_id = created["id"]
+
+        # 4. GET by ID
+        res = asgi_get(api.app, f"/api/probes/{probe_id}", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["id"], probe_id)
+
+        # 5. GET invalid ID -> 404
+        res = asgi_get(api.app, "/api/probes/99999", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+        # 6. PUT update probe
+        update_payload = {"name": "API Service Renamed", "interval_seconds": 120}
+        res = asgi_request(api.app, "PUT", f"/api/probes/{probe_id}", json_body=update_payload, cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["name"], "API Service Renamed")
+        self.assertEqual(res.json()["interval_seconds"], 120)
+
+        # 7. DELETE probe
+        res = asgi_request(api.app, "DELETE", f"/api/probes/{probe_id}", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()["ok"])
+
+        # Verify 404 after deletion
+        res = asgi_get(api.app, f"/api/probes/{probe_id}", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+    def test_api_probes_test_and_history_endpoints(self):
+        """Test /api/probes/{id}/test and /api/probes/{id}/history endpoints."""
+        probe = main.create_sentinel_probe("Test Endpoint Probe", "tcp", "127.0.0.1:8080")
+        probe_id = probe["id"]
+
+        # POST /api/probes/{id}/test
+        with patch.object(
+            main, "execute_probe", new=AsyncMock(return_value={"status": "up", "response_time_ms": 8.0})
+        ):
+            res = asgi_post(api.app, f"/api/probes/{probe_id}/test", cookies=self.auth_cookies)
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["result"]["status"], "up")
+
+        # GET /api/probes/{id}/history
+        res = asgi_get(api.app, f"/api/probes/{probe_id}/history", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 200)
+        history_data = res.json()
+        self.assertIn("history", history_data)
+        self.assertEqual(history_data["probe_id"], probe_id)
+        self.assertEqual(len(history_data["history"]), 1)
+        self.assertEqual(history_data["history"][0]["status"], "up")
+
+    def test_vigil_sentinel_frontend_dom_and_js_contracts(self):
+        """Assert complete frontend DOM element contracts, JS function signatures, and SPA routes."""
+        index_html = (Path(__file__).parent / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+
+        # 1. Sidebar Navigation
+        self.assertIn('id="nav-tab-probes"', index_html)
+        self.assertIn('id="nav-tab-probes-badge"', index_html)
+        self.assertIn('Uptime &amp; Probes', index_html)
+
+        # 2. Probes View Panel & Toolbar
+        self.assertIn('id="view-probes"', index_html)
+        self.assertIn('id="probes-last-updated"', index_html)
+        self.assertIn('id="btn-add-probe"', index_html)
+        self.assertIn('id="refresh-probes-btn"', index_html)
+
+        # 3. Status Ribbon Counters
+        self.assertIn('id="probes-total-count"', index_html)
+        self.assertIn('id="probes-up-count"', index_html)
+        self.assertIn('id="probes-down-count"', index_html)
+        self.assertIn('id="probes-avg-latency"', index_html)
+
+        # 4. Probes Grid & Empty State
+        self.assertIn('id="probes-cards-grid"', index_html)
+        self.assertIn('id="probes-empty-state"', index_html)
+        self.assertIn('id="btn-empty-add-probe"', index_html)
+
+        # 5. Modal Dialog & Form Fields
+        self.assertIn('id="probe-modal"', index_html)
+        self.assertIn('id="probe-modal-title"', index_html)
+        self.assertIn('id="probe-form"', index_html)
+        self.assertIn('id="probe-form-name"', index_html)
+        self.assertIn('id="probe-form-type"', index_html)
+        self.assertIn('id="probe-form-target"', index_html)
+        self.assertIn('id="probe-form-interval"', index_html)
+        self.assertIn('id="probe-form-timeout"', index_html)
+        self.assertIn('id="probe-form-status"', index_html)
+        self.assertIn('id="probe-form-keyword"', index_html)
+        self.assertIn('id="probe-form-ssl"', index_html)
+        self.assertIn('id="probe-form-enabled"', index_html)
+        self.assertIn('id="btn-probe-modal-cancel"', index_html)
+        self.assertIn('id="btn-probe-modal-save"', index_html)
+
+        # 6. JavaScript Client Functions in static/app.js
+        self.assertIn("function fetchProbes(", app_js)
+        self.assertIn("function renderProbes(", app_js)
+        self.assertIn("function openAddProbeModal(", app_js)
+        self.assertIn("function openEditProbeModal(", app_js)
+        self.assertIn("function saveProbe(", app_js)
+        self.assertIn("function deleteProbe(", app_js)
+        self.assertIn("function testProbe(", app_js)
+
+        # 7. SPA Routes for Probes & Sentinel
+        for path in ["/probes", "/sentinel"]:
+            res = asgi_get(api.app, path)
+            self.assertEqual(res.status_code, 200, f"SPA route {path} must return 200")
+            self.assertIn("text/html", res.headers.get("content-type", ""))
+
+    def test_api_probes_edge_cases_and_error_handling(self):
+        """Test edge cases: missing probe on test/history, non-existent update/delete, malformed targets."""
+        # Non-existent probe test -> 404
+        res = asgi_post(api.app, "/api/probes/99999/test", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+        # Non-existent probe history -> 404
+        res = asgi_get(api.app, "/api/probes/99999/history", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+        # Non-existent probe update -> 404
+        res = asgi_request(api.app, "PUT", "/api/probes/99999", json_body={"name": "Ghost"}, cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+        # Non-existent probe delete -> 404
+        res = asgi_request(api.app, "DELETE", "/api/probes/99999", cookies=self.auth_cookies)
+        self.assertEqual(res.status_code, 404)
+
+        # Malformed TCP target (no port or invalid port)
+        tcp_probe_invalid = {
+            "name": "Bad TCP",
+            "type": "tcp",
+            "target": "invalid_no_port",
+            "timeout_seconds": 1,
+        }
+        res_tcp = asyncio.run(main.execute_probe(tcp_probe_invalid))
+        self.assertEqual(res_tcp["status"], "down")
+        self.assertIn("Invalid TCP target", res_tcp["error_message"])
+
+        # Unreachable ping target
+        with patch("asyncio.create_subprocess_exec", side_effect=Exception("Ping tool not found")):
+            res_ping = asyncio.run(main.execute_probe({"name": "Ping Fail", "type": "ping", "target": "10.255.255.1"}))
+            self.assertEqual(res_ping["status"], "down")
+
 
 if __name__ == "__main__":
     unittest.main()

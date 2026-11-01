@@ -2312,6 +2312,11 @@ function handleWebSocketMessage(rawData) {
         throttledRefreshDockerSubtab(currentDockerSubtab);
       }
     }
+    if (msg.probes || msg.module === "probes" || msg.type === "probe_update") {
+      if (typeof fetchProbes === "function") {
+        fetchProbes();
+      }
+    }
   } else {
     // 'snapshot' or full payload
     if (msg.refresh_intervals) {
@@ -2347,6 +2352,11 @@ function handleWebSocketMessage(rawData) {
       setModuleLastUpdated("docker");
       if (currentViewTab === "containers") {
         throttledRefreshDockerSubtab(currentDockerSubtab);
+      }
+    }
+    if (msg.probes || msg.module === "probes" || msg.type === "probe_update") {
+      if (typeof fetchProbes === "function") {
+        fetchProbes();
       }
     }
   }
@@ -2576,6 +2586,7 @@ function onAuthenticatedSuccess(username) {
   fetchInstalledPackages("", 1);
   fetchSystemUsers();
   fetchSystemGroups();
+  fetchProbes();
   startSystemUpdatePolling();
 }
 
@@ -3945,12 +3956,14 @@ function switchViewTab(tabName, updateHash = true) {
   const isUsers = normTab === "users";
   const isAudit = normTab === "audit";
   const isPackages = normTab === "packages" || normTab === "updates" || normTab === "dpkg" || normTab === "apt";
+  const isProbes = normTab === "probes" || normTab === "sentinel" || normTab === "uptime";
   currentViewTab = isRaid ? "raid" : (normTab || "overview");
 
   const overviewTab = document.getElementById("nav-tab-overview");
   const raidTab = document.getElementById("nav-tab-raid");
   const notificationsTab = document.getElementById("nav-tab-notifications");
   const containersTab = document.getElementById("nav-tab-containers");
+  const probesTab = document.getElementById("nav-tab-probes");
   const servicesTab = document.getElementById("nav-tab-services");
   const processesTab = document.getElementById("nav-tab-processes");
   const usersTab = document.getElementById("nav-tab-users");
@@ -3961,6 +3974,7 @@ function switchViewTab(tabName, updateHash = true) {
   const raidView = document.getElementById("view-raid");
   const notificationsView = document.getElementById("view-notifications");
   const containersView = document.getElementById("view-containers");
+  const probesView = document.getElementById("view-probes");
   const servicesView = document.getElementById("view-services");
   const processesView = document.getElementById("view-processes");
   const usersView = document.getElementById("view-users");
@@ -3977,6 +3991,8 @@ function switchViewTab(tabName, updateHash = true) {
   notificationsTab?.setAttribute("aria-selected", "false");
   containersTab?.classList.remove("active");
   containersTab?.setAttribute("aria-selected", "false");
+  probesTab?.classList.remove("active");
+  probesTab?.setAttribute("aria-selected", "false");
   servicesTab?.classList.remove("active");
   servicesTab?.setAttribute("aria-selected", "false");
   processesTab?.classList.remove("active");
@@ -3992,6 +4008,7 @@ function switchViewTab(tabName, updateHash = true) {
   raidView?.classList.add("hidden");
   notificationsView?.classList.add("hidden");
   containersView?.classList.add("hidden");
+  probesView?.classList.add("hidden");
   servicesView?.classList.add("hidden");
   processesView?.classList.add("hidden");
   usersView?.classList.add("hidden");
@@ -4110,6 +4127,19 @@ function switchViewTab(tabName, updateHash = true) {
     if (isAuthenticated) {
       refreshPackagesView();
     }
+  } else if (isProbes) {
+    probesTab?.classList.add("active");
+    probesTab?.setAttribute("aria-selected", "true");
+    probesView?.classList.remove("hidden");
+    if (pageTitle) pageTitle.textContent = "Uptime & Probes";
+
+    if (updateHash && !window.location.hash.startsWith("#probes") && !window.location.hash.startsWith("#sentinel")) {
+      history.replaceState(null, "", "#probes");
+    }
+
+    if (isAuthenticated) {
+      fetchProbes();
+    }
   } else {
     overviewTab?.classList.add("active");
     overviewTab?.setAttribute("aria-selected", "true");
@@ -4141,6 +4171,8 @@ function syncTabFromHash() {
     switchViewTab("services", false);
   } else if (route === "processes" || route === "proc" || route === "tasks") {
     switchViewTab("processes", false);
+  } else if (route === "probes" || route === "sentinel" || route === "uptime") {
+    switchViewTab("probes", false);
   } else if (route.startsWith("users") || route.startsWith("groups")) {
     switchViewTab("users", false);
     if (route.includes("groups")) {
@@ -7629,6 +7661,592 @@ function refreshPackagesView() {
   fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage);
 }
 
+/* =========================================================================
+ * Vigil Sentinel: Service Uptime & Health Probes Controllers
+ * ========================================================================= */
+
+let cachedProbesData = null;
+let isFetchingProbes = false;
+
+/**
+ * Fetch all configured endpoint probes and summary metrics from GET /api/probes.
+ */
+async function fetchProbes(isUserTriggered = false) {
+  if (isFetchingProbes) return;
+  isFetchingProbes = true;
+
+  const refreshBtn = document.getElementById("refresh-probes-btn");
+  if (refreshBtn) refreshBtn.classList.add("loading");
+
+  try {
+    const resp = await apiFetch("/api/probes");
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch probes (HTTP ${resp.status})`);
+    }
+    const data = await resp.json();
+    cachedProbesData = data;
+    renderProbes(data);
+    if (isUserTriggered) {
+      showToast({
+        title: "Probes Refreshed",
+        message: "Endpoint statuses and latency metrics updated.",
+        type: "success",
+      });
+    }
+  } catch (err) {
+    console.error("fetchProbes error:", err);
+    showToast({
+      title: "Probes Sync Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    isFetchingProbes = false;
+    if (refreshBtn) refreshBtn.classList.remove("loading");
+  }
+}
+
+/**
+ * Render probe cards, summary status ribbon, and empty state.
+ */
+function renderProbes(data) {
+  if (!data || typeof data !== "object") return;
+
+  const probes = Array.isArray(data.probes) ? data.probes : [];
+  const summary = data.summary || {
+    total: probes.length,
+    up: probes.filter((p) => p.last_status === "up").length,
+    down: probes.filter((p) => p.last_status === "down").length,
+    avg_latency: 0,
+  };
+
+  // Update Status Ribbon Counters
+  const totalCountEl = document.getElementById("probes-total-count");
+  if (totalCountEl) totalCountEl.textContent = String(summary.total ?? probes.length);
+
+  const upCountEl = document.getElementById("probes-up-count");
+  if (upCountEl) upCountEl.textContent = String(summary.up ?? 0);
+
+  const downCountEl = document.getElementById("probes-down-count");
+  if (downCountEl) downCountEl.textContent = String(summary.down ?? 0);
+
+  const avgLatencyEl = document.getElementById("probes-avg-latency");
+  if (avgLatencyEl) {
+    const avg = Number(summary.avg_latency || 0);
+    avgLatencyEl.textContent = avg > 0 ? `${avg.toFixed(1)} ms` : "-- ms";
+  }
+
+  // Last Updated text
+  const lastUpdatedEl = document.getElementById("probes-last-updated");
+  if (lastUpdatedEl) {
+    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  }
+
+  // Sidebar badge
+  const navBadge = document.getElementById("nav-tab-probes-badge");
+  if (navBadge) {
+    if (summary.down > 0) {
+      navBadge.textContent = String(summary.down);
+      navBadge.className = "nav-tab-badge danger";
+      navBadge.classList.remove("hidden");
+    } else if (summary.total > 0) {
+      navBadge.textContent = String(summary.total);
+      navBadge.className = "nav-tab-badge";
+      navBadge.classList.remove("hidden");
+    } else {
+      navBadge.classList.add("hidden");
+    }
+  }
+
+  const emptyState = document.getElementById("probes-empty-state");
+  const cardsGrid = document.getElementById("probes-cards-grid");
+  if (!cardsGrid) return;
+
+  if (probes.length === 0) {
+    emptyState?.classList.remove("hidden");
+    cardsGrid.innerHTML = "";
+    return;
+  }
+
+  emptyState?.classList.add("hidden");
+
+  // Render cards
+  cardsGrid.innerHTML = probes
+    .map((probe) => {
+      const status = probe.last_status || "pending";
+      let statusBadgeClass = "status-muted";
+      let statusLabel = "PENDING";
+      if (status === "up") {
+        statusBadgeClass = "status-ok";
+        statusLabel = "OPERATIONAL";
+      } else if (status === "down") {
+        statusBadgeClass = "status-danger";
+        statusLabel = "DOWN";
+      } else if (status === "degraded") {
+        statusBadgeClass = "status-warn";
+        statusLabel = "DEGRADED";
+      }
+
+      const uptimePct = Number(probe.uptime_24h_percent ?? 100).toFixed(1);
+      const latencyVal =
+        probe.last_response_time_ms && Number(probe.last_response_time_ms) > 0
+          ? `${Math.round(probe.last_response_time_ms)} ms`
+          : "--";
+
+      // SSL Days Remaining badge
+      let sslBadgeHtml = "";
+      if (probe.type === "http" && probe.ssl_check) {
+        const days = probe.ssl_days_remaining;
+        if (days !== null && days !== undefined) {
+          if (days <= 0) {
+            sslBadgeHtml = `<span class="probe-ssl-badge ssl-danger" title="SSL Certificate has expired!">SSL Expired</span>`;
+          } else if (days <= 14) {
+            sslBadgeHtml = `<span class="probe-ssl-badge ssl-danger" title="Expires in ${days} days — Renewal needed urgently!">SSL: ${days}d</span>`;
+          } else if (days <= 30) {
+            sslBadgeHtml = `<span class="probe-ssl-badge ssl-warning" title="Expires in ${days} days">SSL: ${days}d</span>`;
+          } else {
+            sslBadgeHtml = `<span class="probe-ssl-badge ssl-good" title="Certificate valid for ${days} days">SSL: ${days}d</span>`;
+          }
+        } else {
+          sslBadgeHtml = `<span class="probe-ssl-badge ssl-warning" title="SSL certificate check pending">SSL: --</span>`;
+        }
+      }
+
+      // 20-pip Heartbeat Bar
+      const recentChecks = Array.isArray(probe.recent_checks) ? [...probe.recent_checks] : [];
+      while (recentChecks.length < 20) {
+        recentChecks.unshift("pending");
+      }
+      const last20 = recentChecks.slice(-20);
+      const pipsHtml = last20
+        .map((chk) => {
+          const pipStatus = chk || "pending";
+          const title = `Check: ${pipStatus.toUpperCase()}`;
+          return `<div class="heartbeat-pip pip-${escapeHtml(pipStatus)}" title="${title}"></div>`;
+        })
+        .join("");
+
+      const lastCheckedTime = probe.last_checked_at
+        ? formatRelativeTime(probe.last_checked_at)
+        : "Never checked";
+
+      const cardStatusClass = `status-${status}`;
+      const disabledClass = !probe.enabled ? "probe-disabled" : "";
+
+      return `
+        <article class="probe-card ${cardStatusClass} ${disabledClass}" id="probe-card-${probe.id}">
+          <div class="probe-card-header">
+            <div class="probe-header-title-col">
+              <span class="probe-card-name" title="${escapeHtml(probe.name)}">${escapeHtml(probe.name)}</span>
+              <span class="probe-card-target" title="${escapeHtml(probe.target)}">${escapeHtml(probe.target)}</span>
+            </div>
+            <div class="probe-header-badges-col">
+              <span class="probe-type-badge type-${escapeHtml(probe.type)}">${escapeHtml(probe.type.toUpperCase())}</span>
+              <span class="status-badge ${statusBadgeClass}">${statusLabel}</span>
+            </div>
+          </div>
+
+          <div class="probe-metrics-row">
+            <div class="probe-metric-item">
+              <span class="probe-metric-label">24h Uptime</span>
+              <span class="probe-metric-value">${uptimePct}%</span>
+            </div>
+            <div class="probe-metric-item">
+              <span class="probe-metric-label">Latency</span>
+              <span class="probe-metric-value">${latencyVal}</span>
+            </div>
+            <div class="probe-metric-item">
+              <span class="probe-metric-label">Interval</span>
+              <span class="probe-metric-value">${probe.interval_seconds || 60}s</span>
+            </div>
+            ${sslBadgeHtml ? `<div class="probe-metric-item"><span class="probe-metric-label">SSL Expiry</span>${sslBadgeHtml}</div>` : ""}
+          </div>
+
+          <div class="probe-heartbeat-container">
+            <div class="probe-heartbeat-header">
+              <span>Heartbeat History (last 20 checks)</span>
+              <span>${escapeHtml(lastCheckedTime)}</span>
+            </div>
+            <div class="probe-heartbeat-bar" role="meter" aria-label="Recent check results">
+              ${pipsHtml}
+            </div>
+          </div>
+
+          <div class="probe-actions-bar">
+            <div class="probe-actions-group">
+              <button
+                type="button"
+                class="btn-probe-action"
+                id="btn-probe-test-${probe.id}"
+                data-action="test"
+                data-id="${probe.id}"
+                title="Immediately run diagnostic check"
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                </svg>
+                <span>Check Now</span>
+              </button>
+            </div>
+            <div class="probe-actions-group">
+              <button
+                type="button"
+                class="btn-probe-action"
+                id="btn-probe-edit-${probe.id}"
+                data-action="edit"
+                data-id="${probe.id}"
+                title="Edit probe settings"
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                </svg>
+                <span>Edit</span>
+              </button>
+              <button
+                type="button"
+                class="btn-probe-action danger"
+                id="btn-probe-delete-${probe.id}"
+                data-action="delete"
+                data-id="${probe.id}"
+                title="Delete this probe"
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polyline points="3 6 5 6 21 6"></polyline>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                </svg>
+                <span>Delete</span>
+              </button>
+            </div>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+/**
+ * Handle switching form input fields dynamically when Probe Type changes.
+ */
+function handleProbeTypeChange(selectedType) {
+  const httpFields = document.getElementById("probe-form-http-fields");
+  const targetInput = document.getElementById("probe-form-target");
+  const targetHint = document.getElementById("probe-target-hint");
+
+  if (selectedType === "http") {
+    httpFields?.classList.remove("hidden");
+    if (targetInput) targetInput.placeholder = "https://example.com or http://192.168.1.100:8080";
+    if (targetHint) targetHint.textContent = "Full URL for HTTP/HTTPS (e.g. https://api.example.com/health).";
+  } else if (selectedType === "tcp") {
+    httpFields?.classList.add("hidden");
+    if (targetInput) targetInput.placeholder = "hostname:port (e.g. 192.168.1.50:5432 or db.local:3306)";
+    if (targetHint) targetHint.textContent = "Host and port separated by colon (e.g. 1.1.1.1:53).";
+  } else if (selectedType === "ping") {
+    httpFields?.classList.add("hidden");
+    if (targetInput) targetInput.placeholder = "hostname or IP (e.g. 8.8.8.8 or gateway.local)";
+    if (targetHint) targetHint.textContent = "Hostname or IP address for ICMP echo.";
+  }
+}
+
+/**
+ * Open the Add Probe modal.
+ */
+function openAddProbeModal() {
+  const modal = document.getElementById("probe-modal");
+  const title = document.getElementById("probe-modal-title");
+  const idInput = document.getElementById("probe-form-id");
+  const nameInput = document.getElementById("probe-form-name");
+  const typeSelect = document.getElementById("probe-form-type");
+  const targetInput = document.getElementById("probe-form-target");
+  const intervalSelect = document.getElementById("probe-form-interval");
+  const timeoutInput = document.getElementById("probe-form-timeout");
+  const statusInput = document.getElementById("probe-form-status");
+  const keywordInput = document.getElementById("probe-form-keyword");
+  const sslCheckbox = document.getElementById("probe-form-ssl");
+  const enabledCheckbox = document.getElementById("probe-form-enabled");
+  const feedback = document.getElementById("probe-modal-feedback");
+
+  if (!modal) return;
+
+  if (title) title.textContent = "Add New Endpoint Probe";
+  if (idInput) idInput.value = "";
+  if (nameInput) nameInput.value = "";
+  if (typeSelect) typeSelect.value = "http";
+  if (targetInput) targetInput.value = "";
+  if (intervalSelect) intervalSelect.value = "60";
+  if (timeoutInput) timeoutInput.value = "5";
+  if (statusInput) statusInput.value = "200";
+  if (keywordInput) keywordInput.value = "";
+  if (sslCheckbox) sslCheckbox.checked = true;
+  if (enabledCheckbox) enabledCheckbox.checked = true;
+
+  if (feedback) {
+    feedback.textContent = "";
+    feedback.classList.add("hidden");
+  }
+
+  handleProbeTypeChange("http");
+  modal.classList.remove("hidden");
+  nameInput?.focus();
+}
+
+/**
+ * Open the Edit Probe modal with pre-populated values.
+ */
+function openEditProbeModal(probeId) {
+  const modal = document.getElementById("probe-modal");
+  const title = document.getElementById("probe-modal-title");
+  const idInput = document.getElementById("probe-form-id");
+  const nameInput = document.getElementById("probe-form-name");
+  const typeSelect = document.getElementById("probe-form-type");
+  const targetInput = document.getElementById("probe-form-target");
+  const intervalSelect = document.getElementById("probe-form-interval");
+  const timeoutInput = document.getElementById("probe-form-timeout");
+  const statusInput = document.getElementById("probe-form-status");
+  const keywordInput = document.getElementById("probe-form-keyword");
+  const sslCheckbox = document.getElementById("probe-form-ssl");
+  const enabledCheckbox = document.getElementById("probe-form-enabled");
+  const feedback = document.getElementById("probe-modal-feedback");
+
+  if (!modal) return;
+
+  const probes = cachedProbesData?.probes || [];
+  const probe = probes.find((p) => p.id === probeId);
+  if (!probe) {
+    showToast({
+      title: "Probe Not Found",
+      message: `Could not find probe #${probeId} in cache.`,
+      type: "danger",
+    });
+    return;
+  }
+
+  if (title) title.textContent = `Edit Endpoint Probe: ${probe.name}`;
+  if (idInput) idInput.value = String(probe.id);
+  if (nameInput) nameInput.value = probe.name || "";
+  if (typeSelect) typeSelect.value = probe.type || "http";
+  if (targetInput) targetInput.value = probe.target || "";
+  if (intervalSelect) intervalSelect.value = String(probe.interval_seconds || 60);
+  if (timeoutInput) timeoutInput.value = String(probe.timeout_seconds || 5);
+  if (statusInput) statusInput.value = String(probe.expected_status || 200);
+  if (keywordInput) keywordInput.value = probe.keyword || "";
+  if (sslCheckbox) sslCheckbox.checked = Boolean(probe.ssl_check);
+  if (enabledCheckbox) enabledCheckbox.checked = Boolean(probe.enabled ?? true);
+
+  if (feedback) {
+    feedback.textContent = "";
+    feedback.classList.add("hidden");
+  }
+
+  handleProbeTypeChange(probe.type || "http");
+  modal.classList.remove("hidden");
+  nameInput?.focus();
+}
+
+/**
+ * Close the Add/Edit Probe modal.
+ */
+function closeProbeModal() {
+  const modal = document.getElementById("probe-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+/**
+ * Handle form submission to create or update an endpoint probe.
+ */
+async function saveProbe(event) {
+  return handleProbeFormSubmit(event);
+}
+
+async function handleProbeFormSubmit(event) {
+  if (event) event.preventDefault();
+
+  const idInput = document.getElementById("probe-form-id");
+  const nameInput = document.getElementById("probe-form-name");
+  const typeSelect = document.getElementById("probe-form-type");
+  const targetInput = document.getElementById("probe-form-target");
+  const intervalSelect = document.getElementById("probe-form-interval");
+  const timeoutInput = document.getElementById("probe-form-timeout");
+  const statusInput = document.getElementById("probe-form-status");
+  const keywordInput = document.getElementById("probe-form-keyword");
+  const sslCheckbox = document.getElementById("probe-form-ssl");
+  const enabledCheckbox = document.getElementById("probe-form-enabled");
+  const feedback = document.getElementById("probe-modal-feedback");
+  const saveBtn = document.getElementById("btn-probe-modal-save");
+
+  const probeId = idInput?.value ? parseInt(idInput.value, 10) : null;
+  const name = (nameInput?.value || "").trim();
+  const type = (typeSelect?.value || "http").trim().toLowerCase();
+  let target = (targetInput?.value || "").trim();
+  const interval_seconds = parseInt(intervalSelect?.value || "60", 10);
+  const timeout_seconds = parseInt(timeoutInput?.value || "5", 10);
+  const expected_status = parseInt(statusInput?.value || "200", 10);
+  const keyword = (keywordInput?.value || "").trim();
+  const ssl_check = Boolean(sslCheckbox?.checked);
+  const enabled = Boolean(enabledCheckbox?.checked);
+
+  if (!name) {
+    if (feedback) {
+      feedback.textContent = "Probe name is required.";
+      feedback.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (!target) {
+    if (feedback) {
+      feedback.textContent = "Target endpoint is required.";
+      feedback.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (type === "http" && !target.startsWith("http://") && !target.startsWith("https://")) {
+    target = `https://${target}`;
+    if (targetInput) targetInput.value = target;
+  }
+
+  const payload = {
+    name,
+    type,
+    target,
+    interval_seconds,
+    timeout_seconds,
+    expected_status,
+    keyword,
+    ssl_check,
+    enabled,
+  };
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving...";
+  }
+
+  try {
+    let resp;
+    if (probeId) {
+      resp = await apiFetch("/api/probes/" + probeId, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } else {
+      resp = await apiFetch("/api/probes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    }
+
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(result.detail || `Server responded with status ${resp.status}`);
+    }
+
+    closeProbeModal();
+    showToast({
+      title: probeId ? "Probe Updated" : "Probe Created",
+      message: `Endpoint probe '${name}' was successfully saved.`,
+      type: "success",
+    });
+    await fetchProbes();
+  } catch (err) {
+    console.error("handleProbeFormSubmit error:", err);
+    if (feedback) {
+      feedback.textContent = err instanceof Error ? err.message : String(err);
+      feedback.classList.remove("hidden");
+    }
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save Probe";
+    }
+  }
+}
+
+/**
+ * Delete a configured probe after confirmation.
+ */
+async function deleteProbe(probeId) {
+  const probes = cachedProbesData?.probes || [];
+  const probe = probes.find((p) => p.id === probeId);
+  const probeName = probe ? probe.name : `#${probeId}`;
+
+  if (!confirm(`Are you sure you want to delete the probe '${probeName}'? All check history will be removed.`)) {
+    return;
+  }
+
+  try {
+    const resp = await apiFetch("/api/probes/" + probeId, {
+      method: "DELETE",
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(result.detail || `Failed to delete probe (HTTP ${resp.status})`);
+    }
+
+    showToast({
+      title: "Probe Deleted",
+      message: `Endpoint probe '${probeName}' has been removed.`,
+      type: "success",
+    });
+    await fetchProbes();
+  } catch (err) {
+    console.error("deleteProbe error:", err);
+    showToast({
+      title: "Delete Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
+ * Execute an immediate test of a probe and display results in a toast.
+ */
+async function testProbe(probeId, btnEl) {
+  if (btnEl) {
+    btnEl.classList.add("loading");
+    btnEl.disabled = true;
+  }
+
+  try {
+    const resp = await apiFetch("/api/probes/" + probeId + "/test", {
+      method: "POST",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `Test failed with HTTP ${resp.status}`);
+    }
+
+    const result = data.result || {};
+    const status = (result.status || "unknown").toUpperCase();
+    const latency = result.response_time_ms ? `${Math.round(result.response_time_ms)}ms` : "";
+    const isUp = result.status === "up" || result.status === "degraded";
+
+    showToast({
+      title: `Probe Test: ${status}`,
+      message: `Diagnostic test completed in ${latency || "--"}. Message: ${result.message || "OK"}`,
+      type: isUp ? "success" : "danger",
+    });
+
+    await fetchProbes();
+  } catch (err) {
+    console.error("testProbe error:", err);
+    showToast({
+      title: "Probe Test Error",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (btnEl) {
+      btnEl.classList.remove("loading");
+      btnEl.disabled = false;
+    }
+  }
+}
+
 /**
  * Initialize listeners and run startup authentication check.
  */
@@ -7645,6 +8263,10 @@ function initDashboard() {
   document
     .getElementById("nav-tab-containers")
     ?.addEventListener("click", () => switchViewTab("containers", true));
+
+  document
+    .getElementById("nav-tab-probes")
+    ?.addEventListener("click", () => switchViewTab("probes", true));
 
   document
     .getElementById("nav-tab-services")
@@ -7751,6 +8373,61 @@ function initDashboard() {
         fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage + 1);
       }
     });
+
+  // Vigil Sentinel: Uptime & Health Probes Listeners
+  document
+    .getElementById("refresh-probes-btn")
+    ?.addEventListener("click", () => fetchProbes(true));
+
+  document
+    .getElementById("btn-add-probe")
+    ?.addEventListener("click", openAddProbeModal);
+
+  document
+    .getElementById("btn-empty-add-probe")
+    ?.addEventListener("click", openAddProbeModal);
+
+  document
+    .getElementById("btn-probe-modal-close")
+    ?.addEventListener("click", closeProbeModal);
+
+  document
+    .getElementById("btn-probe-modal-cancel")
+    ?.addEventListener("click", closeProbeModal);
+
+  document
+    .getElementById("probe-form")
+    ?.addEventListener("submit", handleProbeFormSubmit);
+
+  document
+    .getElementById("btn-probe-modal-save")
+    ?.addEventListener("click", handleProbeFormSubmit);
+
+  document
+    .getElementById("probe-form-type")
+    ?.addEventListener("change", (e) => handleProbeTypeChange(e.target.value));
+
+  const probeModal = document.getElementById("probe-modal");
+  probeModal?.addEventListener("click", (e) => {
+    if (e.target === probeModal) closeProbeModal();
+  });
+
+  const probesCardsGrid = document.getElementById("probes-cards-grid");
+  probesCardsGrid?.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    const id = parseInt(btn.getAttribute("data-id"), 10);
+    if (!id) return;
+
+    if (action === "test") {
+      testProbe(id, btn);
+    } else if (action === "edit") {
+      openEditProbeModal(id);
+    } else if (action === "delete") {
+      deleteProbe(id);
+    }
+  });
 
   // CPU Cores Drilldown Toggle
   const btnToggleCpuCores = document.getElementById("btn-toggle-cpu-cores");
