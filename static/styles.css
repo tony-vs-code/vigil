@@ -2344,7 +2344,9 @@ hr.overview-flow-divider {
 
 .cpu-unified-chart-container {
   width: 100%;
-  height: 150px;
+  height: auto;
+  display: flex;
+  flex-direction: column;
   margin-bottom: 10px;
   border-radius: var(--radius-sm);
   background: rgba(4, 9, 20, 0.8);
@@ -2358,6 +2360,8 @@ hr.overview-flow-divider {
   width: 100%;
   height: 150px;
   display: block;
+  border: none;
+  border-radius: 0;
 }
 
 .cpu-core-canvas {
@@ -2367,6 +2371,11 @@ hr.overview-flow-divider {
   border-radius: var(--radius-sm);
   background: rgba(4, 9, 20, 0.8);
   border: 1px solid rgba(71, 85, 105, 0.25);
+}
+
+.cpu-unified-chart-container .cpu-core-canvas {
+  border: none;
+  border-radius: 0;
 }
 
 .cpu-cores-grid {
