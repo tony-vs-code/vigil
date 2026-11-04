@@ -507,31 +507,29 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
   ctx.fillRect(0, 0, w, h);
 
   // 2. Padding and usable plot geometry
-  const padLeft = 32;
-  const padRight = 10;
-  const padTop = 10;
-  const padBottom = 12;
+  const padLeft = 34;
+  const padRight = 12;
+  const padTop = 14;
+  const padBottom = 18;
   const plotW = Math.max(10, w - padLeft - padRight);
   const plotH = Math.max(10, h - padTop - padBottom);
 
-  // 3. Subtle horizontal grid lines & faint percentage labels (100%, 75%, 50%, 25%, 0%)
+  // 3. Subtle horizontal grid lines & percentage labels (100%, 75%, 50%, 25%, 0%)
   const gridPcts = [100, 75, 50, 25, 0];
   ctx.lineWidth = 1;
   gridPcts.forEach((pct) => {
     const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
-    ctx.strokeStyle = "rgba(71, 85, 105, 0.22)";
+    ctx.strokeStyle = pct === 0 ? "rgba(148, 163, 184, 0.35)" : "rgba(71, 85, 105, 0.24)";
     ctx.beginPath();
     ctx.moveTo(padLeft, y);
     ctx.lineTo(w - padRight, y);
     ctx.stroke();
 
-    if (pct > 0) {
-      ctx.fillStyle = "rgba(148, 163, 184, 0.45)";
-      ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
-      ctx.textAlign = "right";
-      ctx.textBaseline = "middle";
-      ctx.fillText(`${pct}%`, padLeft - 4, y);
-    }
+    ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
+    ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`${pct}%`, padLeft - 5, y);
   });
 
   // Vertical time ticks
@@ -566,7 +564,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
     for (let i = 0; i < n; i++) {
       const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
       const x = (w - padRight) - (n - 1 - i) * stepX;
-      const y = padTop + plotH * (1 - sample / 100);
+      const y = padTop + (plotH - 2) * (1 - sample / 100);
       pts.push({ x, y });
     }
     if (pts.length === 1) {
@@ -650,15 +648,29 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
       ctx.fill();
       ctx.restore();
     } else {
+      // Subtle area fill under standard series line
+      ctx.save();
+      const stdGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+      stdGrad.addColorStop(0, `${color}18`);
+      stdGrad.addColorStop(1, `${color}04`);
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, padTop + plotH);
+      pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+      ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
+      ctx.closePath();
+      ctx.fillStyle = stdGrad;
+      ctx.fill();
+      ctx.restore();
+
       // Clean standard line
       ctx.save();
       ctx.strokeStyle = color;
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = 1.8;
       ctx.shadowColor = color;
       ctx.shadowBlur = 3;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      ctx.globalAlpha = 0.85;
+      ctx.globalAlpha = 0.92;
       ctx.beginPath();
       pts.forEach((pt, i) => {
         if (i === 0) ctx.moveTo(pt.x, pt.y);
@@ -2989,6 +3001,7 @@ function onAuthenticatedSuccess(username) {
   fetchProbes();
   fetchSmartDisks();
   fetchHardwareThermals();
+  fetchNetworkSecurity();
   startSystemUpdatePolling();
 }
 
@@ -4359,7 +4372,8 @@ function switchViewTab(tabName, updateHash = true) {
   const isAudit = normTab === "audit";
   const isPackages = normTab === "packages" || normTab === "updates" || normTab === "dpkg" || normTab === "apt";
   const isProbes = normTab === "probes" || normTab === "sentinel" || normTab === "uptime";
-  currentViewTab = isRaid ? "raid" : (normTab || "overview");
+  const isSecurity = normTab === "security" || normTab === "network" || normTab === "firewall";
+  currentViewTab = isRaid ? "raid" : (isSecurity ? "security" : (normTab || "overview"));
 
   const overviewTab = document.getElementById("nav-tab-overview");
   const raidTab = document.getElementById("nav-tab-raid");
@@ -4367,6 +4381,7 @@ function switchViewTab(tabName, updateHash = true) {
   const containersTab = document.getElementById("nav-tab-containers");
   const probesTab = document.getElementById("nav-tab-probes");
   const servicesTab = document.getElementById("nav-tab-services");
+  const securityTab = document.getElementById("nav-tab-security");
   const processesTab = document.getElementById("nav-tab-processes");
   const usersTab = document.getElementById("nav-tab-users");
   const auditTab = document.getElementById("nav-tab-audit");
@@ -4378,6 +4393,7 @@ function switchViewTab(tabName, updateHash = true) {
   const containersView = document.getElementById("view-containers");
   const probesView = document.getElementById("view-probes");
   const servicesView = document.getElementById("view-services");
+  const securityView = document.getElementById("view-security");
   const processesView = document.getElementById("view-processes");
   const usersView = document.getElementById("view-users");
   const auditView = document.getElementById("view-audit");
@@ -4397,6 +4413,8 @@ function switchViewTab(tabName, updateHash = true) {
   probesTab?.setAttribute("aria-selected", "false");
   servicesTab?.classList.remove("active");
   servicesTab?.setAttribute("aria-selected", "false");
+  securityTab?.classList.remove("active");
+  securityTab?.setAttribute("aria-selected", "false");
   processesTab?.classList.remove("active");
   processesTab?.setAttribute("aria-selected", "false");
   usersTab?.classList.remove("active");
@@ -4412,6 +4430,7 @@ function switchViewTab(tabName, updateHash = true) {
   containersView?.classList.add("hidden");
   probesView?.classList.add("hidden");
   servicesView?.classList.add("hidden");
+  securityView?.classList.add("hidden");
   processesView?.classList.add("hidden");
   usersView?.classList.add("hidden");
   auditView?.classList.add("hidden");
@@ -4545,6 +4564,27 @@ function switchViewTab(tabName, updateHash = true) {
     if (isAuthenticated) {
       fetchProbes();
     }
+  } else if (isSecurity) {
+    securityTab?.classList.add("active");
+    securityTab?.setAttribute("aria-selected", "true");
+    securityView?.classList.remove("hidden");
+    if (pageTitle) pageTitle.textContent = "Network & Security";
+
+    if (
+      updateHash &&
+      !window.location.hash.startsWith("#security") &&
+      !window.location.hash.startsWith("#/security") &&
+      !window.location.hash.startsWith("#network") &&
+      !window.location.hash.startsWith("#/network") &&
+      !window.location.hash.startsWith("#firewall") &&
+      !window.location.hash.startsWith("#/firewall")
+    ) {
+      history.replaceState(null, "", "#/security");
+    }
+
+    if (isAuthenticated) {
+      fetchNetworkSecurity();
+    }
   } else {
     overviewTab?.classList.add("active");
     overviewTab?.setAttribute("aria-selected", "true");
@@ -4561,7 +4601,7 @@ function switchViewTab(tabName, updateHash = true) {
  * Synchronize view tab state from location.hash or location.pathname.
  */
 function syncTabFromHash() {
-  const hash = (window.location.hash || "").replace("#", "").toLowerCase().trim();
+  const hash = (window.location.hash || "").replace(/^#\/?/, "").toLowerCase().trim();
   const path = (window.location.pathname || "").toLowerCase().replace(/^\/+|\/+$/g, "").trim();
   const route = hash || path;
 
@@ -4574,6 +4614,8 @@ function syncTabFromHash() {
     switchViewTab("raid", false);
   } else if (route === "services" || route === "systemctl") {
     switchViewTab("services", false);
+  } else if (route.startsWith("security") || route.startsWith("network") || route.startsWith("firewall")) {
+    switchViewTab("security", false);
   } else if (route === "processes" || route === "proc" || route === "tasks") {
     switchViewTab("processes", false);
   } else if (route === "probes" || route === "sentinel" || route === "uptime") {
@@ -4585,7 +4627,7 @@ function syncTabFromHash() {
     } else {
       switchUsersSubtab("users");
     }
-  } else if (route === "audit" || route === "security" || route === "audit-log") {
+  } else if (route === "audit" || route === "audit-log") {
     switchViewTab("audit", false);
   } else if (route.startsWith("packages") || route.startsWith("updates") || route === "dpkg" || route === "apt") {
     switchViewTab("packages", false);
@@ -6908,19 +6950,89 @@ async function handleRemoveVolume(volumeName) {
     return;
   }
 
+  const feedback = document.getElementById("docker-volume-feedback");
   try {
     const resp = await apiFetch(`/api/docker/volumes/${encodeURIComponent(volumeName)}`, {
       method: "DELETE",
     });
-    if (!resp.ok) {
-      const data = await resp.json().catch(() => ({}));
-      alert(`Failed to remove volume: ${data.detail || resp.statusText}`);
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      if (feedback) {
+        feedback.className = "auth-alert feedback-success";
+        feedback.textContent = `Volume "${volumeName}" removed successfully.`;
+        feedback.classList.remove("hidden");
+      }
+      showToast({
+        title: "Volume Removed",
+        message: `Docker volume "${volumeName}" has been deleted.`,
+        type: "success",
+      });
+    } else {
+      const errMsg = data.detail || resp.statusText || "Failed to remove volume.";
+      if (feedback) {
+        feedback.className = "auth-alert feedback-error";
+        feedback.textContent = `Failed to remove volume "${volumeName}": ${errMsg}`;
+        feedback.classList.remove("hidden");
+      }
+      alert(`Failed to remove volume: ${errMsg}`);
     }
   } catch (err) {
+    if (feedback) {
+      feedback.className = "auth-alert feedback-error";
+      feedback.textContent = `Error removing volume: ${err.message}`;
+      feedback.classList.remove("hidden");
+    }
     alert(`Error: ${err.message}`);
   } finally {
     fetchDockerVolumes();
     fetchDockerStatus();
+  }
+}
+
+async function handlePruneVolumes() {
+  if (!confirm("Are you sure you want to prune all unused Docker volumes? Unused volume data will be permanently deleted.")) {
+    return;
+  }
+
+  const feedback = document.getElementById("docker-volume-feedback");
+  try {
+    const resp = await apiFetch("/api/docker/volumes/prune", {
+      method: "POST",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      if (feedback) {
+        feedback.className = "auth-alert feedback-success";
+        feedback.textContent = "Unused volumes pruned successfully.";
+        feedback.classList.remove("hidden");
+      }
+      showToast({
+        title: "Volumes Pruned",
+        message: "Unused Docker volumes pruned successfully.",
+        type: "success",
+      });
+      fetchDockerVolumes();
+      fetchDockerStatus();
+    } else {
+      const errMsg = data.detail || resp.statusText || "Failed to prune volumes.";
+      if (feedback) {
+        feedback.className = "auth-alert feedback-error";
+        feedback.textContent = errMsg;
+        feedback.classList.remove("hidden");
+      }
+      showToast({
+        title: "Prune Volumes Failed",
+        message: errMsg,
+        type: "danger",
+      });
+    }
+  } catch (err) {
+    if (feedback) {
+      feedback.className = "auth-alert feedback-error";
+      feedback.textContent = `Error: ${err.message}`;
+      feedback.classList.remove("hidden");
+    }
+    alert(`Error: ${err.message}`);
   }
 }
 
@@ -7549,6 +7661,7 @@ let currentPkgSearchQuery = "";
 let currentPkgPage = 1;
 let currentPkgTotalPages = 1;
 let pkgInstalledSearchDebounceTimer = null;
+let lastUpgradeTargetPackage = null;
 
 function switchPackagesSubtab(subtab) {
   currentPackagesSubtab = subtab || "updates";
@@ -7583,7 +7696,6 @@ function switchPackagesSubtab(subtab) {
 function renderPackagesOverviewRibbon(rebootStatus, updatesData) {
   const badge = document.getElementById("overview-packages-badge");
   const summary = document.getElementById("overview-packages-summary");
-  const navBadge = document.getElementById("nav-tab-packages-badge");
   const navBadgePackages = document.getElementById("nav-badge-packages");
 
   const rebootRequired = Boolean(rebootStatus && rebootStatus.reboot_required);
@@ -7591,20 +7703,19 @@ function renderPackagesOverviewRibbon(rebootStatus, updatesData) {
   const securityUpdates = updatesData ? (Number(updatesData.security_updates) || 0) : 0;
   const standardUpdates = updatesData ? (Number(updatesData.standard_updates) || 0) : 0;
 
-  [navBadge, navBadgePackages].forEach((nb) => {
-    if (!nb) return;
+  if (navBadgePackages) {
     if (totalUpdates > 0 || rebootRequired) {
-      nb.textContent = totalUpdates > 99 ? "99+" : (totalUpdates > 0 ? String(totalUpdates) : "!");
-      nb.classList.remove("hidden");
+      navBadgePackages.textContent = totalUpdates > 99 ? "99+" : (totalUpdates > 0 ? String(totalUpdates) : "!");
+      navBadgePackages.classList.remove("hidden");
       if (securityUpdates > 0 || rebootRequired) {
-        nb.className = "nav-tab-badge badge-crit";
+        navBadgePackages.className = "nav-tab-badge badge-crit";
       } else {
-        nb.className = "nav-tab-badge";
+        navBadgePackages.className = "nav-tab-badge";
       }
     } else {
-      nb.classList.add("hidden");
+      navBadgePackages.classList.add("hidden");
     }
-  });
+  }
 
   if (badge && summary) {
     if (rebootRequired) {
@@ -7644,23 +7755,21 @@ function renderSystemUpdateNotice({ total, security, standard, rebootRequired })
   const bar = document.getElementById("system-update-notice-bar");
   const msgEl = document.getElementById("system-update-notice-message");
   const badgeEl = document.getElementById("update-indicator-badge");
-  const navBadge1 = document.getElementById("nav-tab-packages-badge");
   const navBadge2 = document.getElementById("nav-badge-packages");
 
-  [navBadge1, navBadge2].forEach((nb) => {
-    if (!nb) return;
+  if (navBadge2) {
     if (total > 0 || rebootRequired) {
-      nb.textContent = total > 99 ? "99+" : (total > 0 ? String(total) : "!");
-      nb.classList.remove("hidden");
+      navBadge2.textContent = total > 99 ? "99+" : (total > 0 ? String(total) : "!");
+      navBadge2.classList.remove("hidden");
       if (security > 0 || rebootRequired) {
-        nb.className = "nav-tab-badge badge-crit";
+        navBadge2.className = "nav-tab-badge badge-crit";
       } else {
-        nb.className = "nav-tab-badge";
+        navBadge2.className = "nav-tab-badge";
       }
     } else {
-      nb.classList.add("hidden");
+      navBadge2.classList.add("hidden");
     }
-  });
+  }
 
   const stateSignature = `${total}:${security}:${rebootRequired}`;
   if (lastKnownUpdateSignature !== null && lastKnownUpdateSignature !== stateSignature) {
@@ -7837,6 +7946,10 @@ async function fetchPackageUpdates(force = false) {
 
 function renderPackageUpdatesTable(updates) {
   const tbody = document.getElementById("pkg-updates-tbody");
+  const installAllBtn = document.getElementById("btn-install-all-packages");
+  if (installAllBtn) {
+    installAllBtn.disabled = !Array.isArray(updates) || updates.length === 0;
+  }
   if (!tbody) return;
 
   const filter = (document.getElementById("pkg-updates-search")?.value || "").toLowerCase().trim();
@@ -7869,14 +7982,24 @@ function renderPackageUpdatesTable(updates) {
           <td class="mono-text font-bold text-ok">${escapeHtml(item.candidate_version || "--")}</td>
           <td class="text-sm text-muted">${escapeHtml(item.origin || "apt")}</td>
           <td style="text-align: right;">
-            <button
-              type="button"
-              class="btn-sm btn-secondary btn-upgrade-single"
-              data-pkg="${escapeHtml(item.package)}"
-              title="Simulate upgrade for ${escapeHtml(item.package)}"
-            >
-              Simulate
-            </button>
+            <div class="btn-action-group" style="justify-content: flex-end;">
+              <button
+                type="button"
+                class="btn-sm btn-secondary btn-upgrade-single"
+                data-pkg="${escapeHtml(item.package)}"
+                title="Simulate upgrade for ${escapeHtml(item.package)}"
+              >
+                Simulate
+              </button>
+              <button
+                type="button"
+                class="btn-sm btn-primary btn-install-single"
+                data-pkg="${escapeHtml(item.package)}"
+                title="Install update for ${escapeHtml(item.package)}"
+              >
+                Install
+              </button>
+            </div>
           </td>
         </tr>
       `;
@@ -7887,6 +8010,13 @@ function renderPackageUpdatesTable(updates) {
     btn.addEventListener("click", () => {
       const pkg = btn.getAttribute("data-pkg");
       simulatePackageUpgrade(pkg);
+    });
+  });
+
+  tbody.querySelectorAll(".btn-install-single").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const pkg = btn.getAttribute("data-pkg");
+      installPackageUpgrade(pkg);
     });
   });
 }
@@ -8012,10 +8142,12 @@ async function refreshAptCache() {
 }
 
 async function simulatePackageUpgrade(packageName = null) {
+  lastUpgradeTargetPackage = packageName;
   const modal = document.getElementById("pkg-upgrade-modal");
   const modalTitle = document.getElementById("pkg-upgrade-modal-title");
   const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
   const terminal = document.getElementById("pkg-upgrade-terminal");
+  const installModalBtn = document.getElementById("btn-pkg-modal-install");
 
   if (modalTitle) {
     modalTitle.textContent = packageName
@@ -8030,6 +8162,7 @@ async function simulatePackageUpgrade(packageName = null) {
   if (terminal) {
     terminal.textContent = "Executing simulation in background...\n\n";
   }
+  installModalBtn?.classList.add("hidden");
   modal?.classList.remove("hidden");
 
   try {
@@ -8049,10 +8182,91 @@ async function simulatePackageUpgrade(packageName = null) {
     if (terminal) {
       terminal.textContent = result.output || "Simulation completed with no output.";
     }
+    installModalBtn?.classList.remove("hidden");
   } catch (err) {
     if (terminal) {
       terminal.textContent += `\nError executing simulation: ${err.message}`;
     }
+  }
+}
+
+async function installPackageUpgrade(packageName = null) {
+  const confirmMsg = packageName
+    ? `Are you sure you want to install update for "${packageName}"?`
+    : "Are you sure you want to install all available package updates?";
+  if (!confirm(confirmMsg)) {
+    return;
+  }
+
+  lastUpgradeTargetPackage = packageName;
+  const modal = document.getElementById("pkg-upgrade-modal");
+  const modalTitle = document.getElementById("pkg-upgrade-modal-title");
+  const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
+  const terminal = document.getElementById("pkg-upgrade-terminal");
+  const installModalBtn = document.getElementById("btn-pkg-modal-install");
+
+  if (modalTitle) {
+    modalTitle.textContent = packageName
+      ? `Installing Package: ${packageName}`
+      : "Installing System Updates";
+  }
+  if (modalSubtitle) {
+    modalSubtitle.textContent = packageName
+      ? `Executing: apt-get -y install --only-upgrade ${packageName}`
+      : "Executing: apt-get -y dist-upgrade (non-interactive)";
+  }
+  if (terminal) {
+    terminal.textContent = "Installing packages in background (this may take a few minutes)...\n\n";
+  }
+  installModalBtn?.classList.add("hidden");
+  modal?.classList.remove("hidden");
+
+  try {
+    const payload = {
+      packages: packageName ? [packageName] : [],
+      dry_run: false,
+    };
+    const resp = await apiFetch("/api/packages/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(result.detail || result.error || `Package upgrade failed (HTTP ${resp.status})`);
+    }
+
+    if (terminal) {
+      terminal.textContent = result.output || result.error || "Package installation finished.";
+    }
+
+    if (result.success) {
+      showToast({
+        title: "Package Upgrade Complete",
+        message: packageName
+          ? `Successfully upgraded ${packageName}.`
+          : "All available package updates installed.",
+        type: "success",
+      });
+    } else {
+      showToast({
+        title: "Package Upgrade Failed",
+        message: result.error || "apt-get returned a non-zero exit code.",
+        type: "danger",
+      });
+    }
+
+    await fetchPackageUpdates(true);
+    pollSystemUpdates();
+  } catch (err) {
+    if (terminal) {
+      terminal.textContent += `\nError installing packages: ${err.message}`;
+    }
+    showToast({
+      title: "Package Upgrade Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
   }
 }
 
@@ -8652,6 +8866,401 @@ async function testProbe(probeId, btnEl) {
   }
 }
 
+/* =========================================================================
+ * Phase 3: Network Security, Open Ports & UFW Firewall Manager (#view-security)
+ * ========================================================================= */
+
+let cachedSecurityPortsData = null;
+let cachedSecurityFirewallData = null;
+let isFetchingNetworkSecurity = false;
+
+/**
+ * Fetch open listening ports and UFW firewall status from backend.
+ */
+async function fetchNetworkSecurity(isUserTriggered = false) {
+  if (isFetchingNetworkSecurity) return;
+  isFetchingNetworkSecurity = true;
+
+  const refreshBtn = document.getElementById("refresh-security-btn");
+  if (refreshBtn) refreshBtn.classList.add("loading");
+
+  try {
+    const [portsResp, firewallResp] = await Promise.all([
+      apiFetch("/api/network/ports"),
+      apiFetch("/api/network/firewall"),
+    ]);
+
+    if (!portsResp.ok) {
+      throw new Error(`Failed to fetch open ports (HTTP ${portsResp.status})`);
+    }
+    if (!firewallResp.ok) {
+      throw new Error(`Failed to fetch firewall status (HTTP ${firewallResp.status})`);
+    }
+
+    const portsData = await portsResp.json();
+    const firewallData = await firewallResp.json();
+
+    cachedSecurityPortsData = portsData;
+    cachedSecurityFirewallData = firewallData;
+
+    renderNetworkSecurity(portsData, firewallData);
+
+    if (isUserTriggered) {
+      showToast({
+        title: "Network & Security Refreshed",
+        message: "Listening ports and UFW firewall rules updated.",
+        type: "success",
+      });
+    }
+  } catch (err) {
+    console.error("fetchNetworkSecurity error:", err);
+    showToast({
+      title: "Network Security Sync Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    isFetchingNetworkSecurity = false;
+    if (refreshBtn) refreshBtn.classList.remove("loading");
+  }
+}
+
+/**
+ * Render Network Security status ribbon, open listening ports table, and UFW firewall table.
+ */
+function renderNetworkSecurity(portsData, firewallData) {
+  const lastUpdatedEl = document.getElementById("security-last-updated");
+  if (lastUpdatedEl) {
+    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  }
+
+  const ports = Array.isArray(portsData?.ports) ? portsData.ports : [];
+  const summary = portsData?.summary || {
+    total: ports.length,
+    public: ports.filter((p) => p.is_public).length,
+    local: ports.filter((p) => !p.is_public).length,
+  };
+
+  const totalPortsEl = document.getElementById("sec-total-ports");
+  if (totalPortsEl) totalPortsEl.textContent = String(summary.total ?? ports.length);
+
+  const publicPortsEl = document.getElementById("sec-public-ports");
+  if (publicPortsEl) publicPortsEl.textContent = String(summary.public ?? 0);
+
+  const localPortsEl = document.getElementById("sec-local-ports");
+  if (localPortsEl) localPortsEl.textContent = String(summary.local ?? 0);
+
+  const fwStatusBadge = document.getElementById("sec-firewall-status");
+  if (fwStatusBadge) {
+    if (!firewallData || !firewallData.available) {
+      fwStatusBadge.textContent = "UNAVAILABLE";
+      fwStatusBadge.className = "status-badge status-muted";
+    } else if (firewallData.enabled) {
+      fwStatusBadge.textContent = "ACTIVE";
+      fwStatusBadge.className = "status-badge status-ok";
+    } else {
+      fwStatusBadge.textContent = "INACTIVE";
+      fwStatusBadge.className = "status-badge status-warn";
+    }
+  }
+
+  const fwPoliciesEl = document.getElementById("sec-firewall-policies");
+  if (fwPoliciesEl) {
+    if (!firewallData || !firewallData.available) {
+      fwPoliciesEl.textContent = "UFW is not installed or unavailable on this host";
+    } else {
+      const inc = (firewallData.default_incoming || "unknown").toUpperCase();
+      const out = (firewallData.default_outgoing || "unknown").toUpperCase();
+      fwPoliciesEl.textContent = `Default Policies: Incoming ${inc} | Outgoing ${out}`;
+    }
+  }
+
+  // Render Open Ports Table
+  const portsTbody = document.getElementById("sec-ports-tbody");
+  if (portsTbody) {
+    if (ports.length === 0) {
+      portsTbody.innerHTML = `<tr><td colspan="8" class="empty-state">No open listening sockets detected.</td></tr>`;
+    } else {
+      portsTbody.innerHTML = ports
+        .map((p) => {
+          const proto = String(p.proto || "tcp").toLowerCase();
+          const portNum = p.port ?? "";
+          const bindIp = p.ip || "0.0.0.0";
+          const isPublic = Boolean(p.is_public);
+          const exposureBadge = isPublic
+            ? `<span class="exposure-badge exp-public">PUBLIC</span>`
+            : `<span class="exposure-badge exp-local">LOCAL</span>`;
+          const procName = p.process_name || "unknown";
+          const pidText = p.pid ? ` (${p.pid})` : "";
+          const user = p.user || "-";
+          const containerHtml = p.container_name
+            ? `<span class="chip-tag chip-primary">${escapeHtml(p.container_name)}</span>`
+            : `<span class="text-muted">-</span>`;
+
+          const searchBlob = `${proto} ${portNum} ${bindIp} ${isPublic ? "public" : "local"} ${procName} ${p.pid || ""} ${user} ${p.container_name || ""}`.toLowerCase();
+
+          return `
+            <tr data-search="${escapeHtml(searchBlob)}">
+              <td><span class="kind-badge">${escapeHtml(proto.toUpperCase())}</span></td>
+              <td class="mono-text font-bold">${escapeHtml(portNum)}</td>
+              <td class="mono-text">${escapeHtml(bindIp)}</td>
+              <td>${exposureBadge}</td>
+              <td><span class="font-bold">${escapeHtml(procName)}</span><span class="mono-text text-secondary">${escapeHtml(pidText)}</span></td>
+              <td class="mono-text text-secondary">${escapeHtml(user)}</td>
+              <td>${containerHtml}</td>
+              <td style="text-align: right;">
+                <div class="table-actions-cell">
+                  <button type="button" class="btn-icon-subtle btn-port-add-rule" title="Add UFW Rule" data-port="${escapeHtml(portNum)}" data-proto="${escapeHtml(proto)}">+ Rule</button>
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+
+      portsTbody.querySelectorAll(".btn-port-add-rule").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const portVal = btn.getAttribute("data-port") || "";
+          const protoVal = btn.getAttribute("data-proto") || "any";
+          openAddFirewallRuleModal(portVal, protoVal);
+        });
+      });
+
+      filterPortsTable();
+    }
+  }
+
+  // Render UFW Firewall Rules Table
+  const fwTbody = document.getElementById("sec-firewall-tbody");
+  if (fwTbody) {
+    if (!firewallData || !firewallData.available) {
+      fwTbody.innerHTML = `<tr><td colspan="6" class="empty-state">UFW firewall is not available on this host.</td></tr>`;
+    } else {
+      const rules = Array.isArray(firewallData.rules) ? firewallData.rules : [];
+      if (rules.length === 0) {
+        const msg = firewallData.enabled
+          ? "No UFW firewall rules configured."
+          : "UFW firewall is inactive or has no rules configured.";
+        fwTbody.innerHTML = `<tr><td colspan="6" class="empty-state">${escapeHtml(msg)}</td></tr>`;
+      } else {
+        fwTbody.innerHTML = rules
+          .map((r) => {
+            const actUpper = String(r.action || "ALLOW").toUpperCase();
+            let actClass = "status-badge status-ok";
+            if (actUpper.includes("DENY") || actUpper.includes("REJECT")) {
+              actClass = "status-badge status-danger";
+            } else if (actUpper.includes("LIMIT")) {
+              actClass = "status-badge status-warn";
+            }
+
+            const protoSuffix =
+              r.proto && r.proto !== "any" ? `/${r.proto}` : "";
+            const toDisplay = `${r.to_port || "-"}${protoSuffix}`;
+            const fromDisplay = r.from_ip || "Anywhere";
+            const typeLabel = r.v6 ? "IPv6" : "IPv4";
+
+            return `
+              <tr>
+                <td class="mono-text font-bold">${escapeHtml(r.index)}</td>
+                <td><span class="${actClass}">${escapeHtml(actUpper)}</span></td>
+                <td class="mono-text font-bold">${escapeHtml(toDisplay)}</td>
+                <td class="mono-text">${escapeHtml(fromDisplay)}</td>
+                <td><span class="kind-badge">${typeLabel}</span></td>
+                <td style="text-align: right;">
+                  <div class="table-actions-cell">
+                    <button type="button" class="btn-icon-danger btn-firewall-delete-rule" data-index="${escapeHtml(r.index)}">Delete</button>
+                  </div>
+                </td>
+              </tr>
+            `;
+          })
+          .join("");
+
+        fwTbody.querySelectorAll(".btn-firewall-delete-rule").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const idx = parseInt(btn.getAttribute("data-index") || "0", 10);
+            if (idx > 0) {
+              deleteFirewallRule(idx);
+            }
+          });
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Filter rows in #sec-ports-table by search text in #sec-ports-filter.
+ */
+function filterPortsTable() {
+  const filterInput = document.getElementById("sec-ports-filter");
+  const tbody = document.getElementById("sec-ports-tbody");
+  if (!tbody) return;
+
+  const query = (filterInput?.value || "").trim().toLowerCase();
+  const rows = Array.from(tbody.querySelectorAll("tr[data-search]"));
+  if (rows.length === 0) return;
+
+  let visibleCount = 0;
+  rows.forEach((row) => {
+    const text = (row.getAttribute("data-search") || row.textContent || "").toLowerCase();
+    const matches = !query || text.includes(query);
+    row.classList.toggle("hidden", !matches);
+    row.style.display = matches ? "" : "none";
+    if (matches) visibleCount += 1;
+  });
+
+  const existingEmpty = tbody.querySelector("tr.sec-filter-empty-row");
+  if (visibleCount === 0 && query) {
+    if (!existingEmpty) {
+      const emptyTr = document.createElement("tr");
+      emptyTr.className = "sec-filter-empty-row";
+      emptyTr.innerHTML = `<td colspan="8" class="empty-state">No listening ports match "${escapeHtml(query)}".</td>`;
+      tbody.appendChild(emptyTr);
+    }
+  } else if (existingEmpty) {
+    existingEmpty.remove();
+  }
+}
+
+/**
+ * Open the Add Firewall Rule Modal, pre-filling port and protocol if provided.
+ */
+function openAddFirewallRuleModal(port = "", proto = "any") {
+  const modal = document.getElementById("firewall-modal");
+  const actionSelect = document.getElementById("firewall-form-action");
+  const portInput = document.getElementById("firewall-form-port");
+  const protoSelect = document.getElementById("firewall-form-proto");
+  const fromInput = document.getElementById("firewall-form-from");
+  const feedback = document.getElementById("firewall-modal-feedback");
+
+  if (!modal) return;
+
+  if (actionSelect) actionSelect.value = "allow";
+  if (portInput) portInput.value = port ? String(port) : "";
+  if (protoSelect) {
+    const cleanProto = String(proto || "any").toLowerCase();
+    protoSelect.value = ["tcp", "udp", "any"].includes(cleanProto) ? cleanProto : "any";
+  }
+  if (fromInput) fromInput.value = "";
+  if (feedback) {
+    feedback.textContent = "";
+    feedback.classList.add("hidden");
+  }
+
+  modal.classList.remove("hidden");
+  portInput?.focus();
+}
+
+/**
+ * Close the Add Firewall Rule Modal.
+ */
+function closeFirewallModal() {
+  const modal = document.getElementById("firewall-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+/**
+ * Submit Add Firewall Rule form via POST /api/network/firewall/rules.
+ */
+async function handleFirewallFormSubmit(e) {
+  if (e) e.preventDefault();
+
+  const actionSelect = document.getElementById("firewall-form-action");
+  const portInput = document.getElementById("firewall-form-port");
+  const protoSelect = document.getElementById("firewall-form-proto");
+  const fromInput = document.getElementById("firewall-form-from");
+  const feedback = document.getElementById("firewall-modal-feedback");
+  const saveBtn = document.getElementById("btn-firewall-modal-save");
+
+  const action = (actionSelect?.value || "allow").trim().toLowerCase();
+  const port = (portInput?.value || "").trim();
+  const proto = (protoSelect?.value || "any").trim().toLowerCase();
+  const rawFrom = (fromInput?.value || "").trim();
+  const from_ip =
+    !rawFrom || rawFrom.toLowerCase() === "anywhere" || rawFrom.toLowerCase() === "any"
+      ? null
+      : rawFrom;
+
+  if (!port) {
+    if (feedback) {
+      feedback.textContent = "Port or service is required.";
+      feedback.classList.remove("hidden");
+    }
+    return;
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Adding...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/network/firewall/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, port, proto, from_ip }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to add firewall rule (HTTP ${resp.status})`);
+    }
+
+    closeFirewallModal();
+    showToast({
+      title: "Firewall Rule Added",
+      message: data.message || `UFW rule (${action.toUpperCase()} ${port}/${proto}) added.`,
+      type: "success",
+    });
+    await fetchNetworkSecurity();
+  } catch (err) {
+    console.error("handleFirewallFormSubmit error:", err);
+    if (feedback) {
+      feedback.textContent = err instanceof Error ? err.message : String(err);
+      feedback.classList.remove("hidden");
+    }
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Add Rule";
+    }
+  }
+}
+
+/**
+ * Delete a UFW firewall rule by index via DELETE /api/network/firewall/rules/{ruleIndex}.
+ */
+async function deleteFirewallRule(ruleIndex) {
+  if (!ruleIndex) return;
+  if (!confirm(`Are you sure you want to delete UFW firewall rule #${ruleIndex}?`)) {
+    return;
+  }
+
+  try {
+    const resp = await apiFetch("/api/network/firewall/rules/" + encodeURIComponent(ruleIndex), {
+      method: "DELETE",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to delete rule #${ruleIndex} (HTTP ${resp.status})`);
+    }
+
+    showToast({
+      title: "Firewall Rule Deleted",
+      message: data.message || `UFW rule #${ruleIndex} removed.`,
+      type: "success",
+    });
+    await fetchNetworkSecurity();
+  } catch (err) {
+    console.error("deleteFirewallRule error:", err);
+    showToast({
+      title: "Delete Rule Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
 /**
  * Initialize listeners and run startup authentication check.
  */
@@ -8676,6 +9285,10 @@ function initDashboard() {
   document
     .getElementById("nav-tab-services")
     ?.addEventListener("click", () => switchViewTab("services", true));
+
+  document
+    .getElementById("nav-tab-security")
+    ?.addEventListener("click", () => switchViewTab("security", true));
 
   document
     .getElementById("nav-tab-processes")
@@ -8734,6 +9347,14 @@ function initDashboard() {
   document
     .getElementById("btn-simulate-upgrade")
     ?.addEventListener("click", () => simulatePackageUpgrade());
+
+  document
+    .getElementById("btn-install-all-packages")
+    ?.addEventListener("click", () => installPackageUpgrade(null));
+
+  document
+    .getElementById("btn-pkg-modal-install")
+    ?.addEventListener("click", () => installPackageUpgrade(lastUpgradeTargetPackage));
 
   document
     .getElementById("btn-close-pkg-upgrade-modal")
@@ -8962,6 +9583,11 @@ function initDashboard() {
     .getElementById("btn-prune-images")
     ?.addEventListener("click", handlePruneImages);
 
+  // Volumes
+  document
+    .getElementById("btn-prune-volumes")
+    ?.addEventListener("click", handlePruneVolumes);
+
   // Updates & Schedule
   document
     .getElementById("docker-auto-update-freq")
@@ -9068,6 +9694,7 @@ function initDashboard() {
       closeNotifScheduleModal();
       closeNotifThresholdsModal();
       closeSmartModal();
+      closeFirewallModal();
     }
   });
 
@@ -9654,6 +10281,36 @@ function initDashboard() {
   const smartModal = document.getElementById("smart-modal");
   smartModal?.addEventListener("click", (e) => {
     if (e.target === smartModal) closeSmartModal();
+  });
+
+  // Network & Security and UFW Firewall Modal Listeners
+  document
+    .getElementById("refresh-security-btn")
+    ?.addEventListener("click", () => fetchNetworkSecurity(true));
+
+  document
+    .getElementById("sec-ports-filter")
+    ?.addEventListener("input", filterPortsTable);
+
+  document
+    .getElementById("btn-add-firewall-rule")
+    ?.addEventListener("click", () => openAddFirewallRuleModal("", "any"));
+
+  document
+    .getElementById("btn-firewall-modal-close")
+    ?.addEventListener("click", closeFirewallModal);
+
+  document
+    .getElementById("btn-firewall-modal-cancel")
+    ?.addEventListener("click", closeFirewallModal);
+
+  document
+    .getElementById("firewall-form")
+    ?.addEventListener("submit", handleFirewallFormSubmit);
+
+  const firewallModal = document.getElementById("firewall-modal");
+  firewallModal?.addEventListener("click", (e) => {
+    if (e.target === firewallModal) closeFirewallModal();
   });
 
   checkAuthStatus();

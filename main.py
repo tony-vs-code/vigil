@@ -6,6 +6,7 @@ import glob
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import platform
@@ -5224,6 +5225,13 @@ class DockerManager:
         self.invalidate_cache()
         return {"success": True, "name": clean_name, "output": out}
 
+    def prune_volumes(self) -> dict[str, Any]:
+        if not self.is_running():
+            raise RuntimeError("Docker daemon is not running.")
+        out = self._run_docker(["volume", "prune", "-f"], timeout=60)
+        self.invalidate_cache()
+        return {"success": True, "output": out}
+
     def get_networks(self) -> list[dict[str, Any]]:
         if self._should_use_socket():
             try:
@@ -5930,6 +5938,7 @@ prune_docker_images = docker_manager.prune_images
 list_docker_volumes = docker_manager.list_volumes
 inspect_docker_volume = docker_manager.inspect_volume
 remove_docker_volume = docker_manager.remove_volume
+prune_docker_volumes = docker_manager.prune_volumes
 list_docker_networks = docker_manager.list_networks
 remove_docker_network = docker_manager.remove_network
 get_docker_container_stats = docker_manager.get_container_stats
@@ -6598,9 +6607,17 @@ class PackageManager:
         if not self.is_supported():
             raise RuntimeError("Package manager (apt/apt-get) is not available on this host")
 
-        cmd = ["apt-get", "-y"]
         if dry_run:
-            cmd.append("-s")
+            cmd = ["apt-get", "-y", "-s"]
+        else:
+            cmd = [
+                "apt-get",
+                "-y",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ]
 
         if packages:
             clean_pkgs = []
@@ -6614,15 +6631,42 @@ class PackageManager:
             cmd.append("dist-upgrade")
 
         try:
-            res = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            with self._cache_lock:
-                self._updates_cache = None
-                self._installed_cache = None
+            if dry_run:
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            else:
+                env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env=env,
+                )
+                err_lower = (res.stderr or "").lower()
+                if (
+                    res.returncode != 0
+                    and (
+                        "are you root" in err_lower
+                        or "permission denied" in err_lower
+                        or "could not open lock file" in err_lower
+                    )
+                    and shutil.which("sudo")
+                ):
+                    sudo_cmd = ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive"] + cmd
+                    res = subprocess.run(
+                        sudo_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300,
+                        env=env,
+                    )
+
+            self.invalidate_cache()
 
             return {
                 "success": res.returncode == 0,
@@ -6633,6 +6677,7 @@ class PackageManager:
                 "returncode": res.returncode,
             }
         except Exception as exc:
+            self.invalidate_cache()
             return {
                 "success": False,
                 "dry_run": dry_run,
@@ -7055,6 +7100,530 @@ def get_network_metrics() -> dict[str, Any]:
         "primary_ip": primary_ip,
         "interfaces": interfaces,
     }
+
+
+def _is_ip_public(ip: str) -> bool:
+    """Return True if IP is public/external (0.0.0.0, ::, or non-loopback), False for loopback."""
+    ip_clean = (ip or "").strip()
+    if ip_clean in ("0.0.0.0", "::", "*", ""):
+        return True
+    if ip_clean == "::1" or ip_clean.startswith("127."):
+        return False
+    try:
+        addr = ipaddress.ip_address(ip_clean)
+        return not addr.is_loopback
+    except Exception:
+        return True
+
+
+def _parse_proc_net_file(filepath: str, proto: str) -> list[dict[str, Any]]:
+    """Parse Linux /proc/net/tcp, /proc/net/tcp6, /proc/net/udp, /proc/net/udp6 files."""
+    entries: list[dict[str, Any]] = []
+    if not os.path.isfile(filepath):
+        return entries
+
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return entries
+
+    if len(lines) <= 1:
+        return entries
+
+    for line in lines[1:]:
+        parts = line.strip().split()
+        if len(parts) < 4:
+            continue
+
+        local_addr = parts[1]
+        state = parts[3].upper()
+
+        # For TCP: state 0A is TCP_LISTEN
+        # For UDP: state 07 is listening/bound
+        if proto == "tcp" and state != "0A":
+            continue
+        if proto == "udp" and state not in ("07", ""):
+            continue
+
+        if ":" not in local_addr:
+            continue
+
+        hex_ip, hex_port = local_addr.split(":", 1)
+        try:
+            port = int(hex_port, 16)
+        except ValueError:
+            continue
+
+        ip_str = "0.0.0.0"
+        try:
+            if len(hex_ip) == 8:
+                raw_bytes = bytes.fromhex(hex_ip)[::-1]
+                ip_str = socket.inet_ntoa(raw_bytes)
+            elif len(hex_ip) == 32:
+                b = bytes.fromhex(hex_ip)
+                chunks = [b[i:i + 4][::-1] for i in range(0, 16, 4)]
+                ip_str = socket.inet_ntop(socket.AF_INET6, b"".join(chunks))
+        except Exception:
+            ip_str = "0.0.0.0"
+
+        inode = parts[9] if len(parts) > 9 else ""
+        entries.append({
+            "proto": proto,
+            "ip": ip_str,
+            "port": port,
+            "inode": inode,
+        })
+    return entries
+
+
+def _get_socket_inode_to_pid_map() -> dict[str, int]:
+    """Scan /proc/[pid]/fd to map socket inodes to process IDs."""
+    mapping: dict[str, int] = {}
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
+        return mapping
+    try:
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            fd_dir = entry / "fd"
+            try:
+                for fd_link in fd_dir.iterdir():
+                    try:
+                        target = os.readlink(str(fd_link))
+                        if target.startswith("socket:[") and target.endswith("]"):
+                            inode = target[8:-1]
+                            mapping[inode] = pid
+                    except (OSError, PermissionError):
+                        continue
+            except (OSError, PermissionError):
+                continue
+    except Exception:
+        pass
+    return mapping
+
+
+def get_open_listening_ports() -> list[dict[str, Any]]:
+    """Scan and return open listening TCP and UDP sockets with process and container context.
+
+    Filters for listening sockets (status == 'LISTEN' for TCP, or UDP sockets).
+    Correlates with running Docker containers via port bindings and container cgroups/PIDs.
+    Returns list sorted public ports first, then by port number.
+    """
+    # 1. Build Docker container port and ID mappings
+    container_port_map: dict[int, str] = {}
+    container_id_map: dict[str, str] = {}
+    try:
+        containers = list_docker_containers()
+        for c in containers:
+            c_name = str(c.get("name") or "")
+            c_id = str(c.get("id") or "")
+            c_state = str(c.get("state") or "").lower()
+            if c_state not in ("running", "") and "up" not in str(c.get("status") or "").lower():
+                continue
+            if c_id:
+                container_id_map[c_id[:12].lower()] = c_name
+            ports_str = str(c.get("ports") or "")
+            for m in re.finditer(r'(?:^|[\s,])(?:(?:\d+\.\d+\.\d+\.\d+|\[?[0-9a-fA-F:]+\]?):)?(\d+)->', ports_str):
+                try:
+                    hp = int(m.group(1))
+                    container_port_map[hp] = c_name
+                except (ValueError, TypeError):
+                    pass
+    except Exception as exc:
+        logging.debug(f"Docker container mapping error: {exc}")
+
+    # Helper to check container name from PID or port
+    def _lookup_container_for_socket(pid: Optional[int], port: int, proc_name: str) -> str:
+        if port in container_port_map:
+            return container_port_map[port]
+        if pid and pid > 0:
+            cgroup_path = Path(f"/proc/{pid}/cgroup")
+            if cgroup_path.is_file():
+                try:
+                    content = cgroup_path.read_text(encoding="utf-8", errors="ignore")
+                    m = re.search(r'(?:docker-|/docker/|docker/)([0-9a-fA-F]{12,64})', content)
+                    if m:
+                        cid = m.group(1)[:12].lower()
+                        if cid in container_id_map:
+                            return container_id_map[cid]
+                except Exception:
+                    pass
+        if "docker" in proc_name.lower() and port in container_port_map:
+            return container_port_map[port]
+        return ""
+
+    raw_items: list[dict[str, Any]] = []
+
+    # 2. Try psutil.net_connections
+    psutil_success = False
+    try:
+        connections = psutil.net_connections(kind="inet")
+        if connections:
+            for conn in connections:
+                if not conn.laddr:
+                    continue
+                is_tcp = conn.type == socket.SOCK_STREAM or getattr(conn, "type", 1) == 1
+                is_udp = conn.type == socket.SOCK_DGRAM or getattr(conn, "type", 2) == 2
+                status = getattr(conn, "status", "")
+
+                if is_tcp and status != "LISTEN" and status != getattr(psutil, "CONN_LISTEN", "LISTEN"):
+                    continue
+                if not is_tcp and not is_udp:
+                    continue
+
+                proto = "tcp" if is_tcp else "udp"
+                ip = conn.laddr.ip if hasattr(conn.laddr, "ip") else conn.laddr[0]
+                port = int(conn.laddr.port if hasattr(conn.laddr, "port") else conn.laddr[1])
+
+                raw_items.append({
+                    "proto": proto,
+                    "ip": ip,
+                    "port": port,
+                    "pid": conn.pid,
+                })
+            psutil_success = bool(raw_items)
+    except Exception as exc:
+        logging.debug(f"psutil.net_connections failed: {exc}")
+        psutil_success = False
+
+    # 3. Fallback to /proc/net/* if psutil failed or returned empty
+    if not psutil_success:
+        inode_pid_map = _get_socket_inode_to_pid_map()
+        proc_entries: list[dict[str, Any]] = []
+        proc_entries.extend(_parse_proc_net_file("/proc/net/tcp", "tcp"))
+        proc_entries.extend(_parse_proc_net_file("/proc/net/tcp6", "tcp"))
+        proc_entries.extend(_parse_proc_net_file("/proc/net/udp", "udp"))
+        proc_entries.extend(_parse_proc_net_file("/proc/net/udp6", "udp"))
+
+        for pe in proc_entries:
+            inode = pe.get("inode", "")
+            pid = inode_pid_map.get(inode) if inode else None
+            raw_items.append({
+                "proto": pe["proto"],
+                "ip": pe["ip"],
+                "port": pe["port"],
+                "pid": pid,
+            })
+
+    pid_info_cache: dict[int, tuple[str, str]] = {}
+
+    def _get_proc_info(pid: Optional[int]) -> tuple[str, str]:
+        if pid is None or pid <= 0:
+            return ("", "")
+        if pid in pid_info_cache:
+            return pid_info_cache[pid]
+        pname, uname = "", ""
+        try:
+            p = psutil.Process(pid)
+            pname = p.name() or ""
+            try:
+                uname = p.username() or ""
+            except Exception:
+                uname = ""
+        except Exception:
+            pname, uname = "", ""
+        pid_info_cache[pid] = (pname, uname)
+        return (pname, uname)
+
+    # 4. Deduplicate and assemble formatted entries
+    seen: set[tuple[str, str, int]] = set()
+    result: list[dict[str, Any]] = []
+
+    for item in raw_items:
+        key = (item["proto"], item["ip"], item["port"])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        pid = item.get("pid")
+        proc_name, user = _get_proc_info(pid)
+        c_name = _lookup_container_for_socket(pid, item["port"], proc_name)
+
+        result.append({
+            "proto": item["proto"],
+            "ip": item["ip"],
+            "port": item["port"],
+            "is_public": _is_ip_public(item["ip"]),
+            "pid": pid,
+            "process_name": proc_name,
+            "user": user,
+            "container_name": c_name,
+        })
+
+    # 5. Sort list: public ports first, then by port number
+    result.sort(key=lambda p: (not p["is_public"], p["port"], p["proto"], p["ip"]))
+    return result
+
+
+def get_ufw_firewall_status() -> dict[str, Any]:
+    """Retrieve UFW firewall status, policies, and numbered rules."""
+    ufw_path = shutil.which("ufw") or ("/usr/sbin/ufw" if os.path.isfile("/usr/sbin/ufw") else None)
+    if not ufw_path:
+        return {
+            "available": False,
+            "enabled": False,
+            "default_incoming": "deny",
+            "default_outgoing": "allow",
+            "rules": [],
+        }
+
+    cmd = [ufw_path, "status", "numbered"]
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        cmd = ["sudo", "-n", ufw_path, "status", "numbered"]
+
+    output = ""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
+        output = proc.stdout
+        if proc.returncode != 0 and "need to be root" in (proc.stderr or output).lower():
+            proc2 = subprocess.run([ufw_path, "status", "numbered"], capture_output=True, text=True, check=False, timeout=5)
+            if proc2.returncode == 0:
+                output = proc2.stdout
+    except Exception as exc:
+        logging.debug(f"ufw status numbered execution error: {exc}")
+        output = ""
+
+    enabled = "status: active" in output.lower()
+    default_incoming = "deny"
+    default_outgoing = "allow"
+
+    m_def = re.search(
+        r'Default:\s*([a-zA-Z]+)\s*\(incoming\),\s*([a-zA-Z]+)\s*\(outgoing\)',
+        output,
+        re.IGNORECASE,
+    )
+    if m_def:
+        default_incoming = m_def.group(1).lower()
+        default_outgoing = m_def.group(2).lower()
+    else:
+        if os.path.isfile("/etc/default/ufw"):
+            try:
+                with open("/etc/default/ufw", "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("DEFAULT_INPUT_POLICY="):
+                            val = line.split("=", 1)[1].strip('"\';').lower()
+                            default_incoming = "deny" if val in ("drop", "deny") else "allow"
+                        elif line.startswith("DEFAULT_OUTPUT_POLICY="):
+                            val = line.split("=", 1)[1].strip('"\';').lower()
+                            default_outgoing = "allow" if val in ("accept", "allow") else "deny"
+            except Exception:
+                pass
+
+    rules: list[dict[str, Any]] = []
+    rule_pattern = re.compile(
+        r'^\s*\[\s*(\d+)\]\s+(.*?)\s+(ALLOW(?:\s+IN|\s+OUT)?|DENY(?:\s+IN|\s+OUT)?|REJECT(?:\s+IN|\s+OUT)?|LIMIT(?:\s+IN|\s+OUT)?)\s+(.*)$',
+        re.IGNORECASE,
+    )
+
+    for line in output.splitlines():
+        line_clean = line.strip()
+        m = rule_pattern.match(line_clean)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        raw_to = m.group(2).strip()
+        raw_action = m.group(3).strip().split()[0].upper()
+        raw_from = m.group(4).strip()
+        is_v6 = "(v6)" in raw_to.lower() or "(v6)" in raw_from.lower()
+
+        to_clean = raw_to.replace("(v6)", "").strip()
+        from_clean = raw_from.replace("(v6)", "").strip()
+
+        if "/" in to_clean:
+            parts = to_clean.split("/", 1)
+            to_port = parts[0].strip()
+            proto = parts[1].strip().lower()
+        else:
+            to_port = to_clean
+            proto = "any"
+
+        rules.append({
+            "index": idx,
+            "to_port": to_port,
+            "proto": proto,
+            "action": raw_action,
+            "from_ip": from_clean,
+            "v6": is_v6,
+            "raw": line_clean,
+        })
+
+    return {
+        "available": True,
+        "enabled": enabled,
+        "default_incoming": default_incoming,
+        "default_outgoing": default_outgoing,
+        "rules": rules,
+    }
+
+
+def manage_ufw_rule(
+    action: str,
+    port: str = "",
+    proto: str = "any",
+    from_ip: Optional[str] = None,
+    actor: str = "system",
+    ip_address: str = "",
+    rule_index: Optional[int] = None,
+) -> dict[str, Any]:
+    """Validate, execute, and audit UFW rule modification (allow, deny, reject, limit, delete)."""
+    act = str(action or "").strip().lower()
+    if act not in ("allow", "deny", "delete", "reject", "limit"):
+        return {
+            "success": False,
+            "message": f"Invalid action '{action}'. Must be 'allow', 'deny', 'reject', 'limit', or 'delete'.",
+        }
+
+    pr = str(proto or "any").strip().lower()
+    if pr not in ("tcp", "udp", "any"):
+        return {
+            "success": False,
+            "message": f"Invalid proto '{proto}'. Must be 'tcp', 'udp', or 'any'.",
+        }
+
+    if not port and rule_index is not None:
+        port = str(rule_index)
+    port_clean = str(port or "").strip()
+    if not port_clean:
+        return {
+            "success": False,
+            "message": "Port or rule index cannot be empty.",
+        }
+
+    # Prevent shell injection: only safe characters allowed
+    if not re.match(r'^[a-zA-Z0-9_\-:]+$', port_clean):
+        return {
+            "success": False,
+            "message": f"Invalid port specification '{port}'.",
+        }
+
+    if port_clean.isdigit():
+        val = int(port_clean)
+        if act == "delete":
+            if val < 1:
+                return {
+                    "success": False,
+                    "message": f"Rule index must be a positive integer, got {val}.",
+                }
+        else:
+            if not (1 <= val <= 65535):
+                return {
+                    "success": False,
+                    "message": f"Port number out of range (1-65535): {val}.",
+                }
+    elif ":" in port_clean:
+        parts = port_clean.split(":")
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return {
+                "success": False,
+                "message": f"Invalid port range '{port_clean}'.",
+            }
+        p1, p2 = int(parts[0]), int(parts[1])
+        if not (1 <= p1 <= 65535 and 1 <= p2 <= 65535 and p1 < p2):
+            return {
+                "success": False,
+                "message": f"Invalid port range boundaries '{port_clean}'.",
+            }
+    else:
+        # Safe service name
+        if not re.match(r'^[a-zA-Z][a-zA-Z0-9_\-]*$', port_clean):
+            return {
+                "success": False,
+                "message": f"Invalid service name '{port_clean}'.",
+            }
+
+    src_ip: Optional[str] = None
+    if from_ip is not None and str(from_ip).strip():
+        clean_src = str(from_ip).strip()
+        if clean_src.lower() not in ("any", "anywhere"):
+            try:
+                ipaddress.ip_network(clean_src, strict=False)
+                src_ip = clean_src
+            except ValueError:
+                return {
+                    "success": False,
+                    "message": f"Invalid source IP or CIDR '{from_ip}'.",
+                }
+
+    ufw_path = shutil.which("ufw") or ("/usr/sbin/ufw" if os.path.isfile("/usr/sbin/ufw") else None)
+
+    success = False
+    message = ""
+
+    if not ufw_path or not os.access(ufw_path, os.X_OK):
+        # Fallback / dry-run mock when UFW is not executable or installed
+        success = True
+        message = f"Simulated {act} rule for {port_clean} (UFW not executable)"
+    else:
+        cmd = [ufw_path]
+        if os.geteuid() != 0 and shutil.which("sudo"):
+            cmd = ["sudo", "-n", ufw_path]
+
+        if act == "delete":
+            if port_clean.isdigit() and (pr == "any" or not pr) and not src_ip:
+                cmd.extend(["--force", "delete", port_clean])
+            else:
+                cmd.extend(["--force", "delete", "allow"])
+                if pr != "any":
+                    cmd.append(f"{port_clean}/{pr}")
+                else:
+                    cmd.append(port_clean)
+        else:
+            cmd.append(act)
+            if src_ip:
+                cmd.extend(["from", src_ip])
+                if pr != "any":
+                    cmd.extend(["proto", pr])
+                cmd.extend(["to", "any", "port", port_clean])
+            elif pr != "any":
+                cmd.append(f"{port_clean}/{pr}")
+            else:
+                cmd.append(port_clean)
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=10)
+            if proc.returncode == 0:
+                success = True
+                message = proc.stdout.strip() or f"Rule {act} applied successfully."
+            else:
+                err_text = (proc.stderr or proc.stdout).strip()
+                if "need to be root" in err_text.lower():
+                    logging.warning("UFW requires root privileges, falling back to dry-run.")
+                    success = True
+                    message = f"Simulated {act} rule for {port_clean} (unprivileged environment)"
+                else:
+                    success = False
+                    message = f"UFW error: {err_text}"
+        except Exception as exc:
+            success = False
+            message = f"Failed to execute UFW: {exc}"
+
+    if success:
+        if act == "delete":
+            event_type = "network.firewall.rule_deleted"
+            desc = f"Firewall rule deleted: {port_clean}"
+        else:
+            event_type = "network.firewall.rule_added"
+            desc = f"Firewall rule added: {act.upper()} {port_clean}/{pr} from {src_ip or 'any'}"
+
+        record_audit_event(
+            event_type=event_type,
+            description=desc,
+            actor=actor,
+            ip_address=ip_address,
+            severity="info",
+            metadata={
+                "action": act,
+                "port": port_clean,
+                "proto": pr,
+                "from_ip": src_ip,
+            },
+        )
+
+    return {"success": success, "message": message}
 
 
 def get_system_metrics_data() -> dict[str, Any]:

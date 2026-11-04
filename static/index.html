@@ -206,6 +206,22 @@
             <span id="nav-tab-services-badge" class="nav-tab-badge hidden">0</span>
           </button>
           <button
+            id="nav-tab-security"
+            class="nav-tab sidebar-nav-item"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="view-security"
+            title="Network &amp; Security"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <rect x="9" y="9" width="6" height="5" rx="1"></rect>
+              <path d="M10 9V7a2 2 0 0 1 4 0v2"></path>
+            </svg>
+            <span>Network &amp; Security</span>
+          </button>
+          <button
             id="nav-tab-processes"
             class="nav-tab sidebar-nav-item"
             type="button"
@@ -234,7 +250,6 @@
               <line x1="12" y1="22.08" x2="12" y2="12"></line>
             </svg>
             <span>Packages</span>
-            <span id="nav-tab-packages-badge" class="nav-tab-badge hidden">0</span>
             <span id="nav-badge-packages" class="nav-tab-badge hidden">0</span>
           </button>
           <button
@@ -1187,6 +1202,11 @@
                 <h3 class="subview-title">Persistent Volumes</h3>
                 <span class="subview-subtitle">Docker volume storage mounts</span>
               </div>
+              <div class="subview-actions">
+                <button id="btn-prune-volumes" type="button" class="btn-danger-outline">
+                  Prune Unused Volumes
+                </button>
+              </div>
             </div>
             <div id="docker-volume-feedback" class="auth-alert hidden" role="status"></div>
             <div class="table-container">
@@ -1705,6 +1725,140 @@
           </section>
         </div>
 
+        <!-- View Panel: Network & Security (#view-security) -->
+        <div id="view-security" class="view-panel hidden" role="tabpanel" aria-labelledby="nav-tab-security">
+          <section class="section-block" aria-labelledby="security-heading">
+            <div class="section-header">
+              <div>
+                <h2 id="security-heading" class="section-title">Network &amp; Security</h2>
+                <p class="section-subtitle">Open Listening Ports, Exposure Risk &amp; Firewall Management</p>
+              </div>
+              <div class="module-toolbar">
+                <span class="module-status-dot" title="Live stream active"></span>
+                <span id="security-last-updated" class="module-last-updated">--</span>
+                <button id="refresh-security-btn" class="btn-module-refresh" type="button" aria-label="Refresh Network Security" title="Refresh Network Security">
+                  <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="23 4 23 10 17 10"></polyline>
+                    <polyline points="1 20 1 14 7 14"></polyline>
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Summary Status Ribbon -->
+            <div class="overview-status-ribbon security-status-ribbon" role="region" aria-label="Network Security Summary">
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Total Listening Ports</span>
+                  <span id="sec-total-ports" class="pill-counter">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Publicly Exposed</span>
+                  <span id="sec-public-ports" class="count-number count-warn">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Local Only</span>
+                  <span id="sec-local-ports" class="count-number count-ok">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Firewall State</span>
+                  <span id="sec-firewall-status" class="status-badge status-unknown">UNKNOWN</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Content Cards Grid -->
+            <div class="security-content-grid">
+              <!-- Card 1: Listening Sockets & Open Ports -->
+              <article class="card security-card" id="sec-ports-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Listening Sockets &amp; Open Ports</h3>
+                    <p class="card-subtitle">Active TCP and UDP sockets mapped to processes and containers</p>
+                  </div>
+                  <div class="sec-card-actions">
+                    <div class="search-box sec-search-box">
+                      <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                      </svg>
+                      <input id="sec-ports-filter" type="search" placeholder="Filter ports, process, user, container..." aria-label="Filter Open Ports" />
+                    </div>
+                  </div>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="sec-ports-table">
+                    <thead>
+                      <tr>
+                        <th>Proto</th>
+                        <th>Port</th>
+                        <th>Bind Address</th>
+                        <th>Exposure</th>
+                        <th>Process (PID)</th>
+                        <th>User</th>
+                        <th>Container</th>
+                        <th style="text-align: right;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="sec-ports-tbody">
+                      <tr>
+                        <td colspan="8" class="empty-state">Loading listening sockets...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <!-- Card 2: UFW Host Firewall -->
+              <article class="card security-card" id="sec-firewall-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">UFW Host Firewall</h3>
+                    <p id="sec-firewall-policies" class="card-subtitle">Default Policies: Incoming -- | Outgoing --</p>
+                  </div>
+                  <div class="sec-card-actions">
+                    <button id="btn-add-firewall-rule" class="btn-primary btn-sm" type="button">
+                      <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                      </svg>
+                      <span>+ Add Rule</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="sec-firewall-table">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Action</th>
+                        <th>To (Port/Proto)</th>
+                        <th>From (IP)</th>
+                        <th>Type</th>
+                        <th style="text-align: right;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="sec-firewall-tbody">
+                      <tr>
+                        <td colspan="6" class="empty-state">Loading UFW firewall rules...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+
         <!-- View Panel: Process Explorer (#view-processes) -->
         <div id="view-processes" class="view-panel hidden" role="tabpanel" aria-labelledby="nav-tab-processes">
           <section class="section-block" aria-labelledby="processes-heading">
@@ -1835,6 +1989,14 @@
                     <polygon points="5 3 19 12 5 21 5 3"></polygon>
                   </svg>
                   <span>Simulate Upgrade</span>
+                </button>
+                <button id="btn-install-all-packages" class="btn-primary" type="button" title="Install all available updates with apt-get dist-upgrade">
+                  <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="7 10 12 15 17 10"></polyline>
+                    <line x1="12" y1="15" x2="12" y2="3"></line>
+                  </svg>
+                  <span>Install All Updates</span>
                 </button>
               </div>
             </div>
@@ -2892,6 +3054,7 @@
       </div>
       <div class="modal-actions">
         <button id="btn-dismiss-pkg-upgrade-modal" type="button" class="btn-secondary">Close</button>
+        <button id="btn-pkg-modal-install" type="button" class="btn-primary hidden">Install Now</button>
       </div>
     </div>
   </div>
@@ -3608,6 +3771,68 @@
       <div class="modal-actions">
         <button id="btn-smart-modal-cancel" type="button" class="btn-secondary">Close</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Add Firewall Rule Modal (#firewall-modal) -->
+  <div id="firewall-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="firewall-modal-title">
+    <div class="modal-card firewall-modal-card">
+      <div class="modal-header">
+        <div class="modal-title-with-icon">
+          <div class="modal-icon-badge security-icon-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            </svg>
+          </div>
+          <div>
+            <h3 id="firewall-modal-title" class="modal-title">Add Firewall Rule</h3>
+            <p class="modal-subtitle">Configure UFW host firewall rule</p>
+          </div>
+        </div>
+        <button id="btn-firewall-modal-close" type="button" class="btn-icon-close" aria-label="Close firewall modal">&times;</button>
+      </div>
+
+      <div id="firewall-modal-feedback" class="auth-alert hidden" role="status"></div>
+
+      <form id="firewall-form" class="settings-form" onsubmit="return false;">
+        <div class="form-row-2col">
+          <div class="form-group">
+            <label for="firewall-form-action">Action <span class="required-star">*</span></label>
+            <select id="firewall-form-action" class="form-select">
+              <option value="allow" selected>ALLOW</option>
+              <option value="deny">DENY</option>
+              <option value="reject">REJECT</option>
+              <option value="limit">LIMIT</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="firewall-form-proto">Protocol <span class="required-star">*</span></label>
+            <select id="firewall-form-proto" class="form-select">
+              <option value="any" selected>ANY</option>
+              <option value="tcp">TCP</option>
+              <option value="udp">UDP</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="firewall-form-port">Port / Service <span class="required-star">*</span></label>
+          <input type="text" id="firewall-form-port" placeholder="e.g. 22 or 80 or 8080" required />
+          <small class="form-hint">Port number (1-65535), port range (e.g. 8000:8010), or service name (e.g. ssh, http).</small>
+        </div>
+
+        <div class="form-group">
+          <label for="firewall-form-from">From IP (Optional)</label>
+          <input type="text" id="firewall-form-from" placeholder="Anywhere or 192.168.1.0/24" />
+          <small class="form-hint">Leave blank or 'Anywhere' to apply to all source addresses, or specify an IP/CIDR subnet.</small>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" id="btn-firewall-modal-cancel" class="btn-secondary">Cancel</button>
+          <button type="submit" id="btn-firewall-modal-save" class="btn-primary">Add Rule</button>
+        </div>
+      </form>
     </div>
   </div>
 
