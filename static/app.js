@@ -564,7 +564,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
     for (let i = 0; i < n; i++) {
       const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
       const x = (w - padRight) - (n - 1 - i) * stepX;
-      const y = padTop + (plotH - 2) * (1 - sample / 100);
+      const y = padTop + plotH * (1 - sample / 100);
       pts.push({ x, y });
     }
     if (pts.length === 1) {

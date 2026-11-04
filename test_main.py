@@ -9448,9 +9448,29 @@ console.log('OK');
         self.assertIn("dry_run: false", js)
 
     def test_refinement_3_cpu_core_graph_zero_percent_visibility_vm(self):
-        """Verify drawCpuCoreGraph renders 0% Y-axis label without clipping and keeps 0% traces above baseline."""
+        """Verify .cpu-unified-chart-container does not clip the 150px canvas and drawCpuCoreGraph renders 0% Y-axis label and 0% traces."""
+        import re
         import subprocess
         root = Path(__file__).parent
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        # 1. Assert .cpu-unified-chart-container CSS block has height: auto, display: flex, flex-direction: column, and NOT height: 150px
+        container_match = re.search(r"\.cpu-unified-chart-container\s*\{([^}]+)\}", css)
+        self.assertIsNotNone(container_match, "Missing .cpu-unified-chart-container rule in static/styles.css")
+        container_body = container_match.group(1)
+        self.assertIn("height: auto", container_body)
+        self.assertIn("display: flex", container_body)
+        self.assertIn("flex-direction: column", container_body)
+        self.assertNotIn("height: 150px", container_body)
+
+        # 2. Assert .cpu-unified-chart-canvas CSS block has height: 150px, border: none, border-radius: 0
+        canvas_match = re.search(r"\.cpu-unified-chart-canvas\s*\{([^}]+)\}", css)
+        self.assertIsNotNone(canvas_match, "Missing .cpu-unified-chart-canvas rule in static/styles.css")
+        canvas_body = canvas_match.group(1)
+        self.assertIn("height: 150px", canvas_body)
+        self.assertIn("border: none", canvas_body)
+        self.assertIn("border-radius: 0", canvas_body)
+
         node_script = r"""
 const fs = require('fs');
 const vm = require('vm');
@@ -9495,8 +9515,8 @@ const mockCtx = {
 };
 const canvas = {
   width: 600,
-  height: 220,
-  getBoundingClientRect: () => ({ width: 600, height: 220 }),
+  height: 150,
+  getBoundingClientRect: () => ({ width: 600, height: 150 }),
   getContext: () => mockCtx,
 };
 
@@ -9509,18 +9529,22 @@ vm.createContext(sandbox);
 vm.runInContext(fnSource, sandbox);
 
 sandbox.drawCpuCoreGraph(canvas, [[0, 0, 0, 0], [0, 0, 0, 0]]);
+const expectedLabels = ['100%', '75%', '50%', '25%', '0%'];
+for (const lbl of expectedLabels) {
+  if (!texts.find(t => t.text === lbl)) {
+    throw new Error('Missing Y-axis label: ' + lbl);
+  }
+}
 const zeroLabel = texts.find(t => t.text === '0%');
-if (!zeroLabel) throw new Error('0% Y-axis label was not rendered!');
-if (zeroLabel.y > canvas.height - 6 || zeroLabel.y < 10) {
+if (zeroLabel.y !== 132.5) {
+  throw new Error('Expected 0% label at y=132.5 in 150px canvas, got: ' + zeroLabel.y);
+}
+if (zeroLabel.y > canvas.height - 10 || zeroLabel.y < 10) {
   throw new Error('0% label Y coordinate is clipped: ' + zeroLabel.y);
 }
-// Bottom baseline is height - padBottom = 220 - 18 = 202 (+0.5 = 202.5).
-// 0% core trace should be drawn above 202.5 (i.e. y = 200).
-const traceMoves = linePoints.filter(p => p.type === 'move' && p.y !== 202.5 && p.y > 190);
-if (traceMoves.length === 0) throw new Error('No 0% core trace drawn');
-if (traceMoves[0].y >= zeroLabel.y) {
-  throw new Error('0% trace is not offset above baseline: traceY=' + traceMoves[0].y + ', baseY=' + zeroLabel.y);
-}
+// In 150px canvas: padTop=14, padBottom=18 => plotH=118. 0% trace is at y = padTop + plotH = 132.
+const traceMoves = linePoints.filter(p => p.type === 'move' && p.y === 132);
+if (traceMoves.length === 0) throw new Error('No 0% core trace drawn at y=132');
 console.log('OK');
 """
         proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
