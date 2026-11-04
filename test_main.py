@@ -331,7 +331,8 @@ class RaidFormattingTests(unittest.TestCase):
            0     259       0        0      active sync set-A   /dev/nvme0n1p1
            1     252       1        1      active sync set-B   /dev/vda1
 """
-        data = main._extract_raid_summary_data("active", nvme_details, SAMPLE_DUF_TABLE)
+        with patch.object(main, "get_all_disks_smart_metrics", return_value=[]):
+            data = main._extract_raid_summary_data("active", nvme_details, SAMPLE_DUF_TABLE)
         self.assertEqual(data["raid_device"], "/dev/md0")
         self.assertEqual(data["raid_level"], "raid10")
         self.assertEqual(
