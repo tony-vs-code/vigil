@@ -2354,16 +2354,81 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertIn("min-height: 100vh", styles_css)
 
     def test_sidebar_navigation_hierarchy_and_view_switching(self):
-        """Test sidebar sections: System Level (Overview, RAID), Container Management, Alerts & Communication."""
+        """Test 4-pillar sidebar navigation hierarchy: Monitoring & Health, Workloads & Runtime, System & Security, Alerts & Auditing."""
+        import re
         index_resp = asgi_get(api.app, "/")
         self.assertEqual(index_resp.status_code, 200)
         html = index_resp.text
 
         self.assertIn('id="app-sidebar"', html)
         self.assertIn('class="app-sidebar"', html)
-        self.assertTrue("System &amp; Storage" in html or "System Level" in html)
-        self.assertIn("Container Management", html)
-        self.assertIn("Alerts &amp; Communication", html)
+
+        # Extract the <nav class="sidebar-nav" ...> block
+        nav_start = html.find('<nav class="sidebar-nav"')
+        self.assertGreater(nav_start, -1)
+        nav_end = html.find('</nav>', nav_start)
+        self.assertGreater(nav_end, nav_start)
+        nav_html = html[nav_start:nav_end]
+
+        # 1. Verify the 4 .sidebar-nav-heading labels in exact order
+        headings = re.findall(r'<span class="sidebar-nav-heading">(.*?)</span>', nav_html)
+        expected_headings = [
+            "Monitoring &amp; Health",
+            "Workloads &amp; Runtime",
+            "System &amp; Security",
+            "Alerts &amp; Auditing",
+        ]
+        self.assertEqual(headings, expected_headings)
+
+        # 2. Verify exact relative DOM order of all 11 navigation buttons
+        expected_nav_buttons = [
+            ("nav-tab-overview", "view-overview"),
+            ("nav-tab-raid", "view-raid"),
+            ("nav-tab-probes", "view-probes"),
+            ("nav-tab-containers", "view-containers"),
+            ("nav-tab-services", "view-services"),
+            ("nav-tab-processes", "view-processes"),
+            ("nav-tab-packages", "view-packages"),
+            ("nav-tab-security", "view-security"),
+            ("nav-tab-users", "view-users"),
+            ("nav-tab-notifications", "view-notifications"),
+            ("nav-tab-audit", "view-audit"),
+        ]
+        nav_button_ids = re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', nav_html)
+        self.assertEqual(nav_button_ids, [btn_id for btn_id, _ in expected_nav_buttons])
+
+        # Verify each section groups the expected buttons
+        sections = nav_html.split('<div class="sidebar-nav-section">')[1:]
+        self.assertEqual(len(sections), 4)
+        self.assertEqual(
+            re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[0]),
+            ["nav-tab-overview", "nav-tab-raid", "nav-tab-probes"],
+        )
+        self.assertEqual(
+            re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[1]),
+            ["nav-tab-containers", "nav-tab-services", "nav-tab-processes"],
+        )
+        self.assertEqual(
+            re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[2]),
+            ["nav-tab-packages", "nav-tab-security", "nav-tab-users"],
+        )
+        self.assertEqual(
+            re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[3]),
+            ["nav-tab-notifications", "nav-tab-audit"],
+        )
+
+        # 3. Verify all aria-controls and badge IDs remain intact
+        for btn_id, view_id in expected_nav_buttons:
+            self.assertIn(f'id="{btn_id}"', nav_html)
+            self.assertIn(f'aria-controls="{view_id}"', nav_html)
+
+        for badge_id in [
+            "nav-tab-probes-badge",
+            "nav-tab-containers-badge",
+            "nav-tab-services-badge",
+            "nav-badge-packages",
+        ]:
+            self.assertIn(f'id="{badge_id}"', nav_html)
 
         # Verify mobile toggle and backdrop controls
         self.assertIn('id="sidebar-toggle-btn"', html)
@@ -2373,14 +2438,9 @@ class FastAPIEndpointTests(unittest.TestCase):
         # Check view switching handlers in app.js
         app_js = Path("static/app.js").read_text(encoding="utf-8")
         self.assertIn("switchViewTab(", app_js)
-        self.assertIn('"nav-tab-overview"', app_js)
-        self.assertIn('"nav-tab-raid"', app_js)
-        self.assertIn('"nav-tab-containers"', app_js)
-        self.assertIn('"nav-tab-notifications"', app_js)
-        self.assertIn('"view-overview"', app_js)
-        self.assertIn('"view-raid"', app_js)
-        self.assertIn('"view-containers"', app_js)
-        self.assertIn('"view-notifications"', app_js)
+        for btn_id, view_id in expected_nav_buttons:
+            self.assertIn(f'"{btn_id}"', app_js)
+            self.assertIn(f'"{view_id}"', app_js)
 
     def test_dedicated_raid_storage_view_and_overview_cockpit(self):
         """Test #view-raid isolation and #view-overview cockpit status cards."""

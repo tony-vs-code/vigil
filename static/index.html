@@ -107,9 +107,9 @@
       </div>
 
       <nav class="sidebar-nav" aria-label="Main Navigation">
-        <!-- Section: System & Storage -->
+        <!-- Section: Monitoring & Health -->
         <div class="sidebar-nav-section">
-          <span class="sidebar-nav-heading">System &amp; Storage</span>
+          <span class="sidebar-nav-heading">Monitoring &amp; Health</span>
           <button
             id="nav-tab-overview"
             class="nav-tab sidebar-nav-item active"
@@ -144,32 +144,6 @@
             </svg>
             <span>Storage</span>
           </button>
-        </div>
-
-        <!-- Section: Container Management -->
-        <div class="sidebar-nav-section">
-          <span class="sidebar-nav-heading">Container Management</span>
-          <button
-            id="nav-tab-containers"
-            class="nav-tab sidebar-nav-item"
-            type="button"
-            role="tab"
-            aria-selected="false"
-            aria-controls="view-containers"
-            title="Containers &amp; Stacks"
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
-              <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
-            </svg>
-            <span>Containers</span>
-            <span id="nav-tab-containers-badge" class="nav-tab-badge">0</span>
-          </button>
-        </div>
-
-        <!-- Section: Vigil Sentinel Health & Probes -->
-        <div class="sidebar-nav-section">
-          <span class="sidebar-nav-heading">Vigil Sentinel</span>
           <button
             id="nav-tab-probes"
             class="nav-tab sidebar-nav-item"
@@ -187,9 +161,25 @@
           </button>
         </div>
 
-        <!-- Section: Host Operations -->
+        <!-- Section: Workloads & Runtime -->
         <div class="sidebar-nav-section">
-          <span class="sidebar-nav-heading">Host Operations</span>
+          <span class="sidebar-nav-heading">Workloads &amp; Runtime</span>
+          <button
+            id="nav-tab-containers"
+            class="nav-tab sidebar-nav-item"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="view-containers"
+            title="Containers &amp; Stacks"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
+              <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+            </svg>
+            <span>Containers</span>
+            <span id="nav-tab-containers-badge" class="nav-tab-badge">0</span>
+          </button>
           <button
             id="nav-tab-services"
             class="nav-tab sidebar-nav-item"
@@ -206,22 +196,6 @@
             <span id="nav-tab-services-badge" class="nav-tab-badge hidden">0</span>
           </button>
           <button
-            id="nav-tab-security"
-            class="nav-tab sidebar-nav-item"
-            type="button"
-            role="tab"
-            aria-selected="false"
-            aria-controls="view-security"
-            title="Network &amp; Security"
-          >
-            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
-              <rect x="9" y="9" width="6" height="5" rx="1"></rect>
-              <path d="M10 9V7a2 2 0 0 1 4 0v2"></path>
-            </svg>
-            <span>Network &amp; Security</span>
-          </button>
-          <button
             id="nav-tab-processes"
             class="nav-tab sidebar-nav-item"
             type="button"
@@ -235,6 +209,11 @@
             </svg>
             <span>Processes</span>
           </button>
+        </div>
+
+        <!-- Section: System & Security -->
+        <div class="sidebar-nav-section">
+          <span class="sidebar-nav-heading">System &amp; Security</span>
           <button
             id="nav-tab-packages"
             class="nav-tab sidebar-nav-item"
@@ -251,6 +230,22 @@
             </svg>
             <span>Packages</span>
             <span id="nav-badge-packages" class="nav-tab-badge hidden">0</span>
+          </button>
+          <button
+            id="nav-tab-security"
+            class="nav-tab sidebar-nav-item"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="view-security"
+            title="Network &amp; Security"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+              <rect x="9" y="9" width="6" height="5" rx="1"></rect>
+              <path d="M10 9V7a2 2 0 0 1 4 0v2"></path>
+            </svg>
+            <span>Network &amp; Security</span>
           </button>
           <button
             id="nav-tab-users"
@@ -271,9 +266,9 @@
           </button>
         </div>
 
-        <!-- Section: Alerts & Communication -->
+        <!-- Section: Alerts & Auditing -->
         <div class="sidebar-nav-section">
-          <span class="sidebar-nav-heading">Alerts &amp; Communication</span>
+          <span class="sidebar-nav-heading">Alerts &amp; Auditing</span>
           <button
             id="nav-tab-notifications"
             class="nav-tab sidebar-nav-item"
