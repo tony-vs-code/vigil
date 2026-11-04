@@ -1360,6 +1360,23 @@ async def api_docker_volumes(_user: str = Depends(require_auth)) -> dict[str, An
     return {"volumes": volumes}
 
 
+@app.post("/api/docker/volumes/prune")
+async def api_docker_prune_volumes(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        res = await asyncio.to_thread(main.docker_manager.prune_volumes)
+        main.record_audit_event(
+            "docker.volume.prune",
+            "Pruned unused Docker volumes",
+            actor=_user,
+            severity="info",
+        )
+        return res
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/docker/volumes/{name}")
 async def api_docker_inspect_volume(
     name: str,
@@ -1385,9 +1402,16 @@ async def api_docker_remove_volume(
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(
+        res = await asyncio.to_thread(
             main.docker_manager.remove_volume, name, force=force
         )
+        main.record_audit_event(
+            "docker.volume.remove",
+            f"Removed Docker volume '{name}'",
+            actor=_user,
+            severity="info",
+        )
+        return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1660,6 +1684,19 @@ def api_packages_upgrade(
 ) -> dict[str, Any]:
     try:
         res = main.package_manager.run_upgrade(packages=req.packages, dry_run=req.dry_run)
+        if not req.dry_run:
+            target_desc = (
+                f"packages ({', '.join(req.packages)})"
+                if req.packages
+                else "all packages"
+            )
+            status_desc = "succeeded" if res.get("success") else "failed"
+            main.record_audit_event(
+                "packages.upgrade",
+                f"Upgrade of {target_desc} {status_desc}",
+                actor=_user,
+                severity="info" if res.get("success") else "warning",
+            )
         return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2138,6 +2175,102 @@ def api_get_probe_history(
     }
 
 
+class UfwRuleRequest(BaseModel):
+    action: str = "allow"
+    port: str
+    proto: str = "any"
+    from_ip: Optional[str] = None
+
+
+@app.get("/api/network/ports")
+def api_network_ports(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        ports = main.get_open_listening_ports()
+        total = len(ports)
+        public = sum(1 for p in ports if p.get("is_public"))
+        local = total - public
+        tcp_count = sum(1 for p in ports if str(p.get("proto", "")).lower().startswith("tcp"))
+        udp_count = sum(1 for p in ports if str(p.get("proto", "")).lower().startswith("udp"))
+        return {
+            "ports": ports,
+            "summary": {
+                "total": total,
+                "public": public,
+                "local": local,
+                "total_listening": total,
+                "public_exposed_count": public,
+                "local_only_count": local,
+                "tcp_count": tcp_count,
+                "udp_count": udp_count,
+            },
+        }
+    except Exception as exc:
+        logging.error(f"Error fetching network ports: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch open ports: {exc}"
+        )
+
+
+@app.get("/api/network/firewall")
+def api_network_firewall(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return main.get_ufw_firewall_status()
+    except Exception as exc:
+        logging.error(f"Error fetching UFW firewall status: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch firewall status: {exc}"
+        )
+
+
+@app.post("/api/network/firewall/rules")
+def api_add_firewall_rule(
+    payload: UfwRuleRequest,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else ""
+    res = main.manage_ufw_rule(
+        action=payload.action,
+        port=payload.port,
+        proto=payload.proto,
+        from_ip=payload.from_ip,
+        actor=_user,
+        ip_address=client_ip,
+    )
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=res.get("message", "Failed to add firewall rule"),
+        )
+    return res
+
+
+@app.delete("/api/network/firewall/rules/{rule_index}")
+def api_delete_firewall_rule(
+    rule_index: int,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    if rule_index < 1:
+        raise HTTPException(
+            status_code=400, detail="Rule index must be a positive integer."
+        )
+    client_ip = request.client.host if request.client else ""
+    res = main.manage_ufw_rule(
+        action="delete",
+        port=str(rule_index),
+        proto="any",
+        actor=_user,
+        ip_address=client_ip,
+    )
+    if not res.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=res.get("message", "Failed to delete firewall rule"),
+        )
+    return res
+
+
 class CacheControlStaticFiles(StaticFiles):
     def file_response(
         self,
@@ -2173,6 +2306,10 @@ class CacheControlStaticFiles(StaticFiles):
 @app.get("/probes/{subpath:path}")
 @app.get("/sentinel")
 @app.get("/sentinel/{subpath:path}")
+@app.get("/network")
+@app.get("/network/{subpath:path}")
+@app.get("/firewall")
+@app.get("/firewall/{subpath:path}")
 @app.get("/login")
 @app.get("/logs")
 def serve_index(subpath: Optional[str] = None):

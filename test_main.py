@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import psutil
 import re
 import socket
 import sqlite3
@@ -183,6 +184,16 @@ def asgi_post(
     return asgi_request(
         app, "POST", path, json_body=json_body, headers=headers, cookies=cookies
     )
+
+
+def asgi_delete(
+    app,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+) -> AsgiResponse:
+    return asgi_request(app, "DELETE", path, headers=headers, cookies=cookies)
 
 
 class AsgiWebSocketResult:
@@ -4220,6 +4231,64 @@ class TestDockerBackend(unittest.TestCase):
             )
             self.assertEqual(missing_resp.status_code, 404)
 
+    def test_volume_remove_and_prune_endpoints_and_audit(self):
+        # 1. Unauthenticated requests return 401
+        self.assertEqual(asgi_post(api.app, "/api/docker/volumes/prune").status_code, 401)
+        self.assertEqual(asgi_delete(api.app, "/api/docker/volumes/data_vol").status_code, 401)
+
+        # 2. DockerManager.prune_volumes() unit test
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager,
+                "_run_docker",
+                return_value="Deleted Volumes:\nvol_old\nTotal reclaimed space: 120MB\n",
+            ) as mock_run,
+        ):
+            main.docker_manager._set_cache("status", {"cached": True})
+            res = main.docker_manager.prune_volumes()
+            self.assertTrue(res["success"])
+            self.assertIn("Total reclaimed space", res["output"])
+            mock_run.assert_called_once_with(["volume", "prune", "-f"], timeout=60)
+            self.assertIsNone(main.docker_manager._get_cached("status"))
+
+        # 3. POST /api/docker/volumes/prune and audit event
+        with patch.object(
+            main.docker_manager,
+            "prune_volumes",
+            return_value={"success": True, "output": "Pruned 2 volumes"},
+        ):
+            prune_resp = asgi_post(
+                api.app, "/api/docker/volumes/prune", cookies=self.auth_cookies
+            )
+            self.assertEqual(prune_resp.status_code, 200)
+            self.assertTrue(prune_resp.json()["success"])
+
+            logs, total = main.get_audit_logs(event_type="docker.volume.prune")
+            self.assertGreaterEqual(total, 1)
+            self.assertEqual(logs[0]["actor"], "admin")
+            self.assertIn("Pruned unused Docker volumes", logs[0]["description"])
+
+        # 4. DELETE /api/docker/volumes/{name} and audit event
+        with patch.object(
+            main.docker_manager,
+            "remove_volume",
+            return_value={"success": True, "name": "data_vol", "output": "data_vol\n"},
+        ) as mock_rm:
+            del_resp = asgi_delete(
+                api.app,
+                "/api/docker/volumes/data_vol?force=true",
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(del_resp.status_code, 200)
+            self.assertTrue(del_resp.json()["success"])
+            mock_rm.assert_called_once_with("data_vol", force=True)
+
+            rm_logs, rm_total = main.get_audit_logs(event_type="docker.volume.remove")
+            self.assertGreaterEqual(rm_total, 1)
+            self.assertEqual(rm_logs[0]["actor"], "admin")
+            self.assertIn("Removed Docker volume 'data_vol'", rm_logs[0]["description"])
+
     def test_docker_update_schedule_flow_and_checker(self):
         # 1. GET schedule returns defaults
         get_resp = asgi_get(
@@ -6952,6 +7021,100 @@ class TestPackageManagerBackendAndEndpoints(unittest.TestCase):
         self.assertEqual(api_bad.status_code, 400)
         self.assertIn("Invalid package name", api_bad.json()["detail"])
 
+    def test_run_upgrade_real_installation_and_audit(self):
+        pm = main.PackageManager()
+        with pm._cache_lock:
+            pm._updates_cache = (time.time(), {"total_updates": 2, "updates": []})
+            pm._installed_cache = (time.time(), [{"name": "curl"}])
+
+        # 1. Real upgrade with dry_run=False passes Dpkg::Options and DEBIAN_FRONTEND=noninteractive
+        with (
+            patch.object(pm, "is_supported", return_value=True),
+            patch("subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="Unpacking curl...\nSetting up curl...\n", stderr=""
+            )
+            res = pm.run_upgrade(packages=["curl"], dry_run=False)
+            self.assertTrue(res["success"])
+            self.assertFalse(res["dry_run"])
+            self.assertIn("Setting up curl", res["output"])
+            self.assertIsNone(pm._updates_cache)
+            self.assertIsNone(pm._installed_cache)
+
+            mock_run.assert_called_once()
+            cmd_arg = mock_run.call_args[0][0]
+            self.assertEqual(
+                cmd_arg,
+                [
+                    "apt-get",
+                    "-y",
+                    "-o",
+                    "Dpkg::Options::=--force-confdef",
+                    "-o",
+                    "Dpkg::Options::=--force-confold",
+                    "install",
+                    "--only-upgrade",
+                    "curl",
+                ],
+            )
+            kwargs = mock_run.call_args[1]
+            self.assertEqual(kwargs.get("timeout"), 300)
+            self.assertEqual(kwargs.get("env", {}).get("DEBIAN_FRONTEND"), "noninteractive")
+
+        # 2. Retry with sudo -n when permission denied
+        with (
+            patch.object(pm, "is_supported", return_value=True),
+            patch("shutil.which", return_value="/usr/bin/sudo"),
+            patch("subprocess.run") as mock_run_sudo,
+        ):
+            mock_run_sudo.side_effect = [
+                MagicMock(
+                    returncode=100,
+                    stdout="",
+                    stderr="E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)",
+                ),
+                MagicMock(returncode=0, stdout="Upgraded via sudo\n", stderr=""),
+            ]
+            res_sudo = pm.run_upgrade(packages=None, dry_run=False)
+            self.assertTrue(res_sudo["success"])
+            self.assertEqual(mock_run_sudo.call_count, 2)
+            second_cmd = mock_run_sudo.call_args_list[1][0][0]
+            self.assertEqual(
+                second_cmd[:4],
+                ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive"],
+            )
+            self.assertIn("dist-upgrade", second_cmd)
+
+        # 3. POST /api/packages/upgrade with dry_run=False logs audit event
+        with patch.object(
+            main.package_manager,
+            "run_upgrade",
+            return_value={
+                "success": True,
+                "dry_run": False,
+                "command": "apt-get -y install --only-upgrade curl",
+                "output": "Upgraded curl",
+                "error": "",
+                "returncode": 0,
+            },
+        ) as mock_upg:
+            resp = asgi_post(
+                api.app,
+                "/api/packages/upgrade",
+                json_body={"packages": ["curl"], "dry_run": False},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertTrue(resp.json()["success"])
+            mock_upg.assert_called_once_with(packages=["curl"], dry_run=False)
+
+            logs, total = main.get_audit_logs(event_type="packages.upgrade")
+            self.assertGreaterEqual(total, 1)
+            self.assertEqual(logs[0]["actor"], "admin")
+            self.assertEqual(logs[0]["severity"], "info")
+            self.assertIn("curl", logs[0]["description"])
+
     def test_api_package_endpoints_and_status(self):
         # 1. Status includes reboot_status and updates_summary
         status_resp = asgi_get(api.app, "/api/status", cookies=self.auth_cookies)
@@ -8689,6 +8852,692 @@ class TestHardwareTelemetryAndSmartCollector(unittest.TestCase):
         self.assertIn(".temp-ok", styles_css)
         self.assertIn(".temp-warn", styles_css)
         self.assertIn(".temp-crit", styles_css)
+
+
+class TestNetworkSecurityAndFirewallManager(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_raid_state.db"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_is_ip_public_helper(self):
+        self.assertTrue(main._is_ip_public("0.0.0.0"))
+        self.assertTrue(main._is_ip_public("::"))
+        self.assertTrue(main._is_ip_public(""))
+        self.assertTrue(main._is_ip_public("*"))
+        self.assertTrue(main._is_ip_public("192.168.1.100"))
+        self.assertTrue(main._is_ip_public("10.0.0.5"))
+        self.assertTrue(main._is_ip_public("1.1.1.1"))
+
+        self.assertFalse(main._is_ip_public("127.0.0.1"))
+        self.assertFalse(main._is_ip_public("127.0.0.53"))
+        self.assertFalse(main._is_ip_public("::1"))
+
+    @patch("main.list_docker_containers")
+    @patch("main.psutil.Process")
+    @patch("main.psutil.net_connections")
+    def test_get_open_listening_ports_psutil_mock(self, mock_conns, mock_proc, mock_containers):
+        mock_containers.return_value = [
+            {
+                "id": "c1234567890ab",
+                "name": "nginx-proxy",
+                "state": "running",
+                "ports": "0.0.0.0:80->80/tcp, :::80->80/tcp",
+            }
+        ]
+
+        from collections import namedtuple
+        SConn = namedtuple("SConn", ["fd", "family", "type", "laddr", "raddr", "status", "pid"])
+        LAddr = namedtuple("LAddr", ["ip", "port"])
+
+        c_tcp_pub = SConn(fd=1, family=socket.AF_INET, type=socket.SOCK_STREAM, laddr=LAddr("0.0.0.0", 80), raddr=(), status="LISTEN", pid=101)
+        c_tcp_priv = SConn(fd=2, family=socket.AF_INET, type=socket.SOCK_STREAM, laddr=LAddr("127.0.0.1", 3306), raddr=(), status="LISTEN", pid=102)
+        c_udp_pub = SConn(fd=3, family=socket.AF_INET, type=socket.SOCK_DGRAM, laddr=LAddr("0.0.0.0", 53), raddr=(), status="NONE", pid=103)
+        c_tcp_est = SConn(fd=4, family=socket.AF_INET, type=socket.SOCK_STREAM, laddr=LAddr("192.168.1.50", 45678), raddr=LAddr("93.184.216.34", 443), status="ESTABLISHED", pid=104)
+
+        mock_conns.return_value = [c_tcp_priv, c_tcp_est, c_tcp_pub, c_udp_pub]
+
+        def proc_side_effect(pid):
+            p = MagicMock()
+            if pid == 101:
+                p.name.return_value = "docker-proxy"
+                p.username.return_value = "root"
+            elif pid == 102:
+                p.name.return_value = "mysqld"
+                p.username.return_value = "mysql"
+            elif pid == 103:
+                p.name.return_value = "named"
+                p.username.return_value = "bind"
+            else:
+                p.name.return_value = "other"
+                p.username.return_value = "nobody"
+            return p
+
+        mock_proc.side_effect = proc_side_effect
+
+        ports = main.get_open_listening_ports()
+        self.assertEqual(len(ports), 3)
+
+        self.assertEqual(ports[0]["port"], 53)
+        self.assertEqual(ports[0]["proto"], "udp")
+        self.assertTrue(ports[0]["is_public"])
+        self.assertEqual(ports[0]["process_name"], "named")
+        self.assertEqual(ports[0]["user"], "bind")
+
+        self.assertEqual(ports[1]["port"], 80)
+        self.assertEqual(ports[1]["proto"], "tcp")
+        self.assertTrue(ports[1]["is_public"])
+        self.assertEqual(ports[1]["process_name"], "docker-proxy")
+        self.assertEqual(ports[1]["container_name"], "nginx-proxy")
+
+        self.assertEqual(ports[2]["port"], 3306)
+        self.assertEqual(ports[2]["proto"], "tcp")
+        self.assertFalse(ports[2]["is_public"])
+        self.assertEqual(ports[2]["process_name"], "mysqld")
+        self.assertEqual(ports[2]["container_name"], "")
+
+    @patch("main._get_socket_inode_to_pid_map")
+    @patch("main._parse_proc_net_file")
+    @patch("main.psutil.net_connections")
+    def test_get_open_listening_ports_fallback_proc_net(self, mock_conns, mock_parse, mock_inode_map):
+        mock_conns.side_effect = psutil.AccessDenied()
+        mock_inode_map.return_value = {"12345": 501}
+
+        def parse_side_effect(filepath, proto):
+            if filepath == "/proc/net/tcp":
+                return [{"proto": "tcp", "ip": "0.0.0.0", "port": 8080, "inode": "12345"}]
+            if filepath == "/proc/net/udp":
+                return [{"proto": "udp", "ip": "127.0.0.1", "port": 5353, "inode": ""}]
+            return []
+
+        mock_parse.side_effect = parse_side_effect
+
+        with patch("main.psutil.Process") as mock_proc:
+            p = MagicMock()
+            p.name.return_value = "proc-app"
+            p.username.return_value = "appuser"
+            mock_proc.return_value = p
+
+            ports = main.get_open_listening_ports()
+            self.assertEqual(len(ports), 2)
+            self.assertEqual(ports[0]["port"], 8080)
+            self.assertTrue(ports[0]["is_public"])
+            self.assertEqual(ports[0]["pid"], 501)
+            self.assertEqual(ports[0]["process_name"], "proc-app")
+
+            self.assertEqual(ports[1]["port"], 5353)
+            self.assertFalse(ports[1]["is_public"])
+            self.assertIsNone(ports[1]["pid"])
+
+    @patch("main.list_docker_containers")
+    @patch("pathlib.Path.read_text")
+    @patch("pathlib.Path.is_file")
+    @patch("main.psutil.Process")
+    @patch("main.psutil.net_connections")
+    def test_docker_container_pid_cgroup_correlation(self, mock_conns, mock_proc, mock_isfile, mock_read, mock_containers):
+        mock_containers.return_value = [
+            {
+                "id": "e3b0c44298fc1c149afbf4c8996fb924",
+                "name": "redis-cache",
+                "state": "running",
+                "ports": "",
+            }
+        ]
+
+        from collections import namedtuple
+        SConn = namedtuple("SConn", ["fd", "family", "type", "laddr", "raddr", "status", "pid"])
+        LAddr = namedtuple("LAddr", ["ip", "port"])
+
+        mock_conns.return_value = [
+            SConn(fd=1, family=socket.AF_INET, type=socket.SOCK_STREAM, laddr=LAddr("127.0.0.1", 6379), raddr=(), status="LISTEN", pid=202)
+        ]
+
+        p = MagicMock()
+        p.name.return_value = "redis-server"
+        p.username.return_value = "redis"
+        mock_proc.return_value = p
+
+        mock_isfile.return_value = True
+        mock_read.return_value = "0::/system.slice/docker-e3b0c44298fc1c149afbf4c8996fb924.scope\n"
+
+        ports = main.get_open_listening_ports()
+        self.assertEqual(len(ports), 1)
+        self.assertEqual(ports[0]["port"], 6379)
+        self.assertEqual(ports[0]["container_name"], "redis-cache")
+
+    @patch("shutil.which")
+    def test_ufw_firewall_status_not_installed(self, mock_which):
+        mock_which.return_value = None
+        with patch("os.path.isfile", return_value=False):
+            status = main.get_ufw_firewall_status()
+            self.assertFalse(status["available"])
+            self.assertFalse(status["enabled"])
+            self.assertEqual(status["default_incoming"], "deny")
+            self.assertEqual(status["default_outgoing"], "allow")
+            self.assertEqual(status["rules"], [])
+
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_ufw_firewall_status_parsing_active_with_rules(self, mock_which, mock_run):
+        mock_which.return_value = "/usr/sbin/ufw"
+        raw_output = """
+Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+     To                         Action      From
+     --                         ------      ----
+[ 1] 22/tcp                     ALLOW IN    Anywhere
+[ 2] 80/tcp                     ALLOW IN    Anywhere
+[ 3] 443                        ALLOW IN    192.168.1.0/24
+[ 4] 22/tcp (v6)                ALLOW IN    Anywhere (v6)
+[ 5] 53/udp                     DENY IN     Anywhere
+[ 6] 8080                       REJECT IN   10.0.0.0/8
+"""
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = raw_output
+        proc.stderr = ""
+        mock_run.return_value = proc
+
+        with patch("os.path.isfile", return_value=True):
+            status = main.get_ufw_firewall_status()
+            self.assertTrue(status["available"])
+            self.assertTrue(status["enabled"])
+            self.assertEqual(status["default_incoming"], "deny")
+            self.assertEqual(status["default_outgoing"], "allow")
+            self.assertEqual(len(status["rules"]), 6)
+
+            r1 = status["rules"][0]
+            self.assertEqual(r1["index"], 1)
+            self.assertEqual(r1["to_port"], "22")
+            self.assertEqual(r1["proto"], "tcp")
+            self.assertEqual(r1["action"], "ALLOW")
+            self.assertEqual(r1["from_ip"], "Anywhere")
+            self.assertFalse(r1["v6"])
+
+            r3 = status["rules"][2]
+            self.assertEqual(r3["index"], 3)
+            self.assertEqual(r3["to_port"], "443")
+            self.assertEqual(r3["proto"], "any")
+            self.assertEqual(r3["action"], "ALLOW")
+            self.assertEqual(r3["from_ip"], "192.168.1.0/24")
+
+            r4 = status["rules"][3]
+            self.assertEqual(r4["index"], 4)
+            self.assertEqual(r4["to_port"], "22")
+            self.assertEqual(r4["proto"], "tcp")
+            self.assertTrue(r4["v6"])
+
+            r5 = status["rules"][4]
+            self.assertEqual(r5["index"], 5)
+            self.assertEqual(r5["to_port"], "53")
+            self.assertEqual(r5["proto"], "udp")
+            self.assertEqual(r5["action"], "DENY")
+
+            r6 = status["rules"][5]
+            self.assertEqual(r6["index"], 6)
+            self.assertEqual(r6["to_port"], "8080")
+            self.assertEqual(r6["action"], "REJECT")
+            self.assertEqual(r6["from_ip"], "10.0.0.0/8")
+
+    def test_manage_ufw_rule_input_validation(self):
+        res = main.manage_ufw_rule("kill", "80")
+        self.assertFalse(res["success"])
+        self.assertIn("Invalid action", res["message"])
+
+        res = main.manage_ufw_rule("allow", "80", proto="icmp")
+        self.assertFalse(res["success"])
+        self.assertIn("Invalid proto", res["message"])
+
+        res = main.manage_ufw_rule("allow", "80; rm -rf /")
+        self.assertFalse(res["success"])
+        self.assertIn("Invalid port specification", res["message"])
+
+        res = main.manage_ufw_rule("allow", "80 && reboot")
+        self.assertFalse(res["success"])
+
+        res = main.manage_ufw_rule("allow", "70000")
+        self.assertFalse(res["success"])
+        self.assertIn("out of range", res["message"])
+
+        res = main.manage_ufw_rule("allow", "9000:8000")
+        self.assertFalse(res["success"])
+        self.assertIn("boundaries", res["message"])
+
+        res = main.manage_ufw_rule("allow", "80", from_ip="300.0.0.1")
+        self.assertFalse(res["success"])
+        self.assertIn("Invalid source IP", res["message"])
+
+        res = main.manage_ufw_rule("delete", "0")
+        self.assertFalse(res["success"])
+        self.assertIn("positive integer", res["message"])
+
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_manage_ufw_rule_execution_and_audit_logging(self, mock_which, mock_run):
+        mock_which.return_value = "/usr/sbin/ufw"
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = "Rule added\n"
+        proc.stderr = ""
+        mock_run.return_value = proc
+
+        with patch("os.path.isfile", return_value=True), patch("os.access", return_value=True):
+            res = main.manage_ufw_rule(
+                "allow",
+                "8443",
+                proto="tcp",
+                from_ip="192.168.1.0/24",
+                actor="admin",
+                ip_address="127.0.0.1",
+            )
+            self.assertTrue(res["success"])
+            self.assertIn("Rule added", res["message"])
+
+            mock_run.assert_called()
+            call_args = mock_run.call_args[0][0]
+            self.assertIn("allow", call_args)
+            self.assertIn("from", call_args)
+            self.assertIn("192.168.1.0/24", call_args)
+            self.assertIn("proto", call_args)
+            self.assertIn("tcp", call_args)
+            self.assertIn("8443", call_args)
+
+            logs, count = main.get_audit_logs(event_type="network.firewall.rule_added")
+            self.assertGreaterEqual(count, 1)
+            self.assertEqual(logs[0]["actor"], "admin")
+            self.assertIn("8443", logs[0]["description"])
+            self.assertEqual(logs[0]["metadata"]["action"], "allow")
+            self.assertEqual(logs[0]["metadata"]["port"], "8443")
+            self.assertEqual(logs[0]["metadata"]["proto"], "tcp")
+            self.assertEqual(logs[0]["metadata"]["from_ip"], "192.168.1.0/24")
+
+            proc.stdout = "Rule deleted\n"
+            res_del = main.manage_ufw_rule("delete", "2", actor="admin")
+            self.assertTrue(res_del["success"])
+
+            del_logs, del_count = main.get_audit_logs(event_type="network.firewall.rule_deleted")
+            self.assertGreaterEqual(del_count, 1)
+            self.assertEqual(del_logs[0]["metadata"]["port"], "2")
+
+    def test_api_network_endpoints_authentication(self):
+        resp = asgi_get(api.app, "/api/network/ports")
+        self.assertEqual(resp.status_code, 401)
+
+        resp = asgi_get(api.app, "/api/network/firewall")
+        self.assertEqual(resp.status_code, 401)
+
+        resp = asgi_post(api.app, "/api/network/firewall/rules", json_body={"action": "allow", "port": "80"})
+        self.assertEqual(resp.status_code, 401)
+
+        resp = asgi_delete(api.app, "/api/network/firewall/rules/1")
+        self.assertEqual(resp.status_code, 401)
+
+    @patch("main.manage_ufw_rule")
+    @patch("main.get_ufw_firewall_status")
+    @patch("main.get_open_listening_ports")
+    def test_api_network_ports_and_firewall_authenticated(self, mock_ports, mock_fw_status, mock_manage):
+        mock_ports.return_value = [
+            {"proto": "tcp", "ip": "0.0.0.0", "port": 80, "is_public": True, "pid": 10, "process_name": "nginx", "user": "www", "container_name": ""},
+            {"proto": "tcp", "ip": "127.0.0.1", "port": 3306, "is_public": False, "pid": 20, "process_name": "mysql", "user": "db", "container_name": ""},
+        ]
+        mock_fw_status.return_value = {
+            "available": True,
+            "enabled": True,
+            "default_incoming": "deny",
+            "default_outgoing": "allow",
+            "rules": [{"index": 1, "to_port": "80", "proto": "tcp", "action": "ALLOW", "from_ip": "Anywhere", "v6": False, "raw": "[ 1] 80/tcp ALLOW IN Anywhere"}],
+        }
+        mock_manage.return_value = {"success": True, "message": "Rule applied"}
+
+        resp = asgi_get(api.app, "/api/network/ports", cookies=self.auth_cookies)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("ports", data)
+        self.assertIn("summary", data)
+        self.assertEqual(data["summary"]["total"], 2)
+        self.assertEqual(data["summary"]["public"], 1)
+        self.assertEqual(data["summary"]["local"], 1)
+        self.assertEqual(data["summary"]["total_listening"], 2)
+        self.assertEqual(data["summary"]["public_exposed_count"], 1)
+        self.assertEqual(data["summary"]["local_only_count"], 1)
+        self.assertEqual(data["summary"]["tcp_count"], 2)
+        self.assertEqual(data["summary"]["udp_count"], 0)
+
+        resp_fw = asgi_get(api.app, "/api/network/firewall", cookies=self.auth_cookies)
+        self.assertEqual(resp_fw.status_code, 200)
+        fw_data = resp_fw.json()
+        self.assertTrue(fw_data["enabled"])
+        self.assertEqual(len(fw_data["rules"]), 1)
+
+        resp_add = asgi_post(
+            api.app,
+            "/api/network/firewall/rules",
+            json_body={"action": "allow", "port": "443", "proto": "tcp"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(resp_add.status_code, 200)
+        self.assertTrue(resp_add.json()["success"])
+
+        mock_manage.return_value = {"success": False, "message": "Invalid action 'invalid'"}
+        resp_inv = asgi_post(
+            api.app,
+            "/api/network/firewall/rules",
+            json_body={"action": "invalid", "port": "443"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(resp_inv.status_code, 400)
+
+        mock_manage.return_value = {"success": True, "message": "Rule deleted"}
+        resp_del = asgi_delete(api.app, "/api/network/firewall/rules/1", cookies=self.auth_cookies)
+        self.assertEqual(resp_del.status_code, 200)
+        self.assertTrue(resp_del.json()["success"])
+
+        resp_del_inv = asgi_delete(api.app, "/api/network/firewall/rules/0", cookies=self.auth_cookies)
+        self.assertEqual(resp_del_inv.status_code, 400)
+
+        resp_spa_net = asgi_get(api.app, "/network", cookies=self.auth_cookies)
+        self.assertEqual(resp_spa_net.status_code, 200)
+        resp_spa_fw = asgi_get(api.app, "/firewall", cookies=self.auth_cookies)
+        self.assertEqual(resp_spa_fw.status_code, 200)
+
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_manage_ufw_rule_limit_action_and_rule_index_kwarg(self, mock_which, mock_run):
+        """Verify manage_ufw_rule supports 'limit' action and optional rule_index parameter."""
+        mock_which.return_value = "/usr/sbin/ufw"
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdout = "Rule updated\n"
+        proc.stderr = ""
+        mock_run.return_value = proc
+
+        with patch("os.path.isfile", return_value=True), patch("os.access", return_value=True):
+            res_limit = main.manage_ufw_rule("limit", "22", proto="tcp", actor="admin")
+            self.assertTrue(res_limit["success"])
+            call_args = mock_run.call_args[0][0]
+            self.assertIn("limit", call_args)
+            self.assertIn("22/tcp", call_args)
+
+            res_idx = main.manage_ufw_rule("delete", rule_index=3, actor="admin")
+            self.assertTrue(res_idx["success"])
+            del_args = mock_run.call_args[0][0]
+            self.assertIn("delete", del_args)
+            self.assertIn("3", del_args)
+
+    def test_phase3_frontend_dom_and_js_contracts_and_vm_execution(self):
+        """Verify Phase 3 Security/Firewall DOM elements, CSS classes, JS functions, and VM rendering."""
+        import subprocess
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        required_ids = [
+            "nav-tab-security",
+            "view-security",
+            "refresh-security-btn",
+            "sec-total-ports",
+            "sec-public-ports",
+            "sec-local-ports",
+            "sec-firewall-status",
+            "sec-ports-filter",
+            "sec-ports-table",
+            "sec-ports-tbody",
+            "btn-add-firewall-rule",
+            "sec-firewall-policies",
+            "sec-firewall-table",
+            "sec-firewall-tbody",
+            "firewall-modal",
+            "btn-firewall-modal-close",
+            "firewall-form",
+            "firewall-form-action",
+            "firewall-form-proto",
+            "firewall-form-port",
+            "firewall-form-from",
+            "btn-firewall-modal-cancel",
+            "btn-firewall-modal-save",
+        ]
+        for dom_id in required_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        for fn_name in [
+            "async function fetchNetworkSecurity(",
+            "function renderNetworkSecurity(",
+            "function filterPortsTable(",
+            "function openAddFirewallRuleModal(",
+            "function closeFirewallModal(",
+            "async function handleFirewallFormSubmit(",
+            "async function deleteFirewallRule(",
+        ]:
+            self.assertIn(fn_name, js, f"Missing {fn_name} in static/app.js")
+
+        for css_sel in [".security-content-grid", ".exposure-badge", ".exp-public", ".exp-local", "#sec-ports-table", "#sec-firewall-table"]:
+            self.assertIn(css_sel, css, f"Missing {css_sel} in static/styles.css")
+
+        # Execute renderNetworkSecurity and filterPortsTable in Node.js VM
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  const idx = source.indexOf('function ' + name + '(');
+  if (idx === -1) throw new Error('Not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') { depth--; if (started && depth === 0) return source.slice(idx, i + 1); }
+    i++;
+  }
+  throw new Error('Unbalanced: ' + name);
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id,
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      className: '',
+      querySelectorAll: () => [],
+      querySelector: () => null,
+      appendChild: () => {},
+      classList: {
+        _set: new Set(),
+        add(...cls) { cls.forEach(c => this._set.add(c)); },
+        remove(...cls) { cls.forEach(c => this._set.delete(c)); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this._set.has(c)) this._set.delete(c); else this._set.add(c);
+          } else if (force) this._set.add(c); else this._set.delete(c);
+        },
+        contains(c) { return this._set.has(c); }
+      }
+    };
+  }
+  return elements[id];
+}
+
+const sandbox = {
+  document: { getElementById: getEl, createElement: () => getEl('tmp') },
+  escapeHtml: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+};
+vm.createContext(sandbox);
+vm.runInContext(extractFunc(code, 'filterPortsTable'), sandbox);
+vm.runInContext(extractFunc(code, 'renderNetworkSecurity'), sandbox);
+
+const portsPayload = {
+  ports: [
+    { proto: 'tcp', ip: '0.0.0.0', port: 443, is_public: true, pid: 101, process_name: 'nginx', user: 'root', container_name: 'web-proxy' },
+    { proto: 'tcp', ip: '127.0.0.1', port: 5432, is_public: false, pid: 202, process_name: 'postgres', user: 'postgres', container_name: '' }
+  ],
+  summary: { total: 2, public: 1, local: 1 }
+};
+const fwPayload = {
+  available: true,
+  enabled: true,
+  default_incoming: 'deny',
+  default_outgoing: 'allow',
+  rules: [
+    { index: 1, to_port: '443', proto: 'tcp', action: 'ALLOW', from_ip: 'Anywhere', v6: false }
+  ]
+};
+
+sandbox.renderNetworkSecurity(portsPayload, fwPayload);
+if (getEl('sec-total-ports').textContent !== '2') throw new Error('Bad total ports: ' + getEl('sec-total-ports').textContent);
+if (getEl('sec-public-ports').textContent !== '1') throw new Error('Bad public ports');
+if (getEl('sec-local-ports').textContent !== '1') throw new Error('Bad local ports');
+if (getEl('sec-firewall-status').textContent !== 'ACTIVE') throw new Error('Bad firewall status: ' + getEl('sec-firewall-status').textContent);
+if (!getEl('sec-ports-tbody').innerHTML.includes('PUBLIC')) throw new Error('Missing PUBLIC badge');
+if (!getEl('sec-ports-tbody').innerHTML.includes('LOCAL')) throw new Error('Missing LOCAL badge');
+if (!getEl('sec-ports-tbody').innerHTML.includes('web-proxy')) throw new Error('Missing container pill');
+if (!getEl('sec-firewall-tbody').innerHTML.includes('ALLOW')) throw new Error('Missing ALLOW rule');
+
+// Test filterPortsTable row filtering
+const mockRows = [
+  { _search: 'tcp 443 0.0.0.0 public nginx 101 root web-proxy', style: { display: '' }, classList: { toggle() {} }, getAttribute: () => 'tcp 443 0.0.0.0 public nginx 101 root web-proxy' },
+  { _search: 'tcp 5432 127.0.0.1 local postgres 202 postgres', style: { display: '' }, classList: { toggle() {} }, getAttribute: () => 'tcp 5432 127.0.0.1 local postgres 202 postgres' }
+];
+getEl('sec-ports-tbody').querySelectorAll = (sel) => sel === 'tr[data-search]' ? mockRows : [];
+getEl('sec-ports-filter').value = 'postgres';
+sandbox.filterPortsTable();
+if (mockRows[0].style.display !== 'none') throw new Error('Filter failed to hide nginx row');
+if (mockRows[1].style.display !== '') throw new Error('Filter hid matching postgres row');
+console.log('OK');
+"""
+        proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"Node VM test failed: {proc.stderr or proc.stdout}")
+        self.assertIn("OK", proc.stdout)
+
+    def test_refinement_1_packages_navbar_single_badge_no_duplicates(self):
+        """Verify #nav-tab-packages has single #nav-badge-packages and no duplicate #nav-tab-packages-badge."""
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="nav-badge-packages"', html)
+        self.assertNotIn("nav-tab-packages-badge", html)
+        self.assertIn("nav-badge-packages", js)
+        self.assertNotIn("nav-tab-packages-badge", js)
+
+    def test_refinement_2_packages_real_installation_contracts(self):
+        """Verify frontend and backend contracts for real package installation vs simulation."""
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="btn-install-all-packages"', html)
+        self.assertIn('id="btn-pkg-modal-install"', html)
+        self.assertIn("btn-install-single", js)
+        self.assertIn("btn-upgrade-single", js)
+        self.assertIn("async function installPackageUpgrade(", js)
+        self.assertIn("dry_run: false", js)
+
+    def test_refinement_3_cpu_core_graph_zero_percent_visibility_vm(self):
+        """Verify drawCpuCoreGraph renders 0% Y-axis label without clipping and keeps 0% traces above baseline."""
+        import subprocess
+        root = Path(__file__).parent
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+const idx = code.indexOf('function drawCpuCoreGraph(');
+if (idx === -1) throw new Error('drawCpuCoreGraph not found');
+let depth = 0, started = false, i = idx;
+while (i < code.length) {
+  if (code[i] === '{') { depth++; started = true; }
+  else if (code[i] === '}') { depth--; if (started && depth === 0) { i++; break; } }
+  i++;
+}
+const fnSource = code.slice(idx, i);
+
+const texts = [];
+const linePoints = [];
+const mockCtx = {
+  save() {},
+  restore() {},
+  scale() {},
+  clearRect() {},
+  fillRect() {},
+  beginPath() {},
+  closePath() {},
+  fill() {},
+  arc() {},
+  createLinearGradient: () => ({ addColorStop() {} }),
+  moveTo(x, y) { linePoints.push({ type: 'move', x, y }); },
+  lineTo(x, y) { linePoints.push({ type: 'line', x, y }); },
+  stroke() {},
+  fillText(text, x, y) { texts.push({ text: String(text), x, y }); },
+  setLineDash() {},
+  strokeStyle: '',
+  fillStyle: '',
+  lineWidth: 1,
+  font: '',
+  textAlign: '',
+  textBaseline: '',
+  lineJoin: '',
+  lineCap: '',
+};
+const canvas = {
+  width: 600,
+  height: 220,
+  getBoundingClientRect: () => ({ width: 600, height: 220 }),
+  getContext: () => mockCtx,
+};
+
+const sandbox = {
+  window: { devicePixelRatio: 1 },
+  CPU_CORE_HISTORY_LIMIT: 40,
+  CPU_CORE_COLORS: ['#38bdf8', '#34d399'],
+};
+vm.createContext(sandbox);
+vm.runInContext(fnSource, sandbox);
+
+sandbox.drawCpuCoreGraph(canvas, [[0, 0, 0, 0], [0, 0, 0, 0]]);
+const zeroLabel = texts.find(t => t.text === '0%');
+if (!zeroLabel) throw new Error('0% Y-axis label was not rendered!');
+if (zeroLabel.y > canvas.height - 6 || zeroLabel.y < 10) {
+  throw new Error('0% label Y coordinate is clipped: ' + zeroLabel.y);
+}
+// Bottom baseline is height - padBottom = 220 - 18 = 202 (+0.5 = 202.5).
+// 0% core trace should be drawn above 202.5 (i.e. y = 200).
+const traceMoves = linePoints.filter(p => p.type === 'move' && p.y !== 202.5 && p.y > 190);
+if (traceMoves.length === 0) throw new Error('No 0% core trace drawn');
+if (traceMoves[0].y >= zeroLabel.y) {
+  throw new Error('0% trace is not offset above baseline: traceY=' + traceMoves[0].y + ', baseY=' + zeroLabel.y);
+}
+console.log('OK');
+"""
+        proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"drawCpuCoreGraph VM test failed: {proc.stderr or proc.stdout}")
+        self.assertIn("OK", proc.stdout)
+
+    def test_refinement_4_docker_volumes_remove_and_prune_contracts(self):
+        """Verify frontend and backend contracts for Docker volume removal and pruning."""
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="btn-prune-volumes"', html)
+        self.assertIn("Prune Unused Volumes", html)
+        self.assertIn("async function handlePruneVolumes(", js)
+        self.assertIn("async function handleRemoveVolume(", js)
+        self.assertIn("/api/docker/volumes/prune", js)
+        self.assertIn("data-vol-delete", js)
 
 
 if __name__ == "__main__":

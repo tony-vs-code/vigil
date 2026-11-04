@@ -6051,8 +6051,132 @@ hr.overview-flow-divider {
   padding: 6px 12px;
 }
 
+/* ==========================================================================
+   Phase 3: Network Security, Open Ports & UFW Firewall Manager Styles
+   ========================================================================== */
 
+.security-content-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 20px;
+}
 
+@media (min-width: 1440px) {
+  .security-content-grid {
+    grid-template-columns: 1.35fr 1fr;
+    align-items: start;
+  }
+}
 
+.security-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
 
+.sec-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sec-search-box {
+  min-width: 240px;
+}
+
+@media (max-width: 640px) {
+  .sec-search-box {
+    min-width: 100%;
+    width: 100%;
+  }
+}
+
+.exposure-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.exposure-badge.exp-public {
+  background: rgba(245, 158, 11, 0.16);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+}
+
+.exposure-badge.exp-local {
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+#sec-ports-table th,
+#sec-ports-table td,
+#sec-firewall-table th,
+#sec-firewall-table td {
+  vertical-align: middle;
+}
+
+.btn-port-add-rule {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(56, 189, 248, 0.08);
+  color: var(--accent-primary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-port-add-rule:hover {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.btn-icon-danger,
+.btn-firewall-delete-rule {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-icon-danger:hover,
+.btn-firewall-delete-rule:hover {
+  background: rgba(239, 68, 68, 0.24);
+  border-color: rgba(239, 68, 68, 0.55);
+  color: #fca5a5;
+}
+
+#firewall-modal .firewall-modal-card {
+  max-width: 520px;
+  width: 95vw;
+}
+
+.security-icon-badge {
+  background: rgba(56, 189, 248, 0.15);
+  color: var(--accent-primary);
+}
 
