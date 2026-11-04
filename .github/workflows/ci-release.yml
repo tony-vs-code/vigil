@@ -37,7 +37,7 @@ jobs:
   release:
     name: Tag, Build & Publish GitHub Release
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository with full history and tags
@@ -54,9 +54,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
 
-      - name: Determine version, auto-bump if merged PR, build packages, and publish Release
+      - name: Determine version, build packages, and publish Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -70,10 +71,13 @@ jobs:
           TAG_EXISTS=0
           if git rev-parse "$TAG" >/dev/null 2>&1 || gh release view "$TAG" >/dev/null 2>&1; then
             TAG_EXISTS=1
-            echo "Tag ${TAG} already exists. Auto-bumping patch version for merged changes..."
           fi
 
           if [ "$TAG_EXISTS" -eq 1 ]; then
+            if [ "${EVENT_NAME}" != "workflow_dispatch" ]; then
+              echo "Tag ${TAG} already exists. Skipping release (releases are published only when version in pyproject.toml is bumped by release-manager or via workflow_dispatch)."
+              exit 0
+            fi
             NEW_VER=$(python3 .github/scripts/release_helper.py bump-patch "$CURRENT_VER")
             TAG="v${NEW_VER}"
             echo "Auto-bumped version to: ${NEW_VER} (tag: ${TAG})"
