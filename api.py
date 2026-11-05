@@ -2182,6 +2182,56 @@ class UfwRuleRequest(BaseModel):
     from_ip: Optional[str] = None
 
 
+class SshIpBanRequest(BaseModel):
+    action: str
+    ip: str
+
+
+@app.get("/api/network/security")
+def api_network_security(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return main.get_network_security_telemetry()
+    except Exception as exc:
+        logging.error(f"Error fetching network security telemetry: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch network security telemetry: {exc}"
+        )
+
+
+@app.get("/api/network/ssh-security")
+def api_network_ssh_security(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return main.get_ssh_security_telemetry()
+    except Exception as exc:
+        logging.error(f"Error fetching SSH security telemetry: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch SSH security telemetry: {exc}"
+        )
+
+
+@app.post("/api/network/ssh-security/ban")
+def api_manage_ssh_ip_ban(
+    payload: SshIpBanRequest,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    client_ip = request.client.host if request.client else ""
+    actor = _user.get("username", "admin") if isinstance(_user, dict) else (str(_user) if _user else "admin")
+    try:
+        return main.manage_ssh_ip_ban(
+            action=payload.action,
+            ip_address=payload.ip,
+            actor=actor,
+            client_ip=client_ip,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to manage IP ban: {exc}")
+
+
 @app.get("/api/network/ports")
 def api_network_ports(_user: str = Depends(require_auth)) -> dict[str, Any]:
     try:
@@ -2271,6 +2321,362 @@ def api_delete_firewall_rule(
     return res
 
 
+# ============================================================================
+# Backups & Cron Scheduler Models and Endpoints
+# ============================================================================
+
+
+class BackupRunRequest(BaseModel):
+    target_type: str = "directory"
+    source_path: str = ""
+    stack_name: str = ""
+    target_name: str = ""
+    excludes: list[str] = []
+    stop_containers: bool = False
+    retain_count: int = 7
+
+
+class BackupTargetRequest(BaseModel):
+    id: Optional[int] = None
+    name: str = ""
+    target_type: str = "directory"
+    source_path: str = ""
+    stack_name: str = ""
+    excludes: list[str] = []
+    stop_containers: bool = False
+    retain_count: int = 7
+
+
+class BackupRestoreRequest(BaseModel):
+    destination_path: Optional[str] = ""
+
+
+class CronJobRequest(BaseModel):
+    id: Optional[int] = None
+    name: str
+    task_type: str
+    cron_expression: str
+    task_config: dict[str, Any] = {}
+    enabled: bool = True
+    notify_on_failure: bool = True
+    notify_on_success: bool = False
+
+
+class CronJobToggleRequest(BaseModel):
+    enabled: Optional[bool] = None
+
+
+@app.get("/api/backups")
+def api_get_backups(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return main.get_backups_overview()
+    except Exception as exc:
+        logging.error(f"Error fetching backups overview: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch backups overview: {exc}"
+        )
+
+
+@app.post("/api/backups/run")
+def api_run_backup(
+    payload: BackupRunRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        archive = main.create_backup_archive(
+            target_type=payload.target_type,
+            source_path=payload.source_path,
+            stack_name=payload.stack_name,
+            target_name=payload.target_name,
+            excludes=payload.excludes,
+            stop_containers=payload.stop_containers,
+            retain_count=payload.retain_count,
+            actor=actor,
+        )
+        return {
+            "success": True,
+            "archive": archive,
+            "message": f"Created backup archive '{archive['filename']}' ({archive['size_human']}, {archive['file_count']} files).",
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error creating backup archive: {exc}")
+        raise HTTPException(status_code=500, detail=f"Backup failed: {exc}")
+
+
+@app.post("/api/backups/targets")
+def api_save_backup_target(
+    payload: BackupTargetRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        target = main.save_backup_target(
+            payload.model_dump(),
+            actor=actor,
+        )
+        return {
+            "success": True,
+            "target": target,
+            "message": f"Backup target '{target['name']}' saved.",
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error saving backup target: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save backup target: {exc}"
+        )
+
+
+@app.delete("/api/backups/targets/{target_id}")
+def api_delete_backup_target(
+    target_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        return main.delete_backup_target(target_id=target_id, actor=actor)
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error deleting backup target {target_id}: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete backup target: {exc}"
+        )
+
+
+@app.get("/api/backups/archives/{filename}/download")
+def api_download_backup_archive(
+    filename: str,
+    _user: str = Depends(require_auth),
+):
+    try:
+        clean_filename = main._validate_archive_filename(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    backups_dir = main.get_backups_dir().resolve()
+    archive_path = (backups_dir / clean_filename).resolve()
+    if archive_path != backups_dir and backups_dir not in archive_path.parents:
+        raise HTTPException(status_code=400, detail="Path traversal detected")
+    if not archive_path.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"Backup archive '{clean_filename}' not found."
+        )
+
+    return FileResponse(
+        path=str(archive_path),
+        filename=clean_filename,
+        media_type="application/gzip",
+    )
+
+
+@app.post("/api/backups/archives/{filename}/restore")
+def api_restore_backup_archive(
+    filename: str,
+    payload: Optional[BackupRestoreRequest] = None,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    dest_path = (
+        payload.destination_path if payload and payload.destination_path else ""
+    )
+    try:
+        res = main.restore_backup_archive(
+            filename=filename,
+            destination_path=dest_path,
+            actor=actor,
+        )
+        return {
+            "success": True,
+            "result": res,
+            "message": f"Successfully restored {res['restored_files']} files to '{res['destination_path']}'.",
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error restoring backup archive {filename}: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to restore archive: {exc}"
+        )
+
+
+@app.delete("/api/backups/archives/{filename}")
+def api_delete_backup_archive(
+    filename: str,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        return main.delete_backup_archive(filename=filename, actor=actor)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error deleting backup archive {filename}: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to delete archive: {exc}"
+        )
+
+
+# Cron Scheduler Endpoints
+
+
+@app.get("/api/cron/jobs")
+def api_get_cron_jobs(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return main.list_cron_jobs()
+    except Exception as exc:
+        logging.error(f"Error listing cron jobs: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to fetch scheduled cron jobs: {exc}"
+        )
+
+
+@app.post("/api/cron/jobs")
+def api_save_cron_job(
+    payload: CronJobRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        job = main.create_or_update_cron_job(
+            payload.model_dump(),
+            actor=actor,
+        )
+        return {
+            "success": True,
+            "job": job,
+            "message": f"Cron job '{job['name']}' ({job['cron_expression']}) saved.",
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error saving cron job: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to save cron job: {exc}")
+
+
+@app.post("/api/cron/jobs/{job_id}/toggle")
+def api_toggle_cron_job(
+    job_id: int,
+    payload: Optional[CronJobToggleRequest] = None,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    enabled = payload.enabled if payload is not None else None
+    try:
+        job = main.toggle_cron_job(job_id=job_id, enabled=enabled, actor=actor)
+        return {
+            "success": True,
+            "job": job,
+            "message": f"Cron job '{job['name']}' is now {'enabled' if job['enabled'] else 'disabled'}.",
+        }
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error toggling cron job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to toggle cron job: {exc}")
+
+
+@app.post("/api/cron/jobs/{job_id}/run")
+def api_run_cron_job_now(
+    job_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        run = main.run_cron_job_now(
+            job_id=job_id, trigger_source="manual", actor=actor
+        )
+        return {
+            "success": True,
+            "run": run,
+            "message": f"Cron job '{run['job_name']}' executed [{run['status']}]: {run['output']}",
+        }
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error executing cron job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to run cron job: {exc}")
+
+
+@app.delete("/api/cron/jobs/{job_id}")
+def api_delete_cron_job(
+    job_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        return main.delete_cron_job(job_id=job_id, actor=actor)
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error deleting cron job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete cron job: {exc}")
+
+
 class CacheControlStaticFiles(StaticFiles):
     def file_response(
         self,
@@ -2310,6 +2716,10 @@ class CacheControlStaticFiles(StaticFiles):
 @app.get("/network/{subpath:path}")
 @app.get("/firewall")
 @app.get("/firewall/{subpath:path}")
+@app.get("/backups")
+@app.get("/backups/{subpath:path}")
+@app.get("/cron")
+@app.get("/cron/{subpath:path}")
 @app.get("/login")
 @app.get("/logs")
 def serve_index(subpath: Optional[str] = None):

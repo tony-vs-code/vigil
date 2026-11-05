@@ -6130,8 +6130,151 @@ hr.overview-flow-divider {
 #sec-ports-table th,
 #sec-ports-table td,
 #sec-firewall-table th,
-#sec-firewall-table td {
+#sec-firewall-table td,
+#sec-ssh-offenders-table th,
+#sec-ssh-offenders-table td,
+#sec-sessions-table th,
+#sec-sessions-table td,
+#sec-recent-auth-table th,
+#sec-recent-auth-table td {
   vertical-align: middle;
+}
+
+.sec-manual-ban-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.sec-manual-ban-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+.sec-manual-ban-input-wrap svg {
+  flex-shrink: 0;
+  color: #f87171;
+}
+
+.sec-ban-input {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg-card-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 6px 10px;
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.sec-ban-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.sec-ban-submit-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.sec-recent-auth-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.sec-subsection-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sec-subsection-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+
+.sec-recent-auth-table-wrap {
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.btn-ban-ip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  background: rgba(239, 68, 68, 0.14);
+  color: #f87171;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-ban-ip:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.25);
+  border-color: rgba(239, 68, 68, 0.6);
+  color: #fca5a5;
+}
+
+.btn-unban-ip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(16, 185, 129, 0.4);
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-unban-ip:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.25);
+  border-color: rgba(16, 185, 129, 0.6);
+  color: #6ee7b7;
+}
+
+.btn-ban-ip:disabled,
+.btn-unban-ip:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+@media (max-width: 640px) {
+  .sec-manual-ban-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .sec-ban-submit-btn {
+    width: 100%;
+    justify-content: center;
+  }
 }
 
 .btn-port-add-rule {
@@ -6188,4 +6331,189 @@ hr.overview-flow-divider {
   background: rgba(56, 189, 248, 0.15);
   color: var(--accent-primary);
 }
+
+/* ==========================================================================
+   Phase 4: Backups & Unified Vigil Cron Scheduler Styles
+   ========================================================================== */
+
+.backups-content-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.backups-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.backups-form-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.backups-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px 16px;
+}
+
+.backups-form-panel .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.backups-form-panel .form-group label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.backups-form-panel input[type="text"],
+.backups-form-panel input[type="number"],
+.backups-form-panel select {
+  width: 100%;
+  background: var(--bg-card-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 7px 10px;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.backups-form-panel input.mono-input {
+  font-family: var(--font-mono);
+}
+
+.backups-form-panel input:focus,
+.backups-form-panel select:focus {
+  border-color: var(--accent-primary);
+}
+
+.backups-form-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.backups-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.cron-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.backups-subsection {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.target-kind-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.target-kind-badge.kind-stack {
+  background: rgba(56, 189, 248, 0.16);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+}
+
+.target-kind-badge.kind-directory {
+  background: rgba(168, 85, 247, 0.16);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.btn-backup-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(56, 189, 248, 0.1);
+  color: var(--accent-primary);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+
+.btn-backup-action:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.2);
+  border-color: rgba(56, 189, 248, 0.5);
+}
+
+.btn-backup-action.btn-schedule {
+  background: rgba(16, 185, 129, 0.12);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.btn-backup-action.btn-schedule:hover:not(:disabled) {
+  background: rgba(16, 185, 129, 0.24);
+  border-color: rgba(16, 185, 129, 0.55);
+}
+
+.btn-backup-action.btn-restore {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+.btn-backup-action.btn-restore:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.25);
+  border-color: rgba(245, 158, 11, 0.6);
+}
+
+.btn-backup-action:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+#backup-targets-table th,
+#backup-targets-table td,
+#backup-archives-table th,
+#backup-archives-table td,
+#cron-jobs-table th,
+#cron-jobs-table td,
+#cron-runs-table th,
+#cron-runs-table td {
+  vertical-align: middle;
+}
+
 

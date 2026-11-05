@@ -2380,7 +2380,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         ]
         self.assertEqual(headings, expected_headings)
 
-        # 2. Verify exact relative DOM order of all 11 navigation buttons
+        # 2. Verify exact relative DOM order of all 12 navigation buttons
         expected_nav_buttons = [
             ("nav-tab-overview", "view-overview"),
             ("nav-tab-raid", "view-raid"),
@@ -2391,6 +2391,7 @@ class FastAPIEndpointTests(unittest.TestCase):
             ("nav-tab-packages", "view-packages"),
             ("nav-tab-security", "view-security"),
             ("nav-tab-users", "view-users"),
+            ("nav-tab-backups", "view-backups"),
             ("nav-tab-notifications", "view-notifications"),
             ("nav-tab-audit", "view-audit"),
         ]
@@ -2410,7 +2411,7 @@ class FastAPIEndpointTests(unittest.TestCase):
         )
         self.assertEqual(
             re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[2]),
-            ["nav-tab-packages", "nav-tab-security", "nav-tab-users"],
+            ["nav-tab-packages", "nav-tab-security", "nav-tab-users", "nav-tab-backups"],
         )
         self.assertEqual(
             re.findall(r'<button\s+[^>]*id="(nav-tab-[a-z-]+)"', sections[3]),
@@ -9623,6 +9624,1354 @@ console.log('OK');
         self.assertIn("async function handleRemoveVolume(", js)
         self.assertIn("/api/docker/volumes/prune", js)
         self.assertIn("data-vol-delete", js)
+
+    @patch("main.get_ufw_firewall_status")
+    @patch("main._run_fail2ban_command")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch("psutil.users")
+    def test_get_ssh_security_telemetry_parsing_and_correlation(
+        self,
+        mock_users,
+        mock_which,
+        mock_run,
+        mock_f2b_cmd,
+        mock_ufw_status,
+    ):
+        """Verify get_ssh_security_telemetry parses active sessions, last logins, fail2ban, UFW bans, and auth.log failures."""
+        from collections import namedtuple
+        SUser = namedtuple("SUser", ["name", "terminal", "host", "started", "pid"])
+        mock_users.return_value = [
+            SUser(name="anthony", terminal="pts/0", host="198.51.100.25", started=1700000000.0, pid=1234),
+            SUser(name="root", terminal="tty1", host="", started=1700000100.0, pid=5678),
+        ]
+
+        def fake_which(cmd):
+            if cmd in ("last", "fail2ban-client"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        mock_which.side_effect = fake_which
+
+        last_proc = MagicMock()
+        last_proc.returncode = 0
+        last_proc.stdout = (
+            "anthony  pts/0        Tue Nov 14 10:00   still logged in   198.51.100.25\n"
+            "reboot   system boot  Tue Nov 14 09:00   still running     6.8.0-generic\n"
+            "admin    pts/1        Mon Nov 13 18:20 - 19:00  (00:40)    203.0.113.10\n"
+            "\n"
+            "wtmp begins Mon Nov  1 00:00:00 2026\n"
+        )
+        mock_run.return_value = last_proc
+
+        f2b_output = (
+            "Status for the jail: sshd\n"
+            "|- Filter\n"
+            "|  |- Currently failed:\t3\n"
+            "|  |- Total failed:\t42\n"
+            "|  `- File list:\t/var/log/auth.log\n"
+            "`- Actions\n"
+            "   |- Currently banned:\t2\n"
+            "   |- Total banned:\t7\n"
+            "   `- Banned IP list:\t203.0.113.50 198.51.100.99\n"
+        )
+        mock_f2b_cmd.return_value = (True, f2b_output)
+
+        mock_ufw_status.return_value = {
+            "available": True,
+            "enabled": True,
+            "default_incoming": "deny",
+            "default_outgoing": "allow",
+            "rules": [
+                {"index": 1, "to_port": "Anywhere", "proto": "any", "action": "DENY", "from_ip": "203.0.113.50", "v6": False},
+                {"index": 2, "to_port": "22", "proto": "tcp", "action": "REJECT", "from_ip": "192.0.2.88", "v6": False},
+                {"index": 3, "to_port": "80", "proto": "tcp", "action": "ALLOW", "from_ip": "Anywhere", "v6": False},
+                {"index": 4, "to_port": "53", "proto": "udp", "action": "DENY", "from_ip": "Anywhere", "v6": False},
+            ],
+        }
+
+        sample_auth_log = "\n".join([
+            "2026-11-04T12:01:01Z server sshd[1001]: Failed password for invalid user admin from 203.0.113.50 port 54321 ssh2",
+            "2026-11-04T12:01:05Z server sshd[1002]: Failed password for root from 203.0.113.50 port 54322 ssh2",
+            "2026-11-04T12:02:10Z server sshd[1003]: Invalid user deploy from 198.51.100.77 port 41111",
+            "2026-11-04T12:03:15Z server sshd[1004]: Connection closed by authenticating user ubuntu 198.51.100.77 port 41112 [preauth]",
+            "2026-11-04T12:04:20Z server sshd[1005]: Disconnecting invalid user oracle 203.0.113.50 port 54329 [preauth]",
+            "2026-11-04T12:05:00Z server sshd[1006]: PAM 2 more authentication failures; logname= uid=0 euid=0 tty=ssh rhost=198.51.100.200  user=root",
+        ])
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+            tf.write(sample_auth_log)
+            temp_log_path = Path(tf.name)
+
+        try:
+            with patch.object(main, "SSH_AUTH_LOG_PATH", temp_log_path):
+                telemetry = main.get_ssh_security_telemetry()
+        finally:
+            temp_log_path.unlink(missing_ok=True)
+
+        # Active sessions
+        self.assertEqual(len(telemetry["active_sessions"]), 2)
+        self.assertEqual(telemetry["active_sessions"][0]["username"], "anthony")
+        self.assertEqual(telemetry["active_sessions"][0]["host"], "198.51.100.25")
+        self.assertEqual(telemetry["active_sessions"][0]["pid"], 1234)
+        self.assertEqual(telemetry["active_sessions"][1]["username"], "root")
+        self.assertEqual(telemetry["active_sessions"][1]["host"], "local")
+
+        # Recent logins
+        self.assertEqual(len(telemetry["recent_logins"]), 2)
+        self.assertEqual(telemetry["recent_logins"][0]["username"], "anthony")
+        self.assertEqual(telemetry["recent_logins"][0]["host"], "198.51.100.25")
+        self.assertEqual(telemetry["recent_logins"][1]["username"], "admin")
+        self.assertEqual(telemetry["recent_logins"][1]["host"], "203.0.113.10")
+
+        # Fail2ban
+        f2b = telemetry["fail2ban"]
+        self.assertTrue(f2b["installed"])
+        self.assertTrue(f2b["active"])
+        self.assertEqual(f2b["jail"], "sshd")
+        self.assertEqual(f2b["currently_failed"], 3)
+        self.assertEqual(f2b["total_failed"], 42)
+        self.assertEqual(f2b["currently_banned"], 2)
+        self.assertEqual(f2b["total_banned"], 7)
+        self.assertEqual(f2b["banned_ips"], ["203.0.113.50", "198.51.100.99"])
+
+        # UFW & unified banned IPs
+        self.assertEqual(telemetry["ufw_banned_ips"], ["203.0.113.50", "192.0.2.88"])
+        banned_map = {item["ip"]: item["sources"] for item in telemetry["banned_ips"]}
+        self.assertEqual(banned_map["203.0.113.50"], ["ufw", "fail2ban"])
+        self.assertEqual(banned_map["192.0.2.88"], ["ufw"])
+        self.assertEqual(banned_map["198.51.100.99"], ["fail2ban"])
+
+        # Brute-force log parsing
+        self.assertEqual(telemetry["failed_attempts_total"], 6)
+        self.assertEqual(len(telemetry["recent_failures"]), 6)
+        self.assertEqual(telemetry["recent_failures"][0]["ip"], "198.51.100.200")
+        self.assertEqual(telemetry["recent_failures"][0]["username"], "root")
+
+        # Top offenders (sorted by is_banned desc, count desc; includes zero-count banned IPs)
+        offenders = telemetry["top_offenders"]
+        offender_by_ip = {o["ip"]: o for o in offenders}
+        self.assertIn("203.0.113.50", offender_by_ip)
+        self.assertEqual(offender_by_ip["203.0.113.50"]["count"], 3)
+        self.assertEqual(offender_by_ip["203.0.113.50"]["targeted_users"], ["admin", "oracle", "root"])
+        self.assertTrue(offender_by_ip["203.0.113.50"]["is_banned"])
+        self.assertEqual(offender_by_ip["203.0.113.50"]["ban_sources"], ["ufw", "fail2ban"])
+
+        # Banned IPs with 0 log occurrences must also appear in top_offenders so user can unban them
+        self.assertIn("192.0.2.88", offender_by_ip)
+        self.assertEqual(offender_by_ip["192.0.2.88"]["count"], 0)
+        self.assertTrue(offender_by_ip["192.0.2.88"]["is_banned"])
+
+        self.assertIn("198.51.100.99", offender_by_ip)
+        self.assertEqual(offender_by_ip["198.51.100.99"]["count"], 0)
+        self.assertTrue(offender_by_ip["198.51.100.99"]["is_banned"])
+
+        # Unbanned attacker with 2 failures
+        self.assertIn("198.51.100.77", offender_by_ip)
+        self.assertEqual(offender_by_ip["198.51.100.77"]["count"], 2)
+        self.assertFalse(offender_by_ip["198.51.100.77"]["is_banned"])
+        self.assertEqual(offender_by_ip["198.51.100.77"]["targeted_users"], ["deploy", "ubuntu"])
+
+        # First entry in top_offenders should be banned with highest count (203.0.113.50)
+        self.assertEqual(offenders[0]["ip"], "203.0.113.50")
+
+    @patch("main.get_ssh_security_telemetry")
+    @patch("main.get_ufw_firewall_status")
+    @patch("main._run_fail2ban_command")
+    @patch("main._run_ufw_command")
+    @patch("shutil.which")
+    def test_manage_ssh_ip_ban_and_validation(
+        self,
+        mock_which,
+        mock_ufw_cmd,
+        mock_f2b_cmd,
+        mock_fw_status,
+        mock_ssh_telemetry,
+    ):
+        """Verify manage_ssh_ip_ban ban/unban execution, audit events, and validation against loopback/self-lockout."""
+        mock_which.return_value = "/usr/bin/fail2ban-client"
+        mock_ufw_cmd.return_value = (True, "Rule added")
+        mock_f2b_cmd.return_value = (True, "1")
+        mock_fw_status.return_value = {
+            "available": True,
+            "enabled": True,
+            "rules": [
+                {"index": 2, "to_port": "Anywhere", "proto": "any", "action": "DENY", "from_ip": "203.0.113.50", "v6": False}
+            ],
+        }
+        mock_ssh_telemetry.return_value = {"active_sessions": [], "banned_ips": []}
+
+        # 1. Invalid action
+        with self.assertRaises(ValueError):
+            main.manage_ssh_ip_ban("drop", "203.0.113.50")
+
+        # 2. Invalid IP
+        with self.assertRaises(ValueError):
+            main.manage_ssh_ip_ban("ban", "999.999.999.999")
+        with self.assertRaises(ValueError):
+            main.manage_ssh_ip_ban("ban", "")
+
+        # 3. Loopback & unspecified protection
+        for forbidden_ip in ("127.0.0.1", "::1", "localhost", "0.0.0.0", "::", "127.0.0.0/8"):
+            with self.assertRaises(ValueError):
+                main.manage_ssh_ip_ban("ban", forbidden_ip)
+
+        # 4. Self-lockout protection (single IP and CIDR containing client_ip)
+        with self.assertRaises(ValueError) as ctx:
+            main.manage_ssh_ip_ban("ban", "198.51.100.42", actor="admin", client_ip="198.51.100.42")
+        self.assertIn("Self-lockout", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx2:
+            main.manage_ssh_ip_ban("ban", "198.51.100.0/24", actor="admin", client_ip="198.51.100.42")
+        self.assertIn("Self-lockout", str(ctx2.exception))
+
+        # 5. Successful ban
+        res_ban = main.manage_ssh_ip_ban("ban", "203.0.113.50", actor="admin", client_ip="198.51.100.42")
+        self.assertEqual(res_ban["status"], "ok")
+        self.assertEqual(res_ban["action"], "ban")
+        self.assertEqual(res_ban["ip"], "203.0.113.50")
+        mock_ufw_cmd.assert_any_call(["ufw", "insert", "1", "deny", "from", "203.0.113.50", "to", "any"])
+        mock_f2b_cmd.assert_any_call(["fail2ban-client", "set", "sshd", "banip", "203.0.113.50"])
+
+        ban_logs, ban_count = main.get_audit_logs(event_type="security.ip.banned")
+        self.assertGreaterEqual(ban_count, 1)
+        self.assertEqual(ban_logs[0]["actor"], "admin")
+        self.assertEqual(ban_logs[0]["metadata"]["target"], "203.0.113.50")
+
+        # 6. Fallback when ufw insert 1 fails (e.g. empty rule table)
+        mock_ufw_cmd.reset_mock()
+        mock_ufw_cmd.side_effect = [(False, "Invalid position '1'"), (True, "Rule added")]
+        res_ban_cidr = main.manage_ssh_ip_ban("ban", "203.0.113.0/24", actor="admin", client_ip="198.51.100.42")
+        self.assertEqual(res_ban_cidr["status"], "ok")
+        self.assertEqual(res_ban_cidr["ip"], "203.0.113.0/24")
+        self.assertEqual(mock_ufw_cmd.call_count, 2)
+        mock_ufw_cmd.assert_any_call(["ufw", "deny", "from", "203.0.113.0/24", "to", "any"])
+
+        # 7. Successful unban
+        mock_ufw_cmd.reset_mock()
+        mock_ufw_cmd.side_effect = None
+        mock_ufw_cmd.return_value = (True, "Rule deleted")
+        res_unban = main.manage_ssh_ip_ban("unban", "203.0.113.50", actor="admin", client_ip="198.51.100.42")
+        self.assertEqual(res_unban["status"], "ok")
+        self.assertEqual(res_unban["action"], "unban")
+        self.assertEqual(res_unban["ip"], "203.0.113.50")
+        mock_ufw_cmd.assert_any_call(["ufw", "--force", "delete", "deny", "from", "203.0.113.50", "to", "any"])
+        mock_ufw_cmd.assert_any_call(["ufw", "--force", "delete", "2"])
+        mock_f2b_cmd.assert_any_call(["fail2ban-client", "set", "sshd", "unbanip", "203.0.113.50"])
+
+        unban_logs, unban_count = main.get_audit_logs(event_type="security.ip.unbanned")
+        self.assertGreaterEqual(unban_count, 1)
+        self.assertEqual(unban_logs[0]["metadata"]["target"], "203.0.113.50")
+
+    @patch("main.manage_ssh_ip_ban")
+    @patch("main.get_ssh_security_telemetry")
+    def test_api_ssh_security_endpoints(self, mock_ssh_telemetry, mock_manage_ban):
+        """Verify GET /api/network/ssh-security and POST /api/network/ssh-security/ban endpoints."""
+        # Unauthenticated requests must return 401
+        self.assertEqual(asgi_get(api.app, "/api/network/ssh-security").status_code, 401)
+        self.assertEqual(
+            asgi_post(api.app, "/api/network/ssh-security/ban", json_body={"action": "ban", "ip": "203.0.113.50"}).status_code,
+            401,
+        )
+
+        mock_ssh_telemetry.return_value = {
+            "active_sessions": [{"username": "admin", "terminal": "pts/0", "host": "local", "started": 1700000000.0, "started_iso": "2023-11-14 22:13:20", "pid": 111}],
+            "recent_logins": [],
+            "fail2ban": {"installed": True, "active": True, "jail": "sshd", "currently_failed": 0, "total_failed": 0, "currently_banned": 1, "total_banned": 1, "banned_ips": ["203.0.113.50"]},
+            "ufw_banned_ips": ["203.0.113.50"],
+            "banned_ips": [{"ip": "203.0.113.50", "sources": ["ufw", "fail2ban"]}],
+            "failed_attempts_total": 5,
+            "top_offenders": [{"ip": "203.0.113.50", "count": 5, "targeted_users": ["root"], "last_seen": "Nov  4 12:00:00", "is_banned": True, "ban_sources": ["ufw", "fail2ban"]}],
+            "recent_failures": [],
+        }
+
+        resp_get = asgi_get(api.app, "/api/network/ssh-security", cookies=self.auth_cookies)
+        self.assertEqual(resp_get.status_code, 200)
+        data = resp_get.json()
+        self.assertEqual(data["failed_attempts_total"], 5)
+        self.assertEqual(len(data["active_sessions"]), 1)
+        self.assertEqual(data["banned_ips"][0]["ip"], "203.0.113.50")
+
+        mock_manage_ban.return_value = {
+            "status": "ok",
+            "action": "ban",
+            "ip": "203.0.113.50",
+            "message": "Banned IP 203.0.113.50",
+            "ssh_security": mock_ssh_telemetry.return_value,
+            "firewall": {"available": True, "enabled": True, "rules": []},
+        }
+        resp_post = asgi_post(
+            api.app,
+            "/api/network/ssh-security/ban",
+            json_body={"action": "ban", "ip": "203.0.113.50"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(resp_post.status_code, 200)
+        self.assertEqual(resp_post.json()["status"], "ok")
+        mock_manage_ban.assert_called_once()
+
+        # ValueError -> 400
+        mock_manage_ban.side_effect = ValueError("Cannot ban loopback address '127.0.0.1'.")
+        resp_400 = asgi_post(
+            api.app,
+            "/api/network/ssh-security/ban",
+            json_body={"action": "ban", "ip": "127.0.0.1"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(resp_400.status_code, 400)
+        self.assertIn("loopback", resp_400.json()["detail"])
+
+        # RuntimeError -> 500
+        mock_manage_ban.side_effect = RuntimeError("UFW execution failed")
+        resp_500 = asgi_post(
+            api.app,
+            "/api/network/ssh-security/ban",
+            json_body={"action": "ban", "ip": "203.0.113.99"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(resp_500.status_code, 500)
+        self.assertIn("UFW execution failed", resp_500.json()["detail"])
+
+        # GET /api/network/security unauthenticated -> 401
+        self.assertEqual(asgi_get(api.app, "/api/network/security").status_code, 401)
+
+        # GET /api/network/security authenticated -> 200 with ports, summary, firewall, ssh_security
+        with (
+            patch("main.get_open_listening_ports", return_value=[]),
+            patch("main.get_ufw_firewall_status", return_value={"available": True, "enabled": True, "rules": []}),
+        ):
+            resp_net_sec = asgi_get(api.app, "/api/network/security", cookies=self.auth_cookies)
+            self.assertEqual(resp_net_sec.status_code, 200)
+            net_sec_data = resp_net_sec.json()
+            self.assertIn("ports", net_sec_data)
+            self.assertIn("summary", net_sec_data)
+            self.assertIn("firewall", net_sec_data)
+            self.assertIn("ssh_security", net_sec_data)
+            self.assertEqual(net_sec_data["ssh_security"]["failed_attempts_total"], 5)
+
+    def test_feature_b_ssh_security_frontend_dom_and_vm_contracts(self):
+        """Verify Feature B SSH Intrusion Detection, Active Sessions & IP Ban Manager DOM, CSS, and renderSshSecurity VM execution."""
+        import subprocess
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        required_ssh_ids = [
+            "sec-active-sessions-count",
+            "sec-failed-ssh-count",
+            "sec-banned-ips-count",
+            "sec-ssh-card",
+            "sec-fail2ban-badge",
+            "sec-ban-ip-input",
+            "sec-ban-ip-btn",
+            "sec-ssh-offenders-table",
+            "sec-ssh-offenders-tbody",
+            "sec-sessions-card",
+            "sec-sessions-badge",
+            "sec-sessions-table",
+            "sec-sessions-tbody",
+            "sec-recent-auth-table",
+            "sec-recent-auth-tbody",
+        ]
+        for dom_id in required_ssh_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        for fn_name in [
+            "function renderSshSecurity(",
+            "async function submitSshIpBan(",
+        ]:
+            self.assertIn(fn_name, js, f"Missing {fn_name} in static/app.js")
+
+        for css_sel in [
+            ".sec-manual-ban-bar",
+            ".sec-ban-input",
+            ".btn-ban-ip",
+            ".btn-unban-ip",
+            "#sec-ssh-offenders-table",
+            "#sec-sessions-table",
+            "#sec-recent-auth-table",
+        ]:
+            self.assertIn(css_sel, css, f"Missing {css_sel} in static/styles.css")
+
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  const idx = source.indexOf('function ' + name + '(');
+  if (idx === -1) throw new Error('Not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') { depth--; if (started && depth === 0) return source.slice(idx, i + 1); }
+    i++;
+  }
+  throw new Error('Unbalanced: ' + name);
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id,
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      className: '',
+    };
+  }
+  return elements[id];
+}
+
+const sandbox = {
+  document: { getElementById: getEl },
+  escapeHtml: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+};
+vm.createContext(sandbox);
+vm.runInContext(extractFunc(code, 'renderSshSecurity'), sandbox);
+
+const sshPayload = {
+  active_sessions: [
+    { username: 'anthony', terminal: 'pts/0', host: '198.51.100.25', pid: 4321, started: 1700000000, started_iso: '2026-11-04 12:00:00' }
+  ],
+  recent_logins: [
+    { username: 'anthony', terminal: 'pts/0', host: '198.51.100.25', time_range: 'Wed Nov 4 12:00 still logged in', raw: 'anthony pts/0 198.51.100.25' }
+  ],
+  fail2ban: {
+    installed: true,
+    active: true,
+    jail: 'sshd',
+    currently_failed: 2,
+    total_failed: 12,
+    currently_banned: 1,
+    total_banned: 4,
+    banned_ips: ['203.0.113.50']
+  },
+  ufw_banned_ips: ['203.0.113.50'],
+  banned_ips: [
+    { ip: '203.0.113.50', sources: ['ufw', 'fail2ban'] }
+  ],
+  failed_attempts_total: 8,
+  top_offenders: [
+    { ip: '203.0.113.50', count: 6, targeted_users: ['root', 'admin'], last_seen: '2026-11-04T12:01:05Z', is_banned: true, ban_sources: ['ufw', 'fail2ban'] },
+    { ip: '198.51.100.77', count: 2, targeted_users: ['deploy'], last_seen: '2026-11-04T12:02:10Z', is_banned: false, ban_sources: [] }
+  ],
+  recent_failures: [
+    { timestamp: '2026-11-04T12:02:10Z', ip: '198.51.100.77', username: 'deploy', reason: 'Invalid user' }
+  ]
+};
+
+sandbox.renderSshSecurity(sshPayload);
+
+if (getEl('sec-active-sessions-count').textContent !== '1') throw new Error('Bad active sessions count: ' + getEl('sec-active-sessions-count').textContent);
+if (getEl('sec-failed-ssh-count').textContent !== '8') throw new Error('Bad failed ssh count: ' + getEl('sec-failed-ssh-count').textContent);
+if (getEl('sec-banned-ips-count').textContent !== '1 Banned') throw new Error('Bad banned ips count: ' + getEl('sec-banned-ips-count').textContent);
+if (!getEl('sec-fail2ban-badge').textContent.includes('FAIL2BAN: ACTIVE (1 Banned)')) throw new Error('Bad fail2ban badge: ' + getEl('sec-fail2ban-badge').textContent);
+if (!getEl('sec-ssh-offenders-tbody').innerHTML.includes('data-unban-ip="203.0.113.50"')) throw new Error('Missing unban button for 203.0.113.50');
+if (!getEl('sec-ssh-offenders-tbody').innerHTML.includes('BANNED (UFW + FAIL2BAN)')) throw new Error('Missing BANNED (UFW + FAIL2BAN) badge');
+if (!getEl('sec-ssh-offenders-tbody').innerHTML.includes('data-ban-ip="198.51.100.77"')) throw new Error('Missing ban button for 198.51.100.77');
+if (getEl('sec-sessions-badge').textContent !== '1 Active') throw new Error('Bad sessions badge: ' + getEl('sec-sessions-badge').textContent);
+if (!getEl('sec-sessions-tbody').innerHTML.includes('anthony') || !getEl('sec-sessions-tbody').innerHTML.includes('pts/0')) throw new Error('Missing active session row');
+if (!getEl('sec-recent-auth-tbody').innerHTML.includes('AUTH FAIL') || !getEl('sec-recent-auth-tbody').innerHTML.includes('LOGIN')) throw new Error('Missing recent auth fail or login rows');
+console.log('OK');
+"""
+        proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"renderSshSecurity VM test failed: {proc.stderr or proc.stdout}")
+        self.assertIn("OK", proc.stdout)
+
+
+class TestBackupsAndCronScheduler(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_backups_cron.db"
+        main.init_state_db(self.db_path)
+        self.db_patcher1 = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher2 = patch.object(main, "STATE_DB_PATH", self.db_path)
+        self.db_patcher1.start()
+        self.db_patcher2.start()
+
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+        self.auth_headers = {"Authorization": f"Bearer {self.session_token}"}
+
+        self.sample_src = Path(self.temp_dir.name) / "sample_data"
+        self.sample_src.mkdir(parents=True, exist_ok=True)
+        (self.sample_src / "app.py").write_text("print('hello world')", encoding="utf-8")
+        (self.sample_src / "config.json").write_text('{"env": "test"}', encoding="utf-8")
+        (self.sample_src / "debug.log").write_text("dummy log content", encoding="utf-8")
+        sub_dir = self.sample_src / "sub"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        (sub_dir / "data.txt").write_text("sub file content", encoding="utf-8")
+
+    def tearDown(self):
+        self.db_patcher2.stop()
+        self.db_patcher1.stop()
+        self.temp_dir.cleanup()
+
+    def test_get_backups_dir_resolution(self):
+        backups_dir = main.get_backups_dir(self.db_path)
+        self.assertTrue(backups_dir.exists())
+        self.assertTrue(backups_dir.is_dir())
+        self.assertEqual(backups_dir, self.db_path.parent / "backups")
+
+        custom_env_dir = Path(self.temp_dir.name) / "custom_env_backups"
+        with patch.dict(os.environ, {"VIGIL_BACKUP_DIR": str(custom_env_dir)}):
+            resolved = main.get_backups_dir(self.db_path)
+            self.assertEqual(resolved, custom_env_dir)
+            self.assertTrue(custom_env_dir.is_dir())
+
+    def test_security_guards_path_validation(self):
+        with self.assertRaises(ValueError):
+            main._validate_safe_host_directory("/", purpose="test")
+        with self.assertRaises(ValueError):
+            main._validate_safe_host_directory("/proc", purpose="test")
+        with self.assertRaises(ValueError):
+            main._validate_safe_host_directory("/sys/kernel", purpose="test")
+        with self.assertRaises(ValueError):
+            main._validate_safe_host_directory("", purpose="test")
+
+        with self.assertRaises(ValueError):
+            main._validate_archive_filename("../etc/passwd")
+        with self.assertRaises(ValueError):
+            main._validate_archive_filename("subdir/test.tar.gz")
+        with self.assertRaises(ValueError):
+            main._validate_archive_filename("")
+
+    def test_create_backup_archive_with_excludes_retention_and_sha256(self):
+        archive1 = main.create_backup_archive(
+            target_type="directory",
+            source_path=str(self.sample_src),
+            target_name="retention-demo",
+            excludes=["*.log"],
+            retain_count=2,
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertEqual(archive1["target_type"], "directory")
+        self.assertEqual(archive1["target_name"], "retention-demo")
+        self.assertEqual(archive1["file_count"], 3)  # app.py, config.json, sub/data.txt
+        self.assertEqual(len(archive1["sha256"]), 64)
+        self.assertGreater(archive1["size_bytes"], 0)
+        self.assertTrue(archive1["exists_on_disk"])
+
+        # Check archive exists in list
+        archives = main.list_backup_archives(self.db_path)
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0]["filename"], archive1["filename"])
+
+        # Create 2 more archives to test retain_count=2 pruning
+        time.sleep(1.05)  # Ensure unique second timestamp
+        archive2 = main.create_backup_archive(
+            target_type="directory",
+            source_path=str(self.sample_src),
+            target_name="retention-demo",
+            retain_count=2,
+            actor="admin",
+            db_path=self.db_path,
+        )
+        time.sleep(1.05)
+        archive3 = main.create_backup_archive(
+            target_type="directory",
+            source_path=str(self.sample_src),
+            target_name="retention-demo",
+            retain_count=2,
+            actor="admin",
+            db_path=self.db_path,
+        )
+
+        archives_after = main.list_backup_archives(self.db_path)
+        self.assertEqual(len(archives_after), 2)
+        archive_names = [a["filename"] for a in archives_after]
+        self.assertIn(archive3["filename"], archive_names)
+        self.assertIn(archive2["filename"], archive_names)
+        self.assertNotIn(archive1["filename"], archive_names)
+
+        # File for archive1 was pruned from disk
+        backups_dir = main.get_backups_dir(self.db_path)
+        self.assertFalse((backups_dir / archive1["filename"]).exists())
+
+    def test_restore_and_delete_backup_archive(self):
+        archive = main.create_backup_archive(
+            target_type="directory",
+            source_path=str(self.sample_src),
+            target_name="restore-test",
+            excludes=["*.log"],
+            retain_count=5,
+            actor="admin",
+            db_path=self.db_path,
+        )
+
+        restore_dest = Path(self.temp_dir.name) / "restore_dest"
+        restore_dest.mkdir(parents=True, exist_ok=True)
+        res = main.restore_backup_archive(
+            filename=archive["filename"],
+            destination_path=str(restore_dest),
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertTrue(res["restored"])
+        self.assertEqual(res["restored_files"], 3)
+        self.assertTrue((restore_dest / "sample_data" / "app.py").is_file())
+        self.assertEqual(
+            (restore_dest / "sample_data" / "app.py").read_text(encoding="utf-8"),
+            "print('hello world')",
+        )
+        self.assertFalse((restore_dest / "sample_data" / "debug.log").exists())
+
+        # Unsafe destination rejected
+        with self.assertRaises(ValueError):
+            main.restore_backup_archive(
+                filename=archive["filename"],
+                destination_path="/",
+                actor="admin",
+                db_path=self.db_path,
+            )
+
+        # Nonexistent archive restore raises FileNotFoundError
+        with self.assertRaises(FileNotFoundError):
+            main.restore_backup_archive(
+                filename="nonexistent-archive.tar.gz",
+                destination_path=str(restore_dest),
+                actor="admin",
+                db_path=self.db_path,
+            )
+
+        # Delete archive
+        del_res = main.delete_backup_archive(
+            archive["filename"], actor="admin", db_path=self.db_path
+        )
+        self.assertTrue(del_res["deleted"])
+        self.assertEqual(len(main.list_backup_archives(self.db_path)), 0)
+
+        # Deleting again raises FileNotFoundError
+        with self.assertRaises(FileNotFoundError):
+            main.delete_backup_archive(
+                archive["filename"], actor="admin", db_path=self.db_path
+            )
+
+    def test_save_list_and_delete_backup_target(self):
+        target = main.save_backup_target(
+            target_data={
+                "name": "Project Data",
+                "target_type": "directory",
+                "source_path": str(self.sample_src),
+                "excludes": ["*.log", ".git/*"],
+                "retain_count": 5,
+            },
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertGreater(target["id"], 0)
+        self.assertEqual(target["name"], "Project Data")
+        self.assertEqual(target["excludes"], ["*.log", ".git/*"])
+
+        saved = main.list_backup_targets(self.db_path)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["id"], target["id"])
+
+        # Update target
+        updated = main.save_backup_target(
+            target_id=target["id"],
+            name="Project Data Renamed",
+            target_type="directory",
+            source_path=str(self.sample_src),
+            retain_count=10,
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertEqual(updated["name"], "Project Data Renamed")
+        self.assertEqual(updated["retain_count"], 10)
+
+        # Delete target
+        del_res = main.delete_backup_target(target["id"], actor="admin", db_path=self.db_path)
+        self.assertTrue(del_res["deleted"])
+        self.assertEqual(len(main.list_backup_targets(self.db_path)), 0)
+
+        # Deleting again raises ValueError
+        with self.assertRaises(ValueError):
+            main.delete_backup_target(target["id"], actor="admin", db_path=self.db_path)
+
+    def test_discover_stack_backup_targets_and_overview(self):
+        # Create a mock stack dir
+        mock_stacks_dir = Path(self.temp_dir.name) / "stacks"
+        (mock_stacks_dir / "webstack").mkdir(parents=True, exist_ok=True)
+        (mock_stacks_dir / "webstack" / "docker-compose.yml").write_text(
+            "services:\n  web:\n    image: nginx\n", encoding="utf-8"
+        )
+        with patch.object(main.DOCKER_MANAGER, "stacks_dir", str(mock_stacks_dir)):
+            stacks = main.discover_stack_backup_targets(self.db_path)
+            self.assertTrue(isinstance(stacks, list))
+            matching = [s for s in stacks if s.get("stack_name") == "webstack"]
+            self.assertEqual(len(matching), 1)
+            self.assertTrue(matching[0]["exists"])
+
+            overview = main.get_backups_overview(self.db_path)
+            self.assertIn("backup_dir", overview)
+            self.assertIn("total_archives", overview)
+            self.assertIn("total_size_bytes", overview)
+            self.assertIn("stack_targets", overview)
+            self.assertIn("saved_targets", overview)
+            self.assertIn("archives", overview)
+
+    def test_cron_expression_validation_and_next_timestamp(self):
+        self.assertTrue(main.validate_cron_expression("*/5 * * * *"))
+        self.assertTrue(main.validate_cron_expression("0 0 * * *"))
+        self.assertTrue(main.validate_cron_expression("30 4 1,15 * 1-5"))
+        self.assertTrue(main.validate_cron_expression("0 12 1 jan-dec sun"))
+
+        self.assertFalse(main.validate_cron_expression("not a cron"))
+        self.assertFalse(main.validate_cron_expression("* * * *"))  # 4 fields
+        self.assertFalse(main.validate_cron_expression("60 * * * *"))  # minute out of range
+        self.assertFalse(main.validate_cron_expression("0 25 * * *"))  # hour out of range
+        self.assertFalse(main.validate_cron_expression("0 0 32 * *"))  # day out of range
+        self.assertFalse(main.validate_cron_expression("0 0 1 13 *"))  # month out of range
+        self.assertFalse(main.validate_cron_expression("0 0 1 1 8"))  # dow out of range
+
+        next_ts = main.get_next_cron_run_timestamp("*/15 * * * *", now_ts=1700000000.0)
+        self.assertGreater(next_ts, 1700000000.0)
+
+    def test_cron_job_crud_and_toggle(self):
+        job = main.create_or_update_cron_job(
+            {
+                "name": "Hourly Directory Backup",
+                "task_type": "backup.directory",
+                "cron_expression": "0 * * * *",
+                "task_config": {
+                    "source_path": str(self.sample_src),
+                    "target_name": "hourly-dir",
+                    "retain_count": 5,
+                },
+                "enabled": True,
+                "notify_on_failure": True,
+                "notify_on_success": False,
+            },
+            actor="admin",
+            db_path=self.db_path,
+        )
+        jid = job["id"]
+        self.assertGreater(jid, 0)
+        self.assertEqual(job["name"], "Hourly Directory Backup")
+        self.assertTrue(job["enabled"])
+        self.assertGreater(job["next_run_at"], 0)
+
+        # Toggle job off and on
+        toggled_off = main.toggle_cron_job(jid, enabled=False, actor="admin", db_path=self.db_path)
+        self.assertFalse(toggled_off["enabled"])
+
+        toggled_on = main.toggle_cron_job(jid, actor="admin", db_path=self.db_path)
+        self.assertTrue(toggled_on["enabled"])
+
+        # Update job
+        updated = main.create_or_update_cron_job(
+            {
+                "id": jid,
+                "name": "Bi-Hourly Directory Backup",
+                "task_type": "backup.directory",
+                "cron_expression": "0 */2 * * *",
+                "task_config": {
+                    "source_path": str(self.sample_src),
+                    "target_name": "bihourly-dir",
+                },
+                "enabled": True,
+            },
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertEqual(updated["id"], jid)
+        self.assertEqual(updated["name"], "Bi-Hourly Directory Backup")
+        self.assertEqual(updated["cron_expression"], "0 */2 * * *")
+
+        # List cron jobs
+        listing = main.list_cron_jobs(self.db_path)
+        self.assertEqual(len(listing["jobs"]), 1)
+        self.assertEqual(listing["jobs"][0]["id"], jid)
+        self.assertGreater(len(listing["supported_task_types"]), 0)
+
+        # Delete job
+        del_res = main.delete_cron_job(jid, actor="admin", db_path=self.db_path)
+        self.assertTrue(del_res["deleted"])
+        self.assertEqual(len(main.list_cron_jobs(self.db_path)["jobs"]), 0)
+
+        # Deleting non-existent job raises ValueError
+        with self.assertRaises(ValueError):
+            main.delete_cron_job(jid, actor="admin", db_path=self.db_path)
+
+    def test_run_cron_job_now_and_evaluation(self):
+        job = main.create_or_update_cron_job(
+            {
+                "name": "Immediate Backup Job",
+                "task_type": "backup.directory",
+                "cron_expression": "0 0 * * *",
+                "task_config": {
+                    "source_path": str(self.sample_src),
+                    "target_name": "immediate-backup",
+                },
+                "enabled": True,
+                "notify_on_failure": False,
+                "notify_on_success": False,
+            },
+            actor="admin",
+            db_path=self.db_path,
+        )
+        jid = job["id"]
+
+        # Run immediately
+        run_res = main.run_cron_job_now(jid, trigger_source="manual", actor="admin", db_path=self.db_path)
+        self.assertEqual(run_res["status"], "success")
+        self.assertEqual(run_res["job_id"], jid)
+        self.assertIn("Created directory backup", run_res["output"])
+
+        # Check job run history
+        listing = main.list_cron_jobs(self.db_path)
+        self.assertEqual(listing["jobs"][0]["last_status"], "success")
+        self.assertGreater(len(listing["recent_runs"]), 0)
+        self.assertEqual(listing["recent_runs"][0]["trigger_source"], "manual")
+
+        # Evaluate due cron jobs: set next_run_at to the past
+        conn = main._connect_state_db(self.db_path)
+        conn.execute("UPDATE cron_jobs SET next_run_at = ? WHERE id = ?", (time.time() - 60, jid))
+        conn.commit()
+        conn.close()
+
+        due_runs = main.evaluate_due_cron_jobs(now_ts=time.time(), db_path=self.db_path)
+        self.assertEqual(len(due_runs), 1)
+        self.assertEqual(due_runs[0]["job_id"], jid)
+        self.assertEqual(due_runs[0]["status"], "success")
+        self.assertEqual(due_runs[0]["trigger_source"], "schedule")
+
+        # Run non-existent job raises ValueError
+        with self.assertRaises(ValueError):
+            main.run_cron_job_now(99999, actor="admin", db_path=self.db_path)
+
+    def test_cron_other_supported_task_types(self):
+        # 1. docker.prune
+        with patch.object(main.DOCKER_MANAGER, "prune_images", return_value={"output": "images pruned"}) as mock_pi, \
+             patch.object(main.DOCKER_MANAGER, "prune_volumes", return_value={"output": "volumes pruned"}) as mock_pv:
+            job_docker = main.create_or_update_cron_job(
+                {
+                    "name": "Docker Cleanup",
+                    "task_type": "docker.prune",
+                    "cron_expression": "0 2 * * *",
+                    "task_config": {"prune_images": True, "prune_volumes": True},
+                },
+                actor="admin",
+                db_path=self.db_path,
+            )
+            run_docker = main.run_cron_job_now(job_docker["id"], actor="admin", db_path=self.db_path)
+            self.assertEqual(run_docker["status"], "success")
+            self.assertIn("Images pruned", run_docker["output"])
+            self.assertIn("Volumes pruned", run_docker["output"])
+
+        # 2. notifications.summary
+        with patch.object(main.NotificationManager, "send_all", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = {"discord": (True, 200)}
+            job_notif = main.create_or_update_cron_job(
+                {
+                    "name": "Daily Digest",
+                    "task_type": "notifications.summary",
+                    "cron_expression": "0 8 * * *",
+                    "task_config": {},
+                },
+                actor="admin",
+                db_path=self.db_path,
+            )
+            run_notif = main.run_cron_job_now(job_notif["id"], actor="admin", db_path=self.db_path)
+            self.assertEqual(run_notif["status"], "success")
+
+        # 3. storage.smart_check
+        with patch("main.get_all_disks_smart_metrics", return_value=[{"device": "sda", "passed": True}]), \
+             patch("main.check_raid_status", return_value=("clean", [])):
+            job_smart = main.create_or_update_cron_job(
+                {
+                    "name": "SMART Check",
+                    "task_type": "storage.smart_check",
+                    "cron_expression": "0 1 * * *",
+                    "task_config": {},
+                },
+                actor="admin",
+                db_path=self.db_path,
+            )
+            run_smart = main.run_cron_job_now(job_smart["id"], actor="admin", db_path=self.db_path)
+            self.assertEqual(run_smart["status"], "success")
+            self.assertIn("Checked 1 disk(s)", run_smart["output"])
+
+        # Invalid task_type raises ValueError
+        with self.assertRaises(ValueError):
+            main.create_or_update_cron_job(
+                {
+                    "name": "Invalid Task",
+                    "task_type": "invalid.task.type",
+                    "cron_expression": "* * * * *",
+                },
+                actor="admin",
+                db_path=self.db_path,
+            )
+
+    def test_fastapi_backups_endpoints_auth_and_lifecycle(self):
+        # 1. Unauthenticated requests rejected
+        unauth_get = asgi_get(api.app, "/api/backups")
+        self.assertEqual(unauth_get.status_code, 401)
+
+        unauth_post = asgi_post(
+            api.app,
+            "/api/backups/run",
+            json_body={"target_type": "directory", "source_path": str(self.sample_src)},
+        )
+        self.assertEqual(unauth_post.status_code, 401)
+
+        # 2. GET /api/backups
+        resp = asgi_get(api.app, "/api/backups", cookies=self.auth_cookies)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("backup_dir", data)
+        self.assertIn("total_archives", data)
+
+        # 3. POST /api/backups/run - invalid source directory returns 400
+        bad_run = asgi_post(
+            api.app,
+            "/api/backups/run",
+            json_body={"target_type": "directory", "source_path": "/nonexistent/path/xyz"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(bad_run.status_code, 400)
+
+        # Valid backup run
+        good_run = asgi_post(
+            api.app,
+            "/api/backups/run",
+            json_body={
+                "target_type": "directory",
+                "source_path": str(self.sample_src),
+                "target_name": "api-backup",
+                "excludes": ["*.log"],
+                "retain_count": 3,
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(good_run.status_code, 200)
+        archive_info = good_run.json()["archive"]
+        filename = archive_info["filename"]
+
+        # 4. GET /api/backups/archives/{filename}/download
+        down_resp = asgi_get(
+            api.app,
+            f"/api/backups/archives/{filename}/download",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(down_resp.status_code, 200)
+        self.assertEqual(down_resp.headers.get("content-type"), "application/gzip")
+        self.assertGreater(len(down_resp.content), 0)
+
+        # Download traversal returns 400
+        down_bad = asgi_get(
+            api.app,
+            "/api/backups/archives/..%2F..%2Fetc%2Fpasswd/download",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(down_bad.status_code, 400)
+
+        # Download missing archive returns 404
+        down_missing = asgi_get(
+            api.app,
+            "/api/backups/archives/missing_file.tar.gz/download",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(down_missing.status_code, 404)
+
+        # 5. POST /api/backups/archives/{filename}/restore
+        restore_dest = Path(self.temp_dir.name) / "api_restored"
+        restore_dest.mkdir(parents=True, exist_ok=True)
+        rest_resp = asgi_post(
+            api.app,
+            f"/api/backups/archives/{filename}/restore",
+            json_body={"destination_path": str(restore_dest)},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(rest_resp.status_code, 200)
+        self.assertTrue(rest_resp.json()["success"])
+
+        # Restore missing archive returns 404
+        rest_missing = asgi_post(
+            api.app,
+            "/api/backups/archives/not_there.tar.gz/restore",
+            json_body={"destination_path": str(restore_dest)},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(rest_missing.status_code, 404)
+
+        # Restore to restricted path '/' returns 400
+        rest_root = asgi_post(
+            api.app,
+            f"/api/backups/archives/{filename}/restore",
+            json_body={"destination_path": "/"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(rest_root.status_code, 400)
+
+        # 6. DELETE /api/backups/archives/{filename}
+        del_arch = asgi_delete(
+            api.app,
+            f"/api/backups/archives/{filename}",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_arch.status_code, 200)
+
+        # Deleting again returns 404
+        del_again = asgi_delete(
+            api.app,
+            f"/api/backups/archives/{filename}",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_again.status_code, 404)
+
+        # 7. POST /api/backups/targets & DELETE /api/backups/targets/{id}
+        bad_target = asgi_post(
+            api.app,
+            "/api/backups/targets",
+            json_body={"name": "Bad", "source_path": "/proc"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(bad_target.status_code, 400)
+
+        good_target = asgi_post(
+            api.app,
+            "/api/backups/targets",
+            json_body={
+                "name": "API Saved Target",
+                "target_type": "directory",
+                "source_path": str(self.sample_src),
+                "excludes": ["*.log"],
+                "retain_count": 5,
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(good_target.status_code, 200)
+        tid = good_target.json()["target"]["id"]
+
+        del_target = asgi_delete(
+            api.app,
+            f"/api/backups/targets/{tid}",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_target.status_code, 200)
+
+        # Deleting non-existent target returns 404
+        del_missing = asgi_delete(
+            api.app,
+            "/api/backups/targets/99999",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_missing.status_code, 404)
+
+    def test_fastapi_cron_endpoints_auth_and_lifecycle(self):
+        # 1. Unauthenticated requests rejected
+        unauth_get = asgi_get(api.app, "/api/cron/jobs")
+        self.assertEqual(unauth_get.status_code, 401)
+
+        unauth_post = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={"name": "Test", "task_type": "docker.prune", "cron_expression": "* * * * *"},
+        )
+        self.assertEqual(unauth_post.status_code, 401)
+
+        # 2. GET /api/cron/jobs
+        resp = asgi_get(api.app, "/api/cron/jobs", cookies=self.auth_cookies)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("jobs", resp.json())
+        self.assertIn("supported_task_types", resp.json())
+
+        # 3. POST /api/cron/jobs - validation errors
+        bad_name = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={"name": "", "task_type": "docker.prune", "cron_expression": "0 0 * * *"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(bad_name.status_code, 400)
+
+        bad_cron = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={"name": "Bad Cron", "task_type": "docker.prune", "cron_expression": "bad-cron"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(bad_cron.status_code, 400)
+
+        # Valid cron job creation
+        good_job = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={
+                "name": "Nightly Prune",
+                "task_type": "docker.prune",
+                "cron_expression": "0 3 * * *",
+                "task_config": {"prune_images": True, "prune_volumes": False},
+                "enabled": True,
+                "notify_on_failure": True,
+                "notify_on_success": False,
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(good_job.status_code, 200)
+        job_data = good_job.json()["job"]
+        jid = job_data["id"]
+
+        # 4. POST /api/cron/jobs/{id}/toggle
+        togg = asgi_post(
+            api.app,
+            f"/api/cron/jobs/{jid}/toggle",
+            json_body={"enabled": False},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(togg.status_code, 200)
+        self.assertFalse(togg.json()["job"]["enabled"])
+
+        # Toggle non-existent returns 404
+        togg_missing = asgi_post(
+            api.app,
+            "/api/cron/jobs/99999/toggle",
+            json_body={"enabled": True},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(togg_missing.status_code, 404)
+
+        # 5. POST /api/cron/jobs/{id}/run
+        with patch.object(main.DOCKER_MANAGER, "prune_images", return_value={"output": "done"}):
+            run_resp = asgi_post(
+                api.app,
+                f"/api/cron/jobs/{jid}/run",
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(run_resp.status_code, 200)
+            self.assertEqual(run_resp.json()["run"]["status"], "success")
+
+        # Run non-existent returns 404
+        run_missing = asgi_post(
+            api.app,
+            "/api/cron/jobs/99999/run",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(run_missing.status_code, 404)
+
+        # 6. DELETE /api/cron/jobs/{id}
+        del_resp = asgi_delete(
+            api.app,
+            f"/api/cron/jobs/{jid}",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_resp.status_code, 200)
+
+        # Deleting non-existent returns 404
+        del_missing = asgi_delete(
+            api.app,
+            f"/api/cron/jobs/{jid}",
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(del_missing.status_code, 404)
+
+    def test_backups_and_cron_frontend_dom_and_vm_contracts(self):
+        """Verify Backups and Cron Scheduler DOM element IDs, JS functions, CSS classes, and VM execution."""
+        import subprocess
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        required_backup_cron_ids = [
+            "nav-tab-backups",
+            "view-backups",
+            "backups-refresh-btn",
+            "backups-total-archives",
+            "backups-total-size",
+            "backups-stacks-count",
+            "cron-active-jobs-count",
+            "backups-manager-card",
+            "backup-create-form",
+            "backup-target-type",
+            "backup-stack-select-group",
+            "backup-stack-select",
+            "backup-source-path",
+            "backup-target-name",
+            "backup-excludes",
+            "backup-retain-count",
+            "backup-stop-containers",
+            "backup-save-target-btn",
+            "backup-run-now-btn",
+            "backup-targets-table",
+            "backup-targets-tbody",
+            "backup-archives-card",
+            "backup-dir-badge",
+            "backup-archives-table",
+            "backup-archives-tbody",
+            "cron-scheduler-card",
+            "cron-job-form",
+            "cron-job-name",
+            "cron-task-type",
+            "cron-preset-select",
+            "cron-expression-input",
+            "cron-config-stack-group",
+            "cron-config-stack-name",
+            "cron-config-path-group",
+            "cron-config-source-path",
+            "cron-config-retain-group",
+            "cron-config-retain-count",
+            "cron-config-stop-group",
+            "cron-config-stop-containers",
+            "cron-config-prune-group",
+            "cron-config-prune-volumes",
+            "cron-notify-failure",
+            "cron-notify-success",
+            "cron-save-job-btn",
+            "cron-jobs-table",
+            "cron-jobs-tbody",
+            "cron-runs-table",
+            "cron-runs-tbody",
+        ]
+        for dom_id in required_backup_cron_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        required_fns = [
+            "async function fetchBackups(",
+            "function renderBackups(",
+            "async function fetchCronJobs(",
+            "function renderCronJobs(",
+            "async function handleSaveCronJob(",
+            "async function toggleCronJob(",
+            "async function runCronJobNow(",
+            "async function deleteCronJob(",
+            "async function executeBackupRun(",
+            "async function restoreBackupArchive(",
+            "async function deleteBackupArchive(",
+            "async function saveBackupTarget(",
+            "async function deleteBackupTarget(",
+            "function updateCronFormTaskConfigVisibility(",
+            "function syncBackupFormWithSelectedStack(",
+        ]
+        for fn_name in required_fns:
+            self.assertIn(fn_name, js, f"Missing {fn_name} in static/app.js")
+
+        required_css = [
+            ".backups-content-grid",
+            ".backups-card",
+            ".backups-form-panel",
+            ".backups-form-grid",
+            ".btn-backup-action",
+            ".target-kind-badge",
+            "#backup-targets-table",
+            "#backup-archives-table",
+            "#cron-jobs-table",
+            "#cron-runs-table",
+        ]
+        for css_sel in required_css:
+            self.assertIn(css_sel, css, f"Missing {css_sel} in static/styles.css")
+
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  const idx = source.indexOf('function ' + name + '(');
+  if (idx === -1) throw new Error('Not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') { depth--; if (started && depth === 0) return source.slice(idx, i + 1); }
+    i++;
+  }
+  throw new Error('Unbalanced: ' + name);
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id,
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      className: '',
+      selectedIndex: 0,
+      options: [{ value: 'plex', getAttribute: () => '/home/anthony/docker/plex' }],
+      children: [],
+      getAttribute: () => '',
+      classList: {
+        _set: new Set(),
+        add(...cls) { cls.forEach(c => this._set.add(c)); },
+        remove(...cls) { cls.forEach(c => this._set.delete(c)); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this._set.has(c)) this._set.delete(c); else this._set.add(c);
+          } else if (force) this._set.add(c); else this._set.delete(c);
+        },
+        contains(c) { return this._set.has(c); }
+      }
+    };
+  }
+  return elements[id];
+}
+
+const sandbox = {
+  document: { getElementById: getEl, createElement: () => getEl('tmp') },
+  escapeHtml: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+  formatBytes: (bytes) => (bytes / (1024 * 1024)).toFixed(1) + ' MB',
+  formatDateTime: (ts) => '2026-11-04 12:00:00',
+};
+vm.createContext(sandbox);
+vm.runInContext(extractFunc(code, 'syncBackupFormWithSelectedStack'), sandbox);
+vm.runInContext(extractFunc(code, 'renderBackups'), sandbox);
+vm.runInContext(extractFunc(code, 'renderCronJobs'), sandbox);
+
+const backupsPayload = {
+  backup_dir: '/home/anthony/.vigil/backups',
+  total_archives: 2,
+  total_size_bytes: 14889779,
+  stack_targets: [
+    { stack_name: 'plex', path: '/home/anthony/docker/plex', compose_file: '/home/anthony/docker/plex/docker-compose.yml', exists: true, container_count: 2 }
+  ],
+  saved_targets: [
+    { id: 1, name: 'AppData Directory', target_type: 'directory', source_path: '/home/anthony/appdata', retain_count: 7, excludes: ['*.log'] }
+  ],
+  archives: [
+    { filename: 'plex_20261104_120000.tar.gz', target_type: 'stack', target_name: 'plex', source_path: '/home/anthony/docker/plex', size_bytes: 1048576, file_count: 15, created_at: 1700000000, sha256: 'a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef' }
+  ]
+};
+
+sandbox.renderBackups(backupsPayload);
+if (getEl('backups-total-archives').textContent !== '2') throw new Error('Bad total archives: ' + getEl('backups-total-archives').textContent);
+if (getEl('backups-total-size').textContent !== '14.2 MB') throw new Error('Bad total size: ' + getEl('backups-total-size').textContent);
+if (getEl('backups-stacks-count').textContent !== '1') throw new Error('Bad stacks count: ' + getEl('backups-stacks-count').textContent);
+if (!getEl('backup-targets-tbody').innerHTML.includes('plex')) throw new Error('Missing plex in targets tbody');
+if (!getEl('backup-targets-tbody').innerHTML.includes('AppData Directory')) throw new Error('Missing AppData Directory in targets tbody');
+if (!getEl('backup-archives-tbody').innerHTML.includes('plex_20261104_120000.tar.gz')) throw new Error('Missing archive filename in archives tbody');
+if (!getEl('backup-archives-tbody').innerHTML.includes('data-restore-archive')) throw new Error('Missing restore button in archives tbody');
+
+const cronPayload = {
+  jobs: [
+    { id: 10, name: 'Nightly Backup', task_type: 'backup.stack', cron_expression: '0 2 * * *', enabled: true, task_config: { stack_name: 'plex' }, last_status: 'success', next_run_at: 1700000000 }
+  ],
+  recent_runs: [
+    { id: 101, job_id: 10, job_name: 'Nightly Backup', task_type: 'backup.stack', trigger_source: 'schedule', status: 'success', started_at: 1700000000, duration_ms: 1200, output: 'Created backup archive plex.tar.gz' }
+  ],
+  supported_task_types: [
+    { type: 'backup.stack', label: 'Docker Stack Backup' }
+  ]
+};
+
+sandbox.renderCronJobs(cronPayload);
+if (!getEl('cron-active-jobs-count').textContent.includes('1 Active')) throw new Error('Bad active cron jobs count: ' + getEl('cron-active-jobs-count').textContent);
+if (!getEl('cron-jobs-tbody').innerHTML.includes('Nightly Backup')) throw new Error('Missing Nightly Backup in jobs tbody');
+if (!getEl('cron-jobs-tbody').innerHTML.includes('0 2 * * *')) throw new Error('Missing cron expression in jobs tbody');
+if (!getEl('cron-runs-tbody').innerHTML.includes('Created backup archive plex.tar.gz')) throw new Error('Missing run output in runs tbody');
+console.log('OK');
+"""
+        proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"Backups/Cron Node VM test failed: {proc.stderr or proc.stdout}")
+        self.assertIn("OK", proc.stdout)
 
 
 if __name__ == "__main__":

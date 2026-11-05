@@ -4373,7 +4373,14 @@ function switchViewTab(tabName, updateHash = true) {
   const isPackages = normTab === "packages" || normTab === "updates" || normTab === "dpkg" || normTab === "apt";
   const isProbes = normTab === "probes" || normTab === "sentinel" || normTab === "uptime";
   const isSecurity = normTab === "security" || normTab === "network" || normTab === "firewall";
-  currentViewTab = isRaid ? "raid" : (isSecurity ? "security" : (normTab || "overview"));
+  const isBackups = normTab === "backups" || normTab === "cron" || normTab === "scheduler";
+  currentViewTab = isRaid
+    ? "raid"
+    : isSecurity
+      ? "security"
+      : isBackups
+        ? "backups"
+        : normTab || "overview";
 
   const overviewTab = document.getElementById("nav-tab-overview");
   const raidTab = document.getElementById("nav-tab-raid");
@@ -4386,6 +4393,7 @@ function switchViewTab(tabName, updateHash = true) {
   const usersTab = document.getElementById("nav-tab-users");
   const auditTab = document.getElementById("nav-tab-audit");
   const packagesTab = document.getElementById("nav-tab-packages");
+  const backupsTab = document.getElementById("nav-tab-backups");
 
   const overviewView = document.getElementById("view-overview");
   const raidView = document.getElementById("view-raid");
@@ -4398,6 +4406,7 @@ function switchViewTab(tabName, updateHash = true) {
   const usersView = document.getElementById("view-users");
   const auditView = document.getElementById("view-audit");
   const packagesView = document.getElementById("view-packages");
+  const backupsView = document.getElementById("view-backups");
 
   const pageTitle = document.getElementById("page-title");
 
@@ -4423,6 +4432,8 @@ function switchViewTab(tabName, updateHash = true) {
   auditTab?.setAttribute("aria-selected", "false");
   packagesTab?.classList.remove("active");
   packagesTab?.setAttribute("aria-selected", "false");
+  backupsTab?.classList.remove("active");
+  backupsTab?.setAttribute("aria-selected", "false");
 
   overviewView?.classList.add("hidden");
   raidView?.classList.add("hidden");
@@ -4435,6 +4446,7 @@ function switchViewTab(tabName, updateHash = true) {
   usersView?.classList.add("hidden");
   auditView?.classList.add("hidden");
   packagesView?.classList.add("hidden");
+  backupsView?.classList.add("hidden");
 
   // Automatically close mobile sidebar if opened
   document.getElementById("app-sidebar")?.classList.remove("open");
@@ -4585,6 +4597,25 @@ function switchViewTab(tabName, updateHash = true) {
     if (isAuthenticated) {
       fetchNetworkSecurity();
     }
+  } else if (isBackups) {
+    backupsTab?.classList.add("active");
+    backupsTab?.setAttribute("aria-selected", "true");
+    backupsView?.classList.remove("hidden");
+    if (pageTitle) pageTitle.textContent = "Backups & Cron Scheduler";
+
+    if (
+      updateHash &&
+      !window.location.hash.startsWith("#backups") &&
+      !window.location.hash.startsWith("#/backups") &&
+      !window.location.hash.startsWith("#cron") &&
+      !window.location.hash.startsWith("#/cron")
+    ) {
+      history.replaceState(null, "", "#backups");
+    }
+
+    if (isAuthenticated) {
+      refreshBackupsAndCron();
+    }
   } else {
     overviewTab?.classList.add("active");
     overviewTab?.setAttribute("aria-selected", "true");
@@ -4616,6 +4647,8 @@ function syncTabFromHash() {
     switchViewTab("services", false);
   } else if (route.startsWith("security") || route.startsWith("network") || route.startsWith("firewall")) {
     switchViewTab("security", false);
+  } else if (route.startsWith("backups") || route.startsWith("cron") || route.startsWith("scheduler")) {
+    switchViewTab("backups", false);
   } else if (route === "processes" || route === "proc" || route === "tasks") {
     switchViewTab("processes", false);
   } else if (route === "probes" || route === "sentinel" || route === "uptime") {
@@ -8872,10 +8905,11 @@ async function testProbe(probeId, btnEl) {
 
 let cachedSecurityPortsData = null;
 let cachedSecurityFirewallData = null;
+let cachedSecuritySshData = null;
 let isFetchingNetworkSecurity = false;
 
 /**
- * Fetch open listening ports and UFW firewall status from backend.
+ * Fetch open listening ports, UFW firewall status, and SSH intrusion/session telemetry from backend.
  */
 async function fetchNetworkSecurity(isUserTriggered = false) {
   if (isFetchingNetworkSecurity) return;
@@ -8885,30 +8919,48 @@ async function fetchNetworkSecurity(isUserTriggered = false) {
   if (refreshBtn) refreshBtn.classList.add("loading");
 
   try {
-    const [portsResp, firewallResp] = await Promise.all([
+    const [portsRes, firewallRes, sshRes] = await Promise.allSettled([
       apiFetch("/api/network/ports"),
       apiFetch("/api/network/firewall"),
+      apiFetch("/api/network/ssh-security"),
     ]);
 
-    if (!portsResp.ok) {
-      throw new Error(`Failed to fetch open ports (HTTP ${portsResp.status})`);
-    }
-    if (!firewallResp.ok) {
-      throw new Error(`Failed to fetch firewall status (HTTP ${firewallResp.status})`);
+    let portsData = cachedSecurityPortsData;
+    let firewallData = cachedSecurityFirewallData;
+    let sshData = cachedSecuritySshData;
+
+    if (portsRes.status === "fulfilled" && portsRes.value.ok) {
+      portsData = await portsRes.value.json();
+      cachedSecurityPortsData = portsData;
+    } else if (portsRes.status === "fulfilled") {
+      throw new Error(`Failed to fetch open ports (HTTP ${portsRes.value.status})`);
+    } else {
+      throw portsRes.reason;
     }
 
-    const portsData = await portsResp.json();
-    const firewallData = await firewallResp.json();
+    if (firewallRes.status === "fulfilled" && firewallRes.value.ok) {
+      firewallData = await firewallRes.value.json();
+      cachedSecurityFirewallData = firewallData;
+    } else if (firewallRes.status === "fulfilled") {
+      throw new Error(`Failed to fetch firewall status (HTTP ${firewallRes.value.status})`);
+    } else {
+      throw firewallRes.reason;
+    }
 
-    cachedSecurityPortsData = portsData;
-    cachedSecurityFirewallData = firewallData;
+    if (sshRes.status === "fulfilled" && sshRes.value.ok) {
+      sshData = await sshRes.value.json();
+      cachedSecuritySshData = sshData;
+    }
 
     renderNetworkSecurity(portsData, firewallData);
+    if (sshData) {
+      renderSshSecurity(sshData);
+    }
 
     if (isUserTriggered) {
       showToast({
         title: "Network & Security Refreshed",
-        message: "Listening ports and UFW firewall rules updated.",
+        message: "Listening ports, UFW firewall rules, and SSH security updated.",
         type: "success",
       });
     }
@@ -9262,6 +9314,1294 @@ async function deleteFirewallRule(ruleIndex) {
 }
 
 /**
+ * Render SSH Intrusion Detection, Active Sessions, and IP Ban Manager panel (#view-security).
+ */
+function renderSshSecurity(sshData) {
+  if (!sshData) return;
+
+  const activeSessions = Array.isArray(sshData.active_sessions) ? sshData.active_sessions : [];
+  const recentLogins = Array.isArray(sshData.recent_logins) ? sshData.recent_logins : [];
+  const recentFailures = Array.isArray(sshData.recent_failures) ? sshData.recent_failures : [];
+  const topOffenders = Array.isArray(sshData.top_offenders) ? sshData.top_offenders : [];
+  const bannedIps = Array.isArray(sshData.banned_ips) ? sshData.banned_ips : [];
+  const fail2ban = sshData.fail2ban || {};
+
+  // 1. Summary Ribbon counters
+  const activeCountEl = document.getElementById("sec-active-sessions-count");
+  if (activeCountEl) {
+    activeCountEl.textContent = String(activeSessions.length);
+  }
+
+  const failedTotal = Number(sshData.failed_attempts_total ?? fail2ban.total_failed ?? 0);
+  const failedCountEl = document.getElementById("sec-failed-ssh-count");
+  if (failedCountEl) {
+    failedCountEl.textContent = String(failedTotal);
+    failedCountEl.className = failedTotal > 0 ? "count-number count-warn" : "count-number count-ok";
+  }
+
+  const bannedCount = bannedIps.length || Number(fail2ban.currently_banned || 0);
+  const bannedCountEl = document.getElementById("sec-banned-ips-count");
+  if (bannedCountEl) {
+    bannedCountEl.textContent = `${bannedCount} Banned`;
+    bannedCountEl.className =
+      bannedCount > 0 ? "status-badge status-danger" : "status-badge status-muted";
+  }
+
+  // 2. Fail2ban status badge
+  const f2bBadge = document.getElementById("sec-fail2ban-badge");
+  if (f2bBadge) {
+    if (fail2ban.installed && fail2ban.active) {
+      const f2bBanned = Number(fail2ban.currently_banned || 0);
+      f2bBadge.textContent = `FAIL2BAN: ACTIVE (${f2bBanned} Banned)`;
+      f2bBadge.className = "status-badge status-ok";
+    } else if (fail2ban.installed && !fail2ban.active) {
+      f2bBadge.textContent = "FAIL2BAN: INACTIVE / UFW ENFORCED";
+      f2bBadge.className = "status-badge status-warn";
+    } else {
+      f2bBadge.textContent = "FAIL2BAN: NOT INSTALLED / UFW ENFORCED";
+      f2bBadge.className = "status-badge status-info";
+    }
+  }
+
+  // 3. Offending IPs & Banned Hosts Table (#sec-ssh-offenders-tbody)
+  const offendersTbody = document.getElementById("sec-ssh-offenders-tbody");
+  if (offendersTbody) {
+    // Merge top_offenders and any manually banned IPs not in top_offenders
+    const offenderMap = new Map();
+    topOffenders.forEach((o) => {
+      if (o && o.ip) {
+        offenderMap.set(o.ip, {
+          ip: o.ip,
+          count: Number(o.count || 0),
+          targeted_users: Array.isArray(o.targeted_users) ? o.targeted_users : [],
+          last_seen: o.last_seen || "-",
+          is_banned: Boolean(o.is_banned),
+          ban_sources: Array.isArray(o.ban_sources) ? o.ban_sources : [],
+        });
+      }
+    });
+
+    bannedIps.forEach((b) => {
+      const ipStr = typeof b === "string" ? b : b?.ip;
+      if (!ipStr) return;
+      const sources = Array.isArray(b?.sources) ? b.sources : ["ufw"];
+      if (offenderMap.has(ipStr)) {
+        const existing = offenderMap.get(ipStr);
+        existing.is_banned = true;
+        existing.ban_sources = Array.from(new Set([...existing.ban_sources, ...sources]));
+      } else {
+        offenderMap.set(ipStr, {
+          ip: ipStr,
+          count: 0,
+          targeted_users: [],
+          last_seen: "Manual / Firewall Rule",
+          is_banned: true,
+          ban_sources: sources,
+        });
+      }
+    });
+
+    const combinedOffenders = Array.from(offenderMap.values());
+
+    if (combinedOffenders.length === 0) {
+      offendersTbody.innerHTML = `<tr><td colspan="6" class="empty-state">No failed SSH login offenders or banned IPs detected.</td></tr>`;
+    } else {
+      offendersTbody.innerHTML = combinedOffenders
+        .map((item) => {
+          const ipSafe = escapeHtml(item.ip);
+          const countDisplay = item.count > 0 ? String(item.count) : "-";
+          const usersList =
+            item.targeted_users && item.targeted_users.length > 0
+              ? item.targeted_users.map((u) => `<span class="chip-tag">${escapeHtml(u)}</span>`).join(" ")
+              : `<span class="text-muted">-</span>`;
+          const lastSeenSafe = escapeHtml(item.last_seen || "-");
+
+          let statusBadge = `<span class="status-badge status-warn">UNBLOCKED</span>`;
+          if (item.is_banned) {
+            const srcLabel =
+              item.ban_sources && item.ban_sources.length > 0
+                ? item.ban_sources.map((s) => String(s).toUpperCase()).join(" + ")
+                : "UFW";
+            statusBadge = `<span class="status-badge status-danger">BANNED (${escapeHtml(srcLabel)})</span>`;
+          }
+
+          const actionBtn = item.is_banned
+            ? `<button type="button" class="btn-unban-ip" data-unban-ip="${ipSafe}" title="Unban ${ipSafe}">Unban IP</button>`
+            : `<button type="button" class="btn-ban-ip" data-ban-ip="${ipSafe}" title="Ban ${ipSafe}">Ban IP</button>`;
+
+          return `
+            <tr>
+              <td class="mono-text font-bold">${ipSafe}</td>
+              <td class="mono-text font-bold">${escapeHtml(countDisplay)}</td>
+              <td>${usersList}</td>
+              <td class="mono-text text-secondary">${lastSeenSafe}</td>
+              <td>${statusBadge}</td>
+              <td style="text-align: right;">
+                <div class="table-actions-cell">
+                  ${actionBtn}
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+
+  // 4. Active Login Sessions Table (#sec-sessions-tbody & #sec-sessions-badge)
+  const sessionsBadge = document.getElementById("sec-sessions-badge");
+  if (sessionsBadge) {
+    sessionsBadge.textContent = `${activeSessions.length} Active`;
+    sessionsBadge.className =
+      activeSessions.length > 0 ? "status-badge status-ok" : "status-badge status-muted";
+  }
+
+  const sessionsTbody = document.getElementById("sec-sessions-tbody");
+  if (sessionsTbody) {
+    if (activeSessions.length === 0) {
+      sessionsTbody.innerHTML = `<tr><td colspan="5" class="empty-state">No active interactive SSH or TTY login sessions.</td></tr>`;
+    } else {
+      sessionsTbody.innerHTML = activeSessions
+        .map((s) => {
+          const user = escapeHtml(s.username || "unknown");
+          const tty = escapeHtml(s.terminal || "-");
+          const host = escapeHtml(s.host || "local");
+          const pid = s.pid ? escapeHtml(String(s.pid)) : "-";
+          const started = escapeHtml(s.started_iso || "-");
+          return `
+            <tr>
+              <td class="font-bold">${user}</td>
+              <td><span class="kind-badge">${tty}</span></td>
+              <td class="mono-text">${host}</td>
+              <td class="mono-text text-secondary">${pid}</td>
+              <td class="mono-text text-secondary">${started}</td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+
+  // 5. Recent Failed Auth Events & Login History (#sec-recent-auth-tbody)
+  const recentAuthTbody = document.getElementById("sec-recent-auth-tbody");
+  if (recentAuthTbody) {
+    const rows = [];
+
+    recentFailures.slice(0, 15).forEach((f) => {
+      rows.push({
+        time: f.timestamp || "-",
+        badge: `<span class="status-badge status-danger">AUTH FAIL</span>`,
+        user: f.username || "unknown",
+        host: f.ip || "-",
+        details: f.reason || "Failed SSH authentication",
+      });
+    });
+
+    recentLogins.slice(0, 15).forEach((l) => {
+      rows.push({
+        time: l.time_range || "-",
+        badge: `<span class="status-badge status-ok">LOGIN</span>`,
+        user: l.username || "unknown",
+        host: l.host || "local",
+        details: l.terminal ? `TTY ${l.terminal}` : l.raw || "Accepted session",
+      });
+    });
+
+    if (rows.length === 0) {
+      recentAuthTbody.innerHTML = `<tr><td colspan="5" class="empty-state">No recent authentication failures or login history recorded.</td></tr>`;
+    } else {
+      recentAuthTbody.innerHTML = rows
+        .map(
+          (r) => `
+            <tr>
+              <td class="mono-text text-secondary">${escapeHtml(r.time)}</td>
+              <td>${r.badge}</td>
+              <td class="font-bold">${escapeHtml(r.user)}</td>
+              <td class="mono-text">${escapeHtml(r.host)}</td>
+              <td class="text-secondary">${escapeHtml(r.details)}</td>
+            </tr>
+          `
+        )
+        .join("");
+    }
+  }
+}
+
+/**
+ * Ban or Unban an IP address via POST /api/network/ssh-security/ban.
+ */
+async function submitSshIpBan(action, ip, buttonEl = null) {
+  const cleanAction = String(action || "").trim().toLowerCase();
+  const cleanIp = String(ip || "").trim();
+  if (!cleanIp || !["ban", "unban"].includes(cleanAction)) {
+    showToast({
+      title: "Invalid IP Ban Request",
+      message: "Please provide a valid IPv4/IPv6 address or CIDR to ban or unban.",
+      type: "warning",
+    });
+    return;
+  }
+
+  const origText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = cleanAction === "ban" ? "Banning..." : "Unbanning...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/network/ssh-security/ban", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: cleanAction, ip: cleanIp }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(
+        data.detail || data.message || `Failed to ${cleanAction} IP ${cleanIp} (HTTP ${resp.status})`
+      );
+    }
+
+    showToast({
+      title: cleanAction === "ban" ? "IP Address Banned" : "IP Address Unbanned",
+      message: data.message || `Successfully executed ${cleanAction.toUpperCase()} for ${cleanIp}.`,
+      type: cleanAction === "ban" ? "warning" : "success",
+    });
+
+    if (data.ssh_security) {
+      cachedSecuritySshData = data.ssh_security;
+      renderSshSecurity(data.ssh_security);
+    }
+    if (data.firewall) {
+      cachedSecurityFirewallData = data.firewall;
+      renderNetworkSecurity(cachedSecurityPortsData, data.firewall);
+    }
+    if (!data.ssh_security || !data.firewall) {
+      await fetchNetworkSecurity();
+    }
+  } catch (err) {
+    console.error("submitSshIpBan error:", err);
+    showToast({
+      title: `${cleanAction === "ban" ? "Ban" : "Unban"} Failed`,
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = origText;
+    }
+  }
+}
+
+/* =========================================================================
+ * Phase 4: Docker Stack & Host Directory Backups + Unified Vigil Cron Scheduler
+ * ========================================================================= */
+
+let cachedBackupsData = null;
+let cachedCronData = null;
+
+/**
+ * Refresh both Backups and Cron Scheduler data.
+ */
+async function refreshBackupsAndCron(manual = false) {
+  const refreshBtn = document.getElementById("backups-refresh-btn");
+  if (refreshBtn && manual) {
+    refreshBtn.classList.add("spinning");
+  }
+  try {
+    await Promise.all([fetchBackups(), fetchCronJobs()]);
+    const updatedEl = document.getElementById("backups-last-updated");
+    if (updatedEl) {
+      updatedEl.textContent = `Updated ${formatTimeOnly(new Date())}`;
+    }
+  } finally {
+    if (refreshBtn && manual) {
+      setTimeout(() => refreshBtn.classList.remove("spinning"), 400);
+    }
+  }
+}
+
+/**
+ * Update the sidebar badge #nav-badge-backups with active cron jobs or archive count.
+ */
+function updateBackupsNavBadge() {
+  const badge = document.getElementById("nav-badge-backups");
+  if (!badge) return;
+  const jobs = Array.isArray(cachedCronData?.jobs) ? cachedCronData.jobs : [];
+  const activeJobsCount = jobs.filter((j) => j.enabled).length;
+  const totalArchives = Number(cachedBackupsData?.total_archives || 0);
+  const count = activeJobsCount > 0 ? activeJobsCount : totalArchives;
+  if (count > 0) {
+    badge.textContent = String(count);
+    badge.classList.remove("hidden");
+  } else {
+    badge.textContent = "0";
+    badge.classList.add("hidden");
+  }
+}
+
+/**
+ * Fetch backup targets, stack folders, and archives via GET /api/backups.
+ */
+async function fetchBackups() {
+  try {
+    const resp = await apiFetch("/api/backups");
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch backups (HTTP ${resp.status})`);
+    }
+    const data = await resp.json();
+    cachedBackupsData = data;
+    renderBackups(data);
+    updateBackupsNavBadge();
+  } catch (err) {
+    console.error("fetchBackups error:", err);
+  }
+}
+
+/**
+ * Render Backups Summary Ribbon, Stack Selector, Targets Table, and Archives Table.
+ */
+function renderBackups(data) {
+  if (!data) return;
+
+  const stackTargets = Array.isArray(data.stack_targets) ? data.stack_targets : [];
+  const savedTargets = Array.isArray(data.saved_targets) ? data.saved_targets : [];
+  const archives = Array.isArray(data.archives) ? data.archives : [];
+
+  // 1. Top Summary Ribbon
+  const totalArchivesEl = document.getElementById("backups-total-archives");
+  if (totalArchivesEl) {
+    totalArchivesEl.textContent = String(data.total_archives ?? archives.length);
+  }
+
+  const totalSizeEl = document.getElementById("backups-total-size");
+  if (totalSizeEl) {
+    totalSizeEl.textContent = formatBytes(data.total_size_bytes ?? 0);
+  }
+
+  const stacksCountEl = document.getElementById("backups-stacks-count");
+  if (stacksCountEl) {
+    stacksCountEl.textContent = String(stackTargets.length);
+  }
+
+  const dirBadge = document.getElementById("backup-dir-badge");
+  if (dirBadge && data.backup_dir) {
+    dirBadge.textContent = data.backup_dir;
+  }
+
+  // 2. Stack selector dropdown (#backup-stack-select)
+  const stackSelect = document.getElementById("backup-stack-select");
+  if (stackSelect) {
+    const currentVal = stackSelect.value;
+    const options = [`<option value="">-- Select a discovered stack (${stackTargets.length}) --</option>`];
+    stackTargets.forEach((st) => {
+      const nameSafe = escapeHtml(st.stack_name || "");
+      const pathSafe = escapeHtml(st.source_path || "");
+      const statusSafe = escapeHtml(st.status || "discovered");
+      options.push(
+        `<option value="${nameSafe}" data-source-path="${pathSafe}">${nameSafe} — ${pathSafe} (${statusSafe})</option>`
+      );
+    });
+    stackSelect.innerHTML = options.join("");
+    if (currentVal && stackTargets.some((s) => s.stack_name === currentVal)) {
+      stackSelect.value = currentVal;
+    } else if (stackTargets.length > 0 && !currentVal) {
+      stackSelect.value = stackTargets[0].stack_name;
+      syncBackupFormWithSelectedStack();
+    }
+  }
+
+  // 3. Discovered Stack Folders & Saved Targets Table (#backup-targets-tbody)
+  const targetsTbody = document.getElementById("backup-targets-tbody");
+  if (targetsTbody) {
+    const rows = [];
+
+    stackTargets.forEach((st) => {
+      const stackName = st.stack_name || "unknown";
+      const sourcePath = st.source_path || "";
+      const servicesCount = Number(st.services || 0);
+      const statusText = st.status || "discovered";
+      const existsBadge = st.exists
+        ? `<span class="status-badge status-ok">${escapeHtml(statusText)}</span>`
+        : `<span class="status-badge status-warn">Path Missing</span>`;
+
+      rows.push(`
+        <tr>
+          <td><span class="target-kind-badge kind-stack">STACK</span></td>
+          <td class="font-bold">${escapeHtml(stackName)}</td>
+          <td class="mono-text text-secondary">${escapeHtml(sourcePath)}</td>
+          <td>
+            ${existsBadge}
+            <span class="text-secondary" style="font-size: 0.78rem; margin-left: 6px;">${servicesCount} container(s)</span>
+          </td>
+          <td style="text-align: right;">
+            <div class="table-actions-cell">
+              <button
+                type="button"
+                class="btn-backup-action"
+                data-backup-now="stack"
+                data-stack-name="${escapeHtml(stackName)}"
+                data-source-path="${escapeHtml(sourcePath)}"
+                data-target-name="${escapeHtml(stackName)}"
+                title="Create backup archive for stack ${escapeHtml(stackName)} now"
+              >
+                1-Click Backup Now
+              </button>
+              <button
+                type="button"
+                class="btn-backup-action btn-schedule"
+                data-schedule-backup="stack"
+                data-stack-name="${escapeHtml(stackName)}"
+                data-source-path="${escapeHtml(sourcePath)}"
+                data-target-name="${escapeHtml(stackName)}"
+                title="Pre-fill Cron Scheduler for ${escapeHtml(stackName)}"
+              >
+                Schedule in Cron
+              </button>
+            </div>
+          </td>
+        </tr>
+      `);
+    });
+
+    savedTargets.forEach((t) => {
+      const targetId = t.id;
+      const name = t.name || t.stack_name || "custom";
+      const tType = t.target_type === "stack" ? "stack" : "directory";
+      const sourcePath = t.source_path || "";
+      const retainCount = Number(t.retain_count || 7);
+      const excludesList = Array.isArray(t.excludes) ? t.excludes.join(", ") : "";
+      const badgeHtml =
+        tType === "stack"
+          ? `<span class="target-kind-badge kind-stack">STACK TARGET</span>`
+          : `<span class="target-kind-badge kind-directory">DIRECTORY</span>`;
+
+      const detailsParts = [`Retain: ${retainCount}`];
+      if (excludesList) detailsParts.push(`Excludes: ${excludesList}`);
+      if (t.stop_containers) detailsParts.push("Stop Containers");
+
+      rows.push(`
+        <tr>
+          <td>${badgeHtml}</td>
+          <td class="font-bold">${escapeHtml(name)}</td>
+          <td class="mono-text text-secondary">${escapeHtml(sourcePath)}</td>
+          <td class="text-secondary" style="font-size: 0.8rem;">${escapeHtml(detailsParts.join(" • "))}</td>
+          <td style="text-align: right;">
+            <div class="table-actions-cell">
+              <button
+                type="button"
+                class="btn-backup-action"
+                data-backup-now="${escapeHtml(tType)}"
+                data-stack-name="${escapeHtml(t.stack_name || "")}"
+                data-source-path="${escapeHtml(sourcePath)}"
+                data-target-name="${escapeHtml(name)}"
+                data-retain-count="${retainCount}"
+                data-excludes="${escapeHtml(excludesList)}"
+                data-stop-containers="${t.stop_containers ? "true" : "false"}"
+                title="Run backup now for ${escapeHtml(name)}"
+              >
+                1-Click Backup Now
+              </button>
+              <button
+                type="button"
+                class="btn-backup-action btn-schedule"
+                data-schedule-backup="${escapeHtml(tType)}"
+                data-stack-name="${escapeHtml(t.stack_name || name)}"
+                data-source-path="${escapeHtml(sourcePath)}"
+                data-target-name="${escapeHtml(name)}"
+                data-retain-count="${retainCount}"
+                title="Schedule ${escapeHtml(name)} in Cron"
+              >
+                Schedule in Cron
+              </button>
+              <button
+                type="button"
+                class="btn-icon-danger"
+                data-delete-target-id="${escapeHtml(String(targetId))}"
+                title="Delete saved target ${escapeHtml(name)}"
+              >
+                Delete Target
+              </button>
+            </div>
+          </td>
+        </tr>
+      `);
+    });
+
+    if (rows.length === 0) {
+      targetsTbody.innerHTML = `<tr><td colspan="5" class="empty-state">No Docker Compose stack directories or saved backup targets found. Add a custom host directory above.</td></tr>`;
+    } else {
+      targetsTbody.innerHTML = rows.join("");
+    }
+  }
+
+  // 4. Backup Archives Browser Table (#backup-archives-tbody)
+  const archivesTbody = document.getElementById("backup-archives-tbody");
+  if (archivesTbody) {
+    if (archives.length === 0) {
+      archivesTbody.innerHTML = `<tr><td colspan="7" class="empty-state">No backup archives created yet. Run a backup above or schedule a job in Cron.</td></tr>`;
+    } else {
+      archivesTbody.innerHTML = archives
+        .map((a) => {
+          const filename = a.filename || "";
+          const filenameSafe = escapeHtml(filename);
+          const tType = a.target_type === "stack" ? "STACK" : "DIRECTORY";
+          const badgeClass = a.target_type === "stack" ? "kind-stack" : "kind-directory";
+          const targetName = escapeHtml(a.target_name || "-");
+          const sourcePath = escapeHtml(a.source_path || "-");
+          const sizeFormatted = formatBytes(a.size_bytes ?? 0);
+          const fileCount = Number(a.file_count || 0);
+          const createdDisplay = escapeHtml(a.created_iso || formatDateTime(a.created_at));
+          const shaShort = a.sha256 ? escapeHtml(String(a.sha256).slice(0, 12)) + "…" : "-";
+          const shaFull = escapeHtml(a.sha256 || "");
+          const downloadUrl = `/api/backups/archives/${encodeURIComponent(filename)}/download`;
+
+          return `
+            <tr>
+              <td class="mono-text font-bold">${filenameSafe}</td>
+              <td>
+                <span class="target-kind-badge ${badgeClass}">${tType}</span>
+                <span class="font-bold" style="margin-left: 6px;">${targetName}</span>
+              </td>
+              <td class="mono-text text-secondary">${sourcePath}</td>
+              <td class="mono-text">${escapeHtml(sizeFormatted)} <span class="text-secondary">(${fileCount} files)</span></td>
+              <td class="mono-text text-secondary">${createdDisplay}</td>
+              <td class="mono-text text-secondary" title="SHA-256: ${shaFull}">${shaShort}</td>
+              <td style="text-align: right;">
+                <div class="table-actions-cell">
+                  <a
+                    href="${downloadUrl}"
+                    class="btn-backup-action"
+                    download="${filenameSafe}"
+                    title="Download ${filenameSafe}"
+                  >
+                    Download
+                  </a>
+                  <button
+                    type="button"
+                    class="btn-backup-action btn-restore"
+                    data-restore-archive="${filenameSafe}"
+                    data-source-path="${sourcePath}"
+                    title="Restore archive ${filenameSafe}"
+                  >
+                    Restore
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-icon-danger"
+                    data-delete-archive="${filenameSafe}"
+                    title="Delete archive ${filenameSafe}"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+}
+
+/**
+ * Sync #backup-source-path and #backup-target-name when a stack is selected in #backup-stack-select.
+ */
+function syncBackupFormWithSelectedStack() {
+  const targetTypeEl = document.getElementById("backup-target-type");
+  const stackSelect = document.getElementById("backup-stack-select");
+  const sourcePathInput = document.getElementById("backup-source-path");
+  const targetNameInput = document.getElementById("backup-target-name");
+  const stackGroup = document.getElementById("backup-stack-select-group");
+
+  const targetType = targetTypeEl ? targetTypeEl.value : "stack";
+  if (stackGroup) {
+    stackGroup.classList.toggle("hidden", targetType !== "stack");
+  }
+
+  if (targetType === "stack" && stackSelect) {
+    const selectedOpt = stackSelect.options[stackSelect.selectedIndex];
+    const stackName = stackSelect.value || "";
+    const sourcePath = selectedOpt ? selectedOpt.getAttribute("data-source-path") || "" : "";
+    if (sourcePathInput && sourcePath) {
+      sourcePathInput.value = sourcePath;
+    }
+    if (targetNameInput && stackName) {
+      targetNameInput.value = stackName;
+    }
+  }
+}
+
+/**
+ * Read current values from #backup-create-form.
+ */
+function getBackupFormPayload() {
+  const target_type = document.getElementById("backup-target-type")?.value || "stack";
+  const stack_name = document.getElementById("backup-stack-select")?.value || "";
+  const source_path = (document.getElementById("backup-source-path")?.value || "").trim();
+  const target_name = (
+    document.getElementById("backup-target-name")?.value ||
+    (target_type === "stack" ? stack_name : "")
+  ).trim();
+  const rawExcludes = (document.getElementById("backup-excludes")?.value || "").trim();
+  const excludes = rawExcludes
+    ? rawExcludes
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const retain_count = Math.max(
+    1,
+    parseInt(document.getElementById("backup-retain-count")?.value || "7", 10) || 7
+  );
+  const stop_containers = Boolean(document.getElementById("backup-stop-containers")?.checked);
+
+  return {
+    target_type,
+    stack_name: target_type === "stack" ? stack_name || target_name : "",
+    source_path,
+    target_name: target_name || stack_name || "backup",
+    name: target_name || stack_name || "Backup Target",
+    excludes,
+    stop_containers,
+    retain_count,
+  };
+}
+
+/**
+ * Execute a backup immediately via POST /api/backups/run.
+ */
+async function executeBackupRun(payload, buttonEl = null) {
+  const origText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Backing up...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/backups/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Backup failed (HTTP ${resp.status})`);
+    }
+
+    const archiveName = data.archive?.filename || payload.target_name || "archive";
+    showToast({
+      title: "Backup Completed",
+      message: data.message || `Created backup archive ${archiveName}.`,
+      type: "success",
+    });
+    await fetchBackups();
+  } catch (err) {
+    console.error("executeBackupRun error:", err);
+    showToast({
+      title: "Backup Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = origText;
+    }
+  }
+}
+
+/**
+ * Save a reusable backup target via POST /api/backups/targets.
+ */
+async function saveBackupTarget(buttonEl = null) {
+  const payload = getBackupFormPayload();
+  if (!payload.source_path && payload.target_type === "directory") {
+    showToast({
+      title: "Source Path Required",
+      message: "Please enter a host directory path to save as a backup target.",
+      type: "warning",
+    });
+    return;
+  }
+
+  const origText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Saving...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/backups/targets", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to save backup target (HTTP ${resp.status})`);
+    }
+
+    showToast({
+      title: "Backup Target Saved",
+      message: `Saved backup target "${payload.name}".`,
+      type: "success",
+    });
+    await fetchBackups();
+  } catch (err) {
+    console.error("saveBackupTarget error:", err);
+    showToast({
+      title: "Save Target Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = origText;
+    }
+  }
+}
+
+/**
+ * Delete a saved backup target via DELETE /api/backups/targets/{target_id}.
+ */
+async function deleteBackupTarget(targetId) {
+  if (!targetId) return;
+  if (!confirm("Remove this saved backup target? (Existing archive files will not be deleted)")) {
+    return;
+  }
+  try {
+    const resp = await apiFetch("/api/backups/targets/" + encodeURIComponent(targetId), {
+      method: "DELETE",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to delete target (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: "Target Removed",
+      message: "Saved backup target removed.",
+      type: "success",
+    });
+    await fetchBackups();
+  } catch (err) {
+    console.error("deleteBackupTarget error:", err);
+    showToast({
+      title: "Delete Target Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
+ * Restore a backup archive via POST /api/backups/archives/{filename}/restore.
+ */
+async function restoreBackupArchive(filename, defaultDest = "") {
+  if (!filename) return;
+  const destInput = prompt(
+    `Restore backup archive "${filename}".\n\nEnter destination directory path (leave blank to restore to original source path ${defaultDest || ""}):`,
+    defaultDest || ""
+  );
+  if (destInput === null) return;
+
+  try {
+    const resp = await apiFetch("/api/backups/archives/" + encodeURIComponent(filename) + "/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ destination_path: destInput.trim() }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to restore archive (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: "Archive Restored",
+      message: data.message || `Successfully restored ${filename}.`,
+      type: "success",
+    });
+  } catch (err) {
+    console.error("restoreBackupArchive error:", err);
+    showToast({
+      title: "Restore Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
+ * Delete a backup archive via DELETE /api/backups/archives/{filename}.
+ */
+async function deleteBackupArchive(filename) {
+  if (!filename) return;
+  if (!confirm(`Permanently delete backup archive "${filename}" from disk?`)) {
+    return;
+  }
+  try {
+    const resp = await apiFetch("/api/backups/archives/" + encodeURIComponent(filename), {
+      method: "DELETE",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to delete archive (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: "Archive Deleted",
+      message: `Deleted backup archive ${filename}.`,
+      type: "success",
+    });
+    await fetchBackups();
+  } catch (err) {
+    console.error("deleteBackupArchive error:", err);
+    showToast({
+      title: "Delete Archive Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
+ * Pre-fill the Cron Job form (#cron-job-form) for a given stack or directory target and scroll to it.
+ */
+function prefillCronFormForTarget({ targetType, stackName, sourcePath, targetName, retainCount }) {
+  const jobNameInput = document.getElementById("cron-job-name");
+  const taskTypeSelect = document.getElementById("cron-task-type");
+  const stackInput = document.getElementById("cron-config-stack-name");
+  const pathInput = document.getElementById("cron-config-source-path");
+  const retainInput = document.getElementById("cron-config-retain-count");
+
+  const isStack = targetType === "stack";
+  const label = targetName || stackName || "Directory";
+
+  if (jobNameInput) {
+    jobNameInput.value = `Nightly ${label} Backup`;
+  }
+  if (taskTypeSelect) {
+    taskTypeSelect.value = isStack ? "backup.stack" : "backup.directory";
+    updateCronFormTaskConfigVisibility();
+  }
+  if (isStack && stackInput) {
+    stackInput.value = stackName || targetName || "all";
+  }
+  if (!isStack && pathInput) {
+    pathInput.value = sourcePath || "";
+  }
+  if (retainInput && retainCount) {
+    retainInput.value = String(retainCount);
+  }
+
+  const cronCard = document.getElementById("cron-scheduler-card");
+  cronCard?.scrollIntoView({ behavior: "smooth", block: "start" });
+  jobNameInput?.focus();
+}
+
+/**
+ * Show/hide dynamic task configuration fields in #cron-job-form based on #cron-task-type.
+ */
+function updateCronFormTaskConfigVisibility() {
+  const taskType = document.getElementById("cron-task-type")?.value || "backup.stack";
+  const stackGroup = document.getElementById("cron-config-stack-group");
+  const pathGroup = document.getElementById("cron-config-path-group");
+  const retainGroup = document.getElementById("cron-config-retain-group");
+  const stopGroup = document.getElementById("cron-config-stop-group");
+  const pruneGroup = document.getElementById("cron-config-prune-group");
+
+  const isStackBackup = taskType === "backup.stack";
+  const isDirBackup = taskType === "backup.directory";
+  const isBackup = isStackBackup || isDirBackup;
+  const isDockerPrune = taskType === "docker.prune";
+
+  stackGroup?.classList.toggle("hidden", !isStackBackup);
+  pathGroup?.classList.toggle("hidden", !isDirBackup);
+  retainGroup?.classList.toggle("hidden", !isBackup);
+  stopGroup?.classList.toggle("hidden", !isStackBackup);
+  pruneGroup?.classList.toggle("hidden", !isDockerPrune);
+}
+
+/**
+ * Fetch scheduled cron jobs and recent execution runs via GET /api/cron/jobs.
+ */
+async function fetchCronJobs() {
+  try {
+    const resp = await apiFetch("/api/cron/jobs");
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch cron jobs (HTTP ${resp.status})`);
+    }
+    const data = await resp.json();
+    cachedCronData = data;
+    renderCronJobs(data);
+    updateBackupsNavBadge();
+  } catch (err) {
+    console.error("fetchCronJobs error:", err);
+  }
+}
+
+/**
+ * Render Unified Cron Scheduler Jobs Table and Recent Execution Runs Table.
+ */
+function renderCronJobs(data) {
+  if (!data) return;
+
+  const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+  const recentRuns = Array.isArray(data.recent_runs) ? data.recent_runs : [];
+  const supportedTypes = Array.isArray(data.supported_task_types) ? data.supported_task_types : [];
+
+  const typeLabelMap = new Map();
+  supportedTypes.forEach((t) => {
+    if (t && t.type) typeLabelMap.set(t.type, t.label || t.type);
+  });
+
+  // Update summary ribbon active count
+  const activeCount = jobs.filter((j) => j.enabled).length;
+  const activeJobsEl = document.getElementById("cron-active-jobs-count");
+  if (activeJobsEl) {
+    activeJobsEl.textContent = `${activeCount} Active / ${jobs.length} Total`;
+    activeJobsEl.className = activeCount > 0 ? "status-badge status-ok" : "status-badge status-muted";
+  }
+
+  // 1. Configured Cron Jobs Table (#cron-jobs-tbody)
+  const jobsTbody = document.getElementById("cron-jobs-tbody");
+  if (jobsTbody) {
+    if (jobs.length === 0) {
+      jobsTbody.innerHTML = `<tr><td colspan="7" class="empty-state">No scheduled cron jobs configured. Create a job above to automate backups or maintenance tasks.</td></tr>`;
+    } else {
+      jobsTbody.innerHTML = jobs
+        .map((job) => {
+          const jobId = escapeHtml(String(job.id));
+          const nameSafe = escapeHtml(job.name || "Unnamed Job");
+          const taskType = job.task_type || "";
+          const taskLabel = escapeHtml(typeLabelMap.get(taskType) || taskType);
+          const cfg = job.task_config || {};
+          let targetDesc = "";
+          if (taskType === "backup.stack") {
+            targetDesc = `Stack: ${cfg.stack_name || "all"} (Retain ${cfg.retain_count ?? 7})`;
+          } else if (taskType === "backup.directory") {
+            targetDesc = `Path: ${cfg.source_path || "-"} (Retain ${cfg.retain_count ?? 7})`;
+          } else if (taskType === "docker.prune" && cfg.prune_volumes) {
+            targetDesc = "Include unused volumes";
+          }
+
+          const cronExpr = escapeHtml(job.cron_expression || "");
+          const nextRun = job.enabled
+            ? escapeHtml(job.next_run_iso || formatDateTime(job.next_run_at))
+            : `<span class="text-muted">Paused</span>`;
+
+          let lastRunHtml = `<span class="text-muted">Never run</span>`;
+          if (job.last_run_at || job.last_run_iso) {
+            const lastTime = escapeHtml(job.last_run_iso || formatDateTime(job.last_run_at));
+            const st = String(job.last_status || "unknown").toLowerCase();
+            const stBadgeClass =
+              st === "success" || st === "completed" || st === "ok"
+                ? "status-ok"
+                : st === "running"
+                  ? "status-info"
+                  : "status-danger";
+            lastRunHtml = `
+              <div>
+                <span class="status-badge ${stBadgeClass}">${escapeHtml(st.toUpperCase())}</span>
+                <span class="mono-text text-secondary" style="font-size: 0.78rem; margin-left: 6px;">${lastTime}</span>
+              </div>
+              ${job.last_output ? `<div class="text-secondary" style="font-size: 0.76rem; margin-top: 2px;">${escapeHtml(String(job.last_output).slice(0, 90))}</div>` : ""}
+            `;
+          }
+
+          const enabledBadge = job.enabled
+            ? `<span class="status-badge status-ok">ENABLED</span>`
+            : `<span class="status-badge status-muted">DISABLED</span>`;
+
+          const toggleLabel = job.enabled ? "Disable" : "Enable";
+
+          return `
+            <tr>
+              <td class="font-bold">${nameSafe}</td>
+              <td>
+                <div class="font-bold">${taskLabel}</div>
+                ${targetDesc ? `<div class="mono-text text-secondary" style="font-size: 0.78rem;">${escapeHtml(targetDesc)}</div>` : ""}
+              </td>
+              <td class="mono-text font-bold">${cronExpr}</td>
+              <td class="mono-text text-secondary">${nextRun}</td>
+              <td>${lastRunHtml}</td>
+              <td>${enabledBadge}</td>
+              <td style="text-align: right;">
+                <div class="table-actions-cell">
+                  <button
+                    type="button"
+                    class="btn-backup-action"
+                    data-run-cron-id="${jobId}"
+                    title="Execute job ${nameSafe} immediately"
+                  >
+                    Run Now
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-backup-action btn-schedule"
+                    data-toggle-cron-id="${jobId}"
+                    data-cron-enabled="${job.enabled ? "true" : "false"}"
+                    title="${toggleLabel} job ${nameSafe}"
+                  >
+                    ${toggleLabel}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-icon-danger"
+                    data-delete-cron-id="${jobId}"
+                    title="Delete job ${nameSafe}"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+
+  // 2. Recent Cron Execution Log Table (#cron-runs-tbody)
+  const runsTbody = document.getElementById("cron-runs-tbody");
+  if (runsTbody) {
+    if (recentRuns.length === 0) {
+      runsTbody.innerHTML = `<tr><td colspan="7" class="empty-state">No recent cron job executions recorded.</td></tr>`;
+    } else {
+      runsTbody.innerHTML = recentRuns
+        .map((r) => {
+          const jobName = escapeHtml(r.job_name || `Job #${r.job_id || ""}`);
+          const taskType = escapeHtml(typeLabelMap.get(r.task_type) || r.task_type || "-");
+          const trigger = escapeHtml(String(r.trigger_source || "schedule").toUpperCase());
+          const started = escapeHtml(formatDateTime(r.started_at));
+          const durationMs = Number(r.duration_ms || 0);
+          const durationStr = durationMs >= 1000 ? `${(durationMs / 1000).toFixed(2)}s` : `${durationMs}ms`;
+          const st = String(r.status || "unknown").toLowerCase();
+          const stClass =
+            st === "success" || st === "completed" || st === "ok"
+              ? "status-ok"
+              : st === "running"
+                ? "status-info"
+                : "status-danger";
+          const outputSafe = escapeHtml(r.output || "-");
+
+          return `
+            <tr>
+              <td class="font-bold">${jobName}</td>
+              <td>${taskType}</td>
+              <td><span class="kind-badge">${trigger}</span></td>
+              <td class="mono-text text-secondary">${started}</td>
+              <td class="mono-text">${escapeHtml(durationStr)}</td>
+              <td><span class="status-badge ${stClass}">${escapeHtml(st.toUpperCase())}</span></td>
+              <td class="mono-text text-secondary" style="font-size: 0.78rem;">${outputSafe}</td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+  }
+}
+
+/**
+ * Handle saving a new or updated cron job via POST /api/cron/jobs.
+ */
+async function handleSaveCronJob(e) {
+  if (e) e.preventDefault();
+
+  const name = (document.getElementById("cron-job-name")?.value || "").trim();
+  const task_type = document.getElementById("cron-task-type")?.value || "backup.stack";
+  const cron_expression = (document.getElementById("cron-expression-input")?.value || "").trim();
+  const notify_on_failure = Boolean(document.getElementById("cron-notify-failure")?.checked);
+  const notify_on_success = Boolean(document.getElementById("cron-notify-success")?.checked);
+  const saveBtn = document.getElementById("cron-save-job-btn");
+
+  if (!name || !cron_expression) {
+    showToast({
+      title: "Missing Fields",
+      message: "Please provide both a Job Name and a 5-field Cron Expression.",
+      type: "warning",
+    });
+    return;
+  }
+
+  const task_config = {};
+  if (task_type === "backup.stack") {
+    task_config.stack_name = (document.getElementById("cron-config-stack-name")?.value || "all").trim() || "all";
+    task_config.retain_count = Math.max(
+      1,
+      parseInt(document.getElementById("cron-config-retain-count")?.value || "7", 10) || 7
+    );
+    task_config.stop_containers = Boolean(document.getElementById("cron-config-stop-containers")?.checked);
+  } else if (task_type === "backup.directory") {
+    const srcPath = (document.getElementById("cron-config-source-path")?.value || "").trim();
+    if (!srcPath) {
+      showToast({
+        title: "Directory Path Required",
+        message: "Please specify a Directory Source Path for the Host Directory Backup job.",
+        type: "warning",
+      });
+      return;
+    }
+    task_config.source_path = srcPath;
+    task_config.target_name = name.replace(/\s+/g, "-").toLowerCase();
+    task_config.retain_count = Math.max(
+      1,
+      parseInt(document.getElementById("cron-config-retain-count")?.value || "7", 10) || 7
+    );
+  } else if (task_type === "docker.prune") {
+    task_config.prune_volumes = Boolean(document.getElementById("cron-config-prune-volumes")?.checked);
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/cron/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: null,
+        name,
+        task_type,
+        cron_expression,
+        task_config,
+        enabled: true,
+        notify_on_failure,
+        notify_on_success,
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to save cron job (HTTP ${resp.status})`);
+    }
+
+    showToast({
+      title: "Scheduled Job Saved",
+      message: `Cron job "${name}" (${cron_expression}) saved.`,
+      type: "success",
+    });
+    const nameInput = document.getElementById("cron-job-name");
+    if (nameInput) nameInput.value = "";
+    await fetchCronJobs();
+  } catch (err) {
+    console.error("handleSaveCronJob error:", err);
+    showToast({
+      title: "Save Cron Job Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save Scheduled Job";
+    }
+  }
+}
+
+/**
+ * Enable or disable a cron job via POST /api/cron/jobs/{job_id}/toggle.
+ */
+async function toggleCronJob(jobId, enabled) {
+  if (!jobId) return;
+  try {
+    const resp = await apiFetch("/api/cron/jobs/" + encodeURIComponent(jobId) + "/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to toggle cron job (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: enabled ? "Cron Job Enabled" : "Cron Job Paused",
+      message: `Scheduled job #${jobId} is now ${enabled ? "enabled" : "disabled"}.`,
+      type: "success",
+    });
+    await fetchCronJobs();
+  } catch (err) {
+    console.error("toggleCronJob error:", err);
+    showToast({
+      title: "Toggle Cron Job Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
+ * Execute a cron job immediately via POST /api/cron/jobs/{job_id}/run.
+ */
+async function runCronJobNow(jobId, buttonEl = null) {
+  if (!jobId) return;
+  const origText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Running...";
+  }
+  try {
+    const resp = await apiFetch("/api/cron/jobs/" + encodeURIComponent(jobId) + "/run", {
+      method: "POST",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to run cron job (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: "Cron Job Executed",
+      message: data.output || data.message || `Job #${jobId} completed.`,
+      type: data.status === "failed" ? "danger" : "success",
+    });
+    await refreshBackupsAndCron();
+  } catch (err) {
+    console.error("runCronJobNow error:", err);
+    showToast({
+      title: "Cron Execution Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = origText;
+    }
+  }
+}
+
+/**
+ * Delete a cron job via DELETE /api/cron/jobs/{job_id}.
+ */
+async function deleteCronJob(jobId) {
+  if (!jobId) return;
+  if (!confirm(`Delete scheduled cron job #${jobId}?`)) {
+    return;
+  }
+  try {
+    const resp = await apiFetch("/api/cron/jobs/" + encodeURIComponent(jobId), {
+      method: "DELETE",
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to delete cron job (HTTP ${resp.status})`);
+    }
+    showToast({
+      title: "Cron Job Deleted",
+      message: `Scheduled job #${jobId} removed.`,
+      type: "success",
+    });
+    await fetchCronJobs();
+  } catch (err) {
+    console.error("deleteCronJob error:", err);
+    showToast({
+      title: "Delete Cron Job Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  }
+}
+
+/**
  * Initialize listeners and run startup authentication check.
  */
 function initDashboard() {
@@ -9309,6 +10649,10 @@ function initDashboard() {
   document
     .getElementById("nav-tab-audit")
     ?.addEventListener("click", () => switchViewTab("audit", true));
+
+  document
+    .getElementById("nav-tab-backups")
+    ?.addEventListener("click", () => switchViewTab("backups", true));
 
   // Overview Quick Link Actions
   document
@@ -10312,6 +11656,195 @@ function initDashboard() {
   firewallModal?.addEventListener("click", (e) => {
     if (e.target === firewallModal) closeFirewallModal();
   });
+
+  // SSH Intrusion & IP Ban Manager Listeners
+  const banIpBtn = document.getElementById("sec-ban-ip-btn");
+  const banIpInput = document.getElementById("sec-ban-ip-input");
+
+  banIpBtn?.addEventListener("click", async () => {
+    const ip = (banIpInput?.value || "").trim();
+    if (!ip) {
+      showToast({
+        title: "IP Required",
+        message: "Enter an IPv4/IPv6 address or CIDR to ban.",
+        type: "warning",
+      });
+      banIpInput?.focus();
+      return;
+    }
+    await submitSshIpBan("ban", ip, banIpBtn);
+    if (banIpInput) banIpInput.value = "";
+  });
+
+  banIpInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      banIpBtn?.click();
+    }
+  });
+
+  const sshOffendersTbody = document.getElementById("sec-ssh-offenders-tbody");
+  sshOffendersTbody?.addEventListener("click", (e) => {
+    const banBtn = e.target.closest("[data-ban-ip]");
+    if (banBtn) {
+      const ip = banBtn.getAttribute("data-ban-ip");
+      if (ip) submitSshIpBan("ban", ip, banBtn);
+      return;
+    }
+    const unbanBtn = e.target.closest("[data-unban-ip]");
+    if (unbanBtn) {
+      const ip = unbanBtn.getAttribute("data-unban-ip");
+      if (ip) submitSshIpBan("unban", ip, unbanBtn);
+    }
+  });
+
+  // Backups & Unified Vigil Cron Scheduler Listeners
+  document
+    .getElementById("backups-refresh-btn")
+    ?.addEventListener("click", () => refreshBackupsAndCron(true));
+
+  document
+    .getElementById("backup-target-type")
+    ?.addEventListener("change", () => syncBackupFormWithSelectedStack());
+
+  document
+    .getElementById("backup-stack-select")
+    ?.addEventListener("change", () => syncBackupFormWithSelectedStack());
+
+  const backupRunNowBtn = document.getElementById("backup-run-now-btn");
+  backupRunNowBtn?.addEventListener("click", async () => {
+    const payload = getBackupFormPayload();
+    if (!payload.source_path && payload.target_type === "directory") {
+      showToast({
+        title: "Source Path Required",
+        message: "Please enter a host directory path to back up.",
+        type: "warning",
+      });
+      return;
+    }
+    await executeBackupRun(payload, backupRunNowBtn);
+  });
+
+  const backupSaveTargetBtn = document.getElementById("backup-save-target-btn");
+  backupSaveTargetBtn?.addEventListener("click", () => saveBackupTarget(backupSaveTargetBtn));
+
+  const backupTargetsTbody = document.getElementById("backup-targets-tbody");
+  backupTargetsTbody?.addEventListener("click", (e) => {
+    const runBtn = e.target.closest("[data-backup-now]");
+    if (runBtn) {
+      const target_type = runBtn.getAttribute("data-backup-now") || "stack";
+      const stack_name = runBtn.getAttribute("data-stack-name") || "";
+      const source_path = runBtn.getAttribute("data-source-path") || "";
+      const target_name = runBtn.getAttribute("data-target-name") || stack_name || "backup";
+      const retain_count = parseInt(runBtn.getAttribute("data-retain-count") || "7", 10) || 7;
+      const rawExcludes = runBtn.getAttribute("data-excludes") || "";
+      const excludes = rawExcludes
+        ? rawExcludes
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+      const stop_containers = runBtn.getAttribute("data-stop-containers") === "true";
+
+      executeBackupRun(
+        {
+          target_type,
+          stack_name,
+          source_path,
+          target_name,
+          excludes,
+          stop_containers,
+          retain_count,
+        },
+        runBtn
+      );
+      return;
+    }
+
+    const schedBtn = e.target.closest("[data-schedule-backup]");
+    if (schedBtn) {
+      prefillCronFormForTarget({
+        targetType: schedBtn.getAttribute("data-schedule-backup") || "stack",
+        stackName: schedBtn.getAttribute("data-stack-name") || "",
+        sourcePath: schedBtn.getAttribute("data-source-path") || "",
+        targetName: schedBtn.getAttribute("data-target-name") || "",
+        retainCount: schedBtn.getAttribute("data-retain-count") || "7",
+      });
+      return;
+    }
+
+    const delTargetBtn = e.target.closest("[data-delete-target-id]");
+    if (delTargetBtn) {
+      const targetId = delTargetBtn.getAttribute("data-delete-target-id");
+      if (targetId) deleteBackupTarget(targetId);
+    }
+  });
+
+  const backupArchivesTbody = document.getElementById("backup-archives-tbody");
+  backupArchivesTbody?.addEventListener("click", (e) => {
+    const restoreBtn = e.target.closest("[data-restore-archive]");
+    if (restoreBtn) {
+      const filename = restoreBtn.getAttribute("data-restore-archive");
+      const srcPath = restoreBtn.getAttribute("data-source-path") || "";
+      if (filename) restoreBackupArchive(filename, srcPath === "-" ? "" : srcPath);
+      return;
+    }
+
+    const delArchiveBtn = e.target.closest("[data-delete-archive]");
+    if (delArchiveBtn) {
+      const filename = delArchiveBtn.getAttribute("data-delete-archive");
+      if (filename) deleteBackupArchive(filename);
+    }
+  });
+
+  document
+    .getElementById("cron-task-type")
+    ?.addEventListener("change", updateCronFormTaskConfigVisibility);
+
+  const cronPresetSelect = document.getElementById("cron-preset-select");
+  const cronExprInput = document.getElementById("cron-expression-input");
+  cronPresetSelect?.addEventListener("change", (e) => {
+    const val = e.target.value;
+    if (val && val !== "custom" && cronExprInput) {
+      cronExprInput.value = val;
+    }
+  });
+  cronExprInput?.addEventListener("input", () => {
+    if (!cronPresetSelect) return;
+    const val = cronExprInput.value.trim();
+    const matchingOpt = Array.from(cronPresetSelect.options).find((o) => o.value === val);
+    cronPresetSelect.value = matchingOpt ? val : "custom";
+  });
+
+  document
+    .getElementById("cron-job-form")
+    ?.addEventListener("submit", handleSaveCronJob);
+
+  const cronJobsTbody = document.getElementById("cron-jobs-tbody");
+  cronJobsTbody?.addEventListener("click", (e) => {
+    const runBtn = e.target.closest("[data-run-cron-id]");
+    if (runBtn) {
+      const jobId = runBtn.getAttribute("data-run-cron-id");
+      if (jobId) runCronJobNow(jobId, runBtn);
+      return;
+    }
+
+    const toggleBtn = e.target.closest("[data-toggle-cron-id]");
+    if (toggleBtn) {
+      const jobId = toggleBtn.getAttribute("data-toggle-cron-id");
+      const currentlyEnabled = toggleBtn.getAttribute("data-cron-enabled") === "true";
+      if (jobId) toggleCronJob(jobId, !currentlyEnabled);
+      return;
+    }
+
+    const delBtn = e.target.closest("[data-delete-cron-id]");
+    if (delBtn) {
+      const jobId = delBtn.getAttribute("data-delete-cron-id");
+      if (jobId) deleteCronJob(jobId);
+    }
+  });
+
+  updateCronFormTaskConfigVisibility();
 
   checkAuthStatus();
 }
