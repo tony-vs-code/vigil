@@ -560,6 +560,119 @@
               </div>
             </div>
 
+            <!-- System Telemetry Time-Machine Section -->
+            <section id="telemetry-timemachine-bar" class="telemetry-timemachine-bar" role="region" aria-label="System Telemetry Time-Machine">
+              <div class="telemetry-timemachine-header">
+                <div class="telemetry-timemachine-title-group">
+                  <div class="telemetry-timemachine-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <polyline points="12 6 12 12 16 14"></polyline>
+                    </svg>
+                  </div>
+                  <h3 class="telemetry-timemachine-title">System Telemetry Time-Machine</h3>
+                  <span id="telemetry-timemachine-badge" class="telemetry-timemachine-mode-badge">LIVE STREAM</span>
+                </div>
+
+                <div id="telemetry-range-selector" class="telemetry-range-selector" role="group" aria-label="Telemetry Time Window">
+                  <button id="btn-telemetry-range-live" class="btn-range-pill active" type="button" data-range="live" title="Real-time live telemetry stream">
+                    <span class="live-pulse-dot" aria-hidden="true"></span>
+                    <span>Live</span>
+                  </button>
+                  <button id="btn-telemetry-range-1h" class="btn-range-pill" type="button" data-range="1h" title="Past 1 hour telemetry">
+                    <span>1h</span>
+                  </button>
+                  <button id="btn-telemetry-range-6h" class="btn-range-pill" type="button" data-range="6h" title="Past 6 hours telemetry">
+                    <span>6h</span>
+                  </button>
+                  <button id="btn-telemetry-range-24h" class="btn-range-pill" type="button" data-range="24h" title="Past 24 hours telemetry">
+                    <span>24h</span>
+                  </button>
+                  <button id="btn-telemetry-range-7d" class="btn-range-pill" type="button" data-range="7d" title="Past 7 days telemetry">
+                    <span>7d</span>
+                  </button>
+                </div>
+              </div>
+
+              <!-- Historical Telemetry Summary Ribbon (Hidden in Live mode) -->
+              <div id="telemetry-history-summary" class="telemetry-history-summary hidden" role="region" aria-label="Historical Telemetry Summary">
+                <div class="telemetry-summary-header-row">
+                  <span id="telemetry-history-title" class="telemetry-history-title">Historical Telemetry (Last 1 Hour)</span>
+                  <span id="telemetry-history-samples-count" class="telemetry-samples-badge">0 samples</span>
+                </div>
+                <div class="telemetry-summary-stats-grid">
+                  <div class="telemetry-stat-card">
+                    <div class="telemetry-stat-label-row">
+                      <span class="stat-dot dot-cpu" aria-hidden="true"></span>
+                      <span class="telemetry-stat-name">CPU Load</span>
+                    </div>
+                    <span id="telemetry-stat-cpu" class="telemetry-stat-val">Avg: --% (Min: --% / Max: --%)</span>
+                  </div>
+                  <div class="telemetry-stat-card">
+                    <div class="telemetry-stat-label-row">
+                      <span class="stat-dot dot-mem" aria-hidden="true"></span>
+                      <span class="telemetry-stat-name">Memory</span>
+                    </div>
+                    <span id="telemetry-stat-mem" class="telemetry-stat-val">Avg: --% (Min: --% / Max: --%)</span>
+                  </div>
+                  <div class="telemetry-stat-card">
+                    <div class="telemetry-stat-label-row">
+                      <span class="stat-dot dot-net" aria-hidden="true"></span>
+                      <span class="telemetry-stat-name">Network Throughput</span>
+                    </div>
+                    <span id="telemetry-stat-net" class="telemetry-stat-val">RX: -- / TX: --</span>
+                  </div>
+                  <div class="telemetry-stat-card">
+                    <div class="telemetry-stat-label-row">
+                      <span class="stat-dot dot-temp" aria-hidden="true"></span>
+                      <span class="telemetry-stat-name">CPU Temperature</span>
+                    </div>
+                    <span id="telemetry-stat-temp" class="telemetry-stat-val">Avg: --°C (Min: --°C / Max: --°C)</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Dedicated Historical Multi-Series Chart Container (Hidden in Live mode) -->
+              <div id="telemetry-historical-chart-container" class="telemetry-historical-chart-container hidden" role="region" aria-label="Historical Telemetry Chart">
+                <div class="telemetry-chart-top-bar">
+                  <div class="telemetry-chart-legend" aria-label="Chart Series Legend">
+                    <span class="legend-chip legend-cpu">
+                      <span class="legend-color-dot" style="background-color: #00f0ff;" aria-hidden="true"></span>
+                      <span>CPU</span>
+                    </span>
+                    <span class="legend-chip legend-mem">
+                      <span class="legend-color-dot" style="background-color: #c084fc;" aria-hidden="true"></span>
+                      <span>Memory</span>
+                    </span>
+                    <span class="legend-chip legend-net-rx">
+                      <span class="legend-color-dot" style="background-color: #10b981;" aria-hidden="true"></span>
+                      <span>Net Rx</span>
+                    </span>
+                    <span class="legend-chip legend-net-tx">
+                      <span class="legend-color-dot" style="background-color: #f59e0b;" aria-hidden="true"></span>
+                      <span>Net Tx</span>
+                    </span>
+                  </div>
+                  <div class="telemetry-chart-actions">
+                    <span id="telemetry-chart-status-hint" class="telemetry-chart-hint">Hover or drag across chart to inspect point details</span>
+                  </div>
+                </div>
+
+                <div class="telemetry-canvas-wrapper">
+                  <canvas id="telemetry-historical-canvas" class="telemetry-historical-canvas" width="900" height="260" aria-label="Historical multi-series telemetry graph"></canvas>
+                  <div id="telemetry-historical-tooltip" class="telemetry-historical-tooltip hidden" role="tooltip" aria-hidden="true"></div>
+                  <div id="telemetry-history-empty" class="telemetry-history-empty hidden">
+                    <svg viewBox="0 0 24 24" width="30" height="30" stroke="currentColor" stroke-width="1.75" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="12" y1="8" x2="12" y2="12"></line>
+                      <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                    </svg>
+                    <span>No historical telemetry recorded for this time window yet</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <div class="metrics-grid overview-flow-grid">
               <!-- CPU Telemetry -->
               <article class="metric-card" id="cpu-metric-card">

@@ -120,10 +120,20 @@ async def docker_events_listener(
 
 _notifications_task: Optional[asyncio.Task] = None
 _sentinel_probes_task: Optional[asyncio.Task] = None
+_eval_loop_count: int = 0
 
 
 async def notifications_evaluator_loop() -> None:
+    global _eval_loop_count
     while True:
+        try:
+            main.record_telemetry_sample()
+            _eval_loop_count += 1
+            if _eval_loop_count % 120 == 0:
+                main.prune_telemetry_samples(7)
+        except Exception as exc:
+            logging.debug(f"Telemetry collector in evaluator loop error: {exc}")
+
         try:
             await main.evaluate_threshold_alerts()
             await main.evaluate_scheduled_reports()
@@ -835,6 +845,40 @@ def api_system_network(_user: str = Depends(require_auth)) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Error fetching network metrics: {exc}"
+        )
+
+
+VALID_TELEMETRY_RANGES = {"1h", "6h", "24h", "7d"}
+
+
+@app.get("/api/telemetry/history")
+def api_telemetry_history(
+    range: str = Query(default="1h"),
+    points: int = Query(default=60),
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    if range not in VALID_TELEMETRY_RANGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid range '{range}'. Valid ranges are: {', '.join(sorted(VALID_TELEMETRY_RANGES))}",
+        )
+    try:
+        return main.get_telemetry_history(range_key=range, points_limit=points)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching telemetry history: {exc}"
+        )
+
+
+@app.post("/api/telemetry/sample")
+def api_telemetry_sample(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        return main.record_telemetry_sample()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error recording telemetry sample: {exc}"
         )
 
 
