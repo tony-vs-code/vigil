@@ -3380,7 +3380,7 @@ function connectWebSocket() {
 
   wsConnection.onclose = (event) => {
     wsConnection = null;
-    if (event && event.code === 4401) {
+    if (event && (event.code === 4401 || event.code === 1008)) {
       handleUnauthorized();
       return;
     }
@@ -3559,6 +3559,11 @@ function onAuthenticatedSuccess(username) {
   fetchSmartDisks();
   fetchHardwareThermals();
   fetchNetworkSecurity();
+  refreshBackupsAndCron();
+  updateBackupsNavBadge();
+  if (currentViewTab === "backups") {
+    refreshBackupsAndCron();
+  }
   startSystemUpdatePolling();
 }
 
@@ -10157,6 +10162,8 @@ async function submitSshIpBan(action, ip, buttonEl = null) {
 let cachedBackupsData = null;
 let cachedCronData = null;
 
+let isBackupsAndCronRefreshing = false;
+
 /**
  * Refresh both Backups and Cron Scheduler data.
  */
@@ -10165,6 +10172,8 @@ async function refreshBackupsAndCron(manual = false) {
   if (refreshBtn && manual) {
     refreshBtn.classList.add("spinning");
   }
+  if (isBackupsAndCronRefreshing) return;
+  isBackupsAndCronRefreshing = true;
   try {
     await Promise.all([fetchBackups(), fetchCronJobs()]);
     const updatedEl = document.getElementById("backups-last-updated");
@@ -10172,6 +10181,7 @@ async function refreshBackupsAndCron(manual = false) {
       updatedEl.textContent = `Updated ${formatTimeOnly(new Date())}`;
     }
   } finally {
+    isBackupsAndCronRefreshing = false;
     if (refreshBtn && manual) {
       setTimeout(() => refreshBtn.classList.remove("spinning"), 400);
     }

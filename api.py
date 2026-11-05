@@ -971,7 +971,7 @@ async def api_websocket(websocket: WebSocket) -> None:
 
     if not username:
         await websocket.accept()
-        await websocket.close(code=4401)
+        await websocket.close(code=1008)
         return
 
     await ws_manager.connect(websocket)
