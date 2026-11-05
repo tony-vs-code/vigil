@@ -2658,9 +2658,9 @@ class FastAPIEndpointTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/vigil", install_content)
 
     def test_websocket_auth_snapshot_and_refresh_actions(self):
-        # 1. Unauthenticated connection attempt is closed with code 4401
+        # 1. Unauthenticated connection attempt is closed with code 1008 (policy violation)
         unauth_ws = asgi_ws(api.app, "/api/ws")
-        self.assertEqual(unauth_ws.close_code, 4401)
+        self.assertEqual(unauth_ws.close_code, 1008)
         self.assertEqual(unauth_ws.messages, [])
 
         # 2. Authenticated connection via session_token cookie receives initial snapshot
@@ -11717,6 +11717,148 @@ console.log('OK');
         proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, f"Telemetry Frontend VM test failed: {proc.stderr or proc.stdout}")
         self.assertIn("OK", proc.stdout)
+
+
+class ApiEndpointAuthenticationSecurityTests(unittest.TestCase):
+    """Exhaustive automated security audit verifying that 100% of non-whitelisted API endpoints require auth."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "state.db"
+        self.db_patcher = patch.object(main, "STATE_DB_PATH", self.db_path)
+        self.db_patcher.start()
+        main.init_state_db()
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_all_api_endpoints_require_auth(self):
+        public_whitelist = {
+            ("GET", "/api/auth/status"),
+            ("POST", "/api/auth/login"),
+            ("POST", "/api/auth/setup"),
+            ("POST", "/api/auth/logout"),
+            ("POST", "/api/auth/google"),
+        }
+
+        mock_params = {
+            "disk_name": "sda",
+            "name": "test-item",
+            "id": "item123",
+            "service_name": "test-service",
+            "pid": "1234",
+            "username": "testuser",
+            "groupname": "testgroup",
+            "probe_id": "1",
+            "rule_index": "1",
+            "target_id": "1",
+            "filename": "test-archive.tar.gz",
+            "job_id": "1",
+        }
+
+        def fill_route_path(tmpl: str) -> str:
+            return re.sub(
+                r"\{([a-zA-Z0-9_]+)(?::[a-zA-Z0-9_]+)?\}",
+                lambda m: mock_params.get(m.group(1), "test"),
+                tmpl,
+            )
+
+        api_routes_found = 0
+        tested_endpoints = []
+
+        for route in api.app.routes:
+            path = getattr(route, "path", None)
+            if not path or not path.startswith("/api/"):
+                continue
+
+            # Check for WebSocket endpoint
+            if path == "/api/ws" or getattr(route, "protocol", None) == "websocket":
+                unauth_ws = asgi_ws(api.app, "/api/ws")
+                self.assertEqual(
+                    unauth_ws.close_code,
+                    1008,
+                    f"Expected WebSocket unauth connection to close with 1008, got {unauth_ws.close_code}",
+                )
+                api_routes_found += 1
+                tested_endpoints.append(("WS", "/api/ws"))
+                continue
+
+            # Check HTTP routes
+            methods = getattr(route, "methods", None) or set()
+            for method in sorted(methods):
+                if method in ("HEAD", "OPTIONS"):
+                    continue
+
+                if (method, path) in public_whitelist:
+                    continue
+
+                api_routes_found += 1
+                tested_endpoints.append((method, path))
+
+                # 1. Verify require_auth is declared in dependencies or parameters
+                dependant = getattr(route, "dependant", None)
+                self.assertIsNotNone(
+                    dependant,
+                    f"Route {method} {path} has no dependant object",
+                )
+                dep_calls = [
+                    d.call
+                    for d in (getattr(dependant, "dependencies", []) or [])
+                    if hasattr(d, "call")
+                ]
+                endpoint = getattr(route, "endpoint", None)
+                has_dep = api.require_auth in dep_calls
+                if not has_dep and endpoint:
+                    import inspect
+                    sig = inspect.signature(endpoint)
+                    for param in sig.parameters.values():
+                        if param.default is not inspect.Parameter.empty and hasattr(param.default, "dependency"):
+                            if param.default.dependency == api.require_auth:
+                                has_dep = True
+                                break
+
+                self.assertTrue(
+                    has_dep,
+                    f"Endpoint {method} {path} does NOT declare require_auth dependency!",
+                )
+
+                # 2. Execute an unauthenticated request and assert 401 Unauthorized
+                resolved_path = fill_route_path(path)
+                resp = asgi_request(api.app, method, resolved_path)
+                self.assertEqual(
+                    resp.status_code,
+                    401,
+                    f"Expected 401 for unauthenticated {method} {resolved_path} (from {path}), got {resp.status_code}",
+                )
+
+        self.assertGreater(
+            len(tested_endpoints),
+            40,
+            f"Expected > 40 tested API endpoints, only found {len(tested_endpoints)}",
+        )
+        print(f"\n[AUTH SECURITY AUDIT] Verified {len(tested_endpoints)} non-whitelisted endpoints strictly require authentication.")
+
+    def test_frontend_reload_lifecycle_backups_and_cron(self):
+        """Validate that static/app.js triggers refreshBackupsAndCron and updateBackupsNavBadge on auth success."""
+        app_js_path = Path(__file__).resolve().parent / "static" / "app.js"
+        content = app_js_path.read_text(encoding="utf-8")
+
+        auth_success_match = re.search(
+            r"function\s+onAuthenticatedSuccess\s*\([^)]*\)\s*\{(.*?)\n\}",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(
+            auth_success_match,
+            "onAuthenticatedSuccess function not found in app.js",
+        )
+        auth_body = auth_success_match.group(1)
+
+        self.assertIn("refreshBackupsAndCron()", auth_body)
+        self.assertIn("updateBackupsNavBadge()", auth_body)
+        self.assertIn('currentViewTab === "backups"', auth_body)
+        self.assertIn("isBackupsAndCronRefreshing", content)
 
 
 if __name__ == "__main__":
