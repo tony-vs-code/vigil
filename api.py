@@ -151,6 +151,10 @@ async def notifications_evaluator_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _docker_events_task, _notifications_task, _sentinel_probes_task
+    try:
+        main.init_state_db()
+    except Exception as exc:
+        logging.debug(f"State DB initialization notice: {exc}")
     if _docker_events_task is None or _docker_events_task.done():
         _docker_events_task = asyncio.create_task(docker_events_listener())
     if _notifications_task is None or _notifications_task.done():
@@ -2404,7 +2408,7 @@ class CronJobRequest(BaseModel):
     task_config: dict[str, Any] = {}
     enabled: bool = True
     notify_on_failure: bool = True
-    notify_on_success: bool = False
+    notify_on_success: Optional[bool] = None
 
 
 class BackupConfigRequest(BaseModel):
@@ -2678,12 +2682,48 @@ def api_save_cron_job(
             "message": f"Cron job '{job['name']}' ({job['cron_expression']}) saved.",
         }
     except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         logging.error(f"Error saving cron job: {exc}")
         raise HTTPException(status_code=500, detail=f"Failed to save cron job: {exc}")
+
+
+@app.put("/api/cron/jobs/{job_id}")
+def api_update_cron_job(
+    job_id: int,
+    payload: CronJobRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    try:
+        data = payload.model_dump()
+        data["id"] = int(job_id)
+        job = main.create_or_update_cron_job(
+            data,
+            actor=actor,
+        )
+        return {
+            "success": True,
+            "job": job,
+            "message": f"Cron job '{job['name']}' ({job['cron_expression']}) updated.",
+        }
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        logging.error(f"Error updating cron job {job_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to update cron job: {exc}")
 
 
 @app.post("/api/cron/jobs/{job_id}/toggle")

@@ -1,27 +1,30 @@
-# Release v1.0.26: Historical Telemetry Time-Machine (1h / 6h / 24h / 7d Charts)
+# Release v1.0.27: Cron Job Edit Mode, RAID Discord Status Embeds, and Notification Badges
 
 ## Overview
-Vigil v1.0.26 introduces the **Historical Telemetry Time-Machine**, giving host operators deep operational visibility into past system performance. Operating alongside real-time live telemetry, the Time-Machine features an embedded SQLite time-series persistence engine, adaptive bucketed aggregation, and a responsive High-DPI multi-series chart with interactive tooltips and summary metrics across 1-hour, 6-hour, 24-hour, and 7-day observation windows.
+Vigil v1.0.27 introduces significant enhancements to the unified Cron Scheduler and Discord automated reporting pipeline. Scheduled storage and health tasks now broadcast rich Discord status reports for routine healthy operations, jobs feature full interactive edit workflows in the dashboard, and job notification routing is surfaced with clear visual badge indicators.
 
 ## Highlights & Enhancements
 
-### 1. SQLite Time-Series Persistence & 7-Day Auto-Pruning
-- **Dedicated Telemetry Storage**: Persists periodic host resource snapshots into a indexed SQLite table (`telemetry_samples`) capturing CPU load, memory utilization, swap usage, disk capacity, temperature, and network RX/TX transfer rates.
-- **Background Sampling Engine**: Automatic background evaluation captures system metrics every 15 seconds without blocking API requests or degrading host performance.
-- **Automated Retention Pruning**: Enforces a rolling 7-day data retention policy (`prune_telemetry_samples`), automatically cleaning up expired records to maintain a lean database footprint.
+### 1. Rich RAID Status Embeds for Scheduled Storage Checks
+- **Automated Health Dispatch**: `storage.smart_check` scheduled tasks now format and dispatch full RAID Discord embeds (including array state, component device telemetry, disk health metrics, and formatted `duf` disk space breakdown) on every execution.
+- **Healthy State Visibility**: Routine checks on healthy `clean` or `active` arrays now reliably deliver affirmative status reports to Discord instead of silently terminating on non-degraded checks.
 
-### 2. Bucketed Aggregation Engine & Telemetry History API
-- **Dynamic Downsampling**: Added `GET /api/telemetry/history?range={1h|6h|24h|7d}&points={10-300}` delivering time-bucketed averages and interpolated points tailored for canvas rendering.
-- **Statistical Summaries**: Computes comprehensive min, max, and average resource utilization metrics for each window, providing operators with immediate high-level capacity insights.
-- **Manual Sample Ingestion Endpoint**: Added `POST /api/telemetry/sample` enabling on-demand sample capture or external metric ingestion.
+### 2. Default Success Notifications for Summary Tasks
+- **Intelligent Defaults**: Summary and observability tasks (`storage.smart_check` and `notifications.summary`) now default to `notify_on_success = true`.
+- **Operator Confidence**: Routine status tasks immediately confirm operational health across notification channels without requiring manual configuration tweaks.
 
-### 3. Interactive Overview Time-Machine Canvas & Selector Toolbar
-- **Modern Selector Toolbar**: Introduced intuitive pill controls (`Live`, `1h`, `6h`, `24h`, `7d`) in the dashboard Overview tab, allowing instant switching between real-time ticks and historical windows.
-- **High-DPI Multi-Series Canvas Chart**: Custom retina-ready canvas renderer graphing CPU (%), Memory (%), and Network Transfer Rates (KB/s) with clean grid lines and formatted time axes.
-- **Interactive Hover Tooltips & Summary Stats**: Real-time crosshair and hover tooltips showing precise timestamped metrics at any cursor position, backed by min/avg/max summary indicator chips.
+### 3. Interactive Cron Job Edit Mode
+- **1-Click Form Pre-population**: Added an **Edit** action to each job in the Cron table that seamlessly loads the job parameters, task type, schedule timing, notification routing, and configuration payload into the creation form.
+- **Visual Editing Context**: An active `Editing: <Name>` banner highlights the job being updated, toggling the form submission button to **Update Scheduled Job** and providing a **Cancel Edit** button to discard changes and reset the form.
+
+### 4. Notification Routing Badges
+- **Visual Notification Policies**: Introduced clear badge indicators in the Cron table displaying notification behavior at a glance:
+  - `🔔 Success + Failure` (Success & Failure notifications enabled)
+  - `🔔 Failure Only` (Failure notifications enabled)
+  - `🔕 Muted` (No automated notifications)
 
 ## Reliability & Fixes
 
-### Quality & Contract Verification
-- **Cross-Tier Contract Integrity**: Verified 58 frontend API route endpoints and 607 DOM element bindings with zero mismatches or unhandled exceptions.
-- **Comprehensive Automated Test Suite**: Expanded test suite to 229 tests (`229 passed, 0 failures`) covering time-series schema creation, retention pruning, bucket downsampling, summary statistics, API authentication, and UI DOM bindings.
+### Cross-Tier Quality & Contract Verification
+- **DOM & API Alignment**: Full contract alignment across 58 API routes and 611 DOM elements.
+- **Test Suite Pass**: 230/230 tests passed with 0 failures, validating cron job update APIs, Discord embed dispatches, task defaults, and responsive UI interactions.
