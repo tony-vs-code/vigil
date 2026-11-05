@@ -9394,7 +9394,10 @@ const vm = require('vm');
 const code = fs.readFileSync('static/app.js', 'utf8');
 
 function extractFunc(source, name) {
-  const idx = source.indexOf('function ' + name + '(');
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) {
+    idx = source.indexOf('function ' + name + '(');
+  }
   if (idx === -1) throw new Error('Not found: ' + name);
   let depth = 0, started = false, i = idx;
   while (i < source.length) {
@@ -10000,7 +10003,10 @@ const vm = require('vm');
 const code = fs.readFileSync('static/app.js', 'utf8');
 
 function extractFunc(source, name) {
-  const idx = source.indexOf('function ' + name + '(');
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) {
+    idx = source.indexOf('function ' + name + '(');
+  }
   if (idx === -1) throw new Error('Not found: ' + name);
   let depth = 0, started = false, i = idx;
   while (i < source.length) {
@@ -10916,7 +10922,10 @@ const vm = require('vm');
 const code = fs.readFileSync('static/app.js', 'utf8');
 
 function extractFunc(source, name) {
-  const idx = source.indexOf('function ' + name + '(');
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) {
+    idx = source.indexOf('function ' + name + '(');
+  }
   if (idx === -1) throw new Error('Not found: ' + name);
   let depth = 0, started = false, i = idx;
   while (i < source.length) {
@@ -11011,6 +11020,466 @@ console.log('OK');
 """
         proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, f"Backups/Cron Node VM test failed: {proc.stderr or proc.stdout}")
+        self.assertIn("OK", proc.stdout)
+
+
+class TestHistoricalTelemetryTimeMachine(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "raid_state.db"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_telemetry_table_schema_and_init(self):
+        main.init_db(self.db_path)
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            columns = {
+                row[1]: row[2]
+                for row in conn.execute("PRAGMA table_info(telemetry_samples)").fetchall()
+            }
+            expected = {
+                "id": "INTEGER",
+                "timestamp": "INTEGER",
+                "cpu_percent": "REAL",
+                "memory_percent": "REAL",
+                "memory_used_bytes": "INTEGER",
+                "memory_total_bytes": "INTEGER",
+                "net_rx_rate_bps": "REAL",
+                "net_tx_rate_bps": "REAL",
+                "cpu_temp": "REAL",
+            }
+            for col, dtype in expected.items():
+                self.assertIn(col, columns)
+                self.assertEqual(columns[col].upper(), dtype)
+
+            indexes = [
+                row[1]
+                for row in conn.execute("PRAGMA index_list(telemetry_samples)").fetchall()
+            ]
+            self.assertIn("idx_telemetry_samples_timestamp", indexes)
+        finally:
+            conn.close()
+
+    def test_record_telemetry_sample_with_mocked_system_data(self):
+        mock_vm = MagicMock()
+        mock_vm.percent = 55.5
+        mock_vm.used = 8 * 1024 * 1024 * 1024
+        mock_vm.total = 16 * 1024 * 1024 * 1024
+
+        mock_io1 = MagicMock()
+        mock_io1.bytes_recv = 1000000
+        mock_io1.bytes_sent = 500000
+
+        with patch("psutil.cpu_percent", return_value=35.2), \
+             patch("psutil.virtual_memory", return_value=mock_vm), \
+             patch("psutil.net_io_counters", return_value=mock_io1), \
+             patch.object(main, "get_hardware_thermal_metrics", return_value={"cpu_package_c": 52.0}):
+            main._last_telemetry_net_sample = None
+            sample1 = main.record_telemetry_sample(db_path=self.db_path, timestamp=1700000000)
+
+        self.assertEqual(sample1["timestamp"], 1700000000)
+        self.assertEqual(sample1["cpu_percent"], 35.2)
+        self.assertEqual(sample1["memory_percent"], 55.5)
+        self.assertEqual(sample1["memory_used_bytes"], 8 * 1024 * 1024 * 1024)
+        self.assertEqual(sample1["memory_total_bytes"], 16 * 1024 * 1024 * 1024)
+        self.assertEqual(sample1["cpu_temp"], 52.0)
+        self.assertEqual(sample1["net_rx_rate_bps"], 0.0)
+
+        # Second sample after time delta
+        mock_io2 = MagicMock()
+        mock_io2.bytes_recv = 1010000  # +10000 bytes in 1 sec
+        mock_io2.bytes_sent = 505000   # +5000 bytes in 1 sec
+
+        with patch("psutil.cpu_percent", return_value=40.0), \
+             patch("psutil.virtual_memory", return_value=mock_vm), \
+             patch("psutil.net_io_counters", return_value=mock_io2), \
+             patch.object(main, "get_hardware_thermal_metrics", return_value={"cpu_package_c": 54.0}), \
+             patch("time.time", return_value=1700000001.0):
+            main._last_telemetry_net_sample = (1700000000.0, 1000000, 500000)
+            sample2 = main.record_telemetry_sample(db_path=self.db_path, timestamp=1700000001)
+
+        self.assertEqual(sample2["timestamp"], 1700000001)
+        self.assertEqual(sample2["cpu_percent"], 40.0)
+        self.assertEqual(sample2["net_rx_rate_bps"], 10000.0)
+        self.assertEqual(sample2["net_tx_rate_bps"], 5000.0)
+        self.assertEqual(sample2["cpu_temp"], 54.0)
+
+    def test_prune_telemetry_samples(self):
+        now = 1700000000
+        # Sample 10 days old
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=now - (10 * 86400),
+            cpu_percent=10.0,
+            memory_percent=20.0,
+        )
+        # Sample 3 days old
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=now - (3 * 86400),
+            cpu_percent=15.0,
+            memory_percent=25.0,
+        )
+        # Current sample
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=now,
+            cpu_percent=20.0,
+            memory_percent=30.0,
+        )
+
+        with patch("time.time", return_value=float(now)):
+            deleted = main.prune_telemetry_samples(max_age_days=7, db_path=self.db_path)
+
+        self.assertEqual(deleted, 1)
+
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            remaining = conn.execute("SELECT COUNT(*) FROM telemetry_samples").fetchone()[0]
+            self.assertEqual(remaining, 2)
+        finally:
+            conn.close()
+
+    def test_get_telemetry_history_aggregation_and_summary(self):
+        end_time = 1700000000
+        # Insert samples over past hour
+        t1 = end_time - 3000
+        t2 = end_time - 2000
+        t3 = end_time - 1000
+
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=t1,
+            cpu_percent=10.0,
+            memory_percent=20.0,
+            memory_used_bytes=2000,
+            memory_total_bytes=10000,
+            net_rx_rate_bps=100.0,
+            net_tx_rate_bps=50.0,
+            cpu_temp=40.0,
+        )
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=t2,
+            cpu_percent=20.0,
+            memory_percent=40.0,
+            memory_used_bytes=4000,
+            memory_total_bytes=10000,
+            net_rx_rate_bps=200.0,
+            net_tx_rate_bps=100.0,
+            cpu_temp=50.0,
+        )
+        main.record_telemetry_sample(
+            db_path=self.db_path,
+            timestamp=t3,
+            cpu_percent=30.0,
+            memory_percent=60.0,
+            memory_used_bytes=6000,
+            memory_total_bytes=10000,
+            net_rx_rate_bps=300.0,
+            net_tx_rate_bps=150.0,
+            cpu_temp=60.0,
+        )
+
+        # Query 1h history
+        data = main.get_telemetry_history(
+            range_key="1h",
+            points_limit=60,
+            db_path=self.db_path,
+            end_time=end_time,
+        )
+
+        self.assertEqual(data["range"], "1h")
+        self.assertEqual(data["start_time"], end_time - 3600)
+        self.assertEqual(data["end_time"], end_time)
+        self.assertEqual(data["total_samples"], 3)
+        self.assertEqual(data["summary"]["cpu"]["min"], 10.0)
+        self.assertEqual(data["summary"]["cpu"]["max"], 30.0)
+        self.assertEqual(data["summary"]["cpu"]["avg"], 20.0)
+        self.assertEqual(data["summary"]["memory"]["min"], 20.0)
+        self.assertEqual(data["summary"]["memory"]["max"], 60.0)
+        self.assertEqual(data["summary"]["memory"]["avg"], 40.0)
+        self.assertEqual(data["summary"]["net_rx"]["min"], 100.0)
+        self.assertEqual(data["summary"]["net_rx"]["max"], 300.0)
+        self.assertEqual(data["summary"]["net_rx"]["avg"], 200.0)
+        self.assertEqual(data["summary"]["net_tx"]["min"], 50.0)
+        self.assertEqual(data["summary"]["net_tx"]["max"], 150.0)
+        self.assertEqual(data["summary"]["net_tx"]["avg"], 100.0)
+        self.assertEqual(data["summary"]["cpu_temp"]["min"], 40.0)
+        self.assertEqual(data["summary"]["cpu_temp"]["max"], 60.0)
+        self.assertEqual(data["summary"]["cpu_temp"]["avg"], 50.0)
+
+        self.assertTrue(len(data["points"]) >= 1)
+        for pt in data["points"]:
+            self.assertIn("timestamp", pt)
+            self.assertIn("iso_time", pt)
+            self.assertIn("cpu_percent", pt)
+            self.assertIn("memory_percent", pt)
+            self.assertIn("net_rx_rate_bps", pt)
+            self.assertIn("net_tx_rate_bps", pt)
+            self.assertIn("cpu_temp", pt)
+
+        # Check supported ranges 6h, 24h, 7d
+        for r_key in ["6h", "24h", "7d"]:
+            res = main.get_telemetry_history(range_key=r_key, db_path=self.db_path, end_time=end_time)
+            self.assertEqual(res["range"], r_key)
+
+    def test_api_telemetry_history_and_sample_endpoints(self):
+        # 1. Unauthenticated request should fail
+        unauth_resp = asgi_get(api.app, "/api/telemetry/history")
+        self.assertEqual(unauth_resp.status_code, 401)
+
+        unauth_post = asgi_post(api.app, "/api/telemetry/sample")
+        self.assertEqual(unauth_post.status_code, 401)
+
+        # 2. Record a sample via POST
+        with patch("psutil.cpu_percent", return_value=25.0), \
+             patch("psutil.virtual_memory", return_value=MagicMock(percent=45.0, used=4000, total=8000)), \
+             patch.object(main, "get_hardware_thermal_metrics", return_value={"cpu_package_c": 48.5}):
+            post_resp = asgi_post(api.app, "/api/telemetry/sample", cookies=self.auth_cookies)
+
+        self.assertEqual(post_resp.status_code, 200)
+        sample_data = post_resp.json()
+        self.assertEqual(sample_data["cpu_percent"], 25.0)
+        self.assertEqual(sample_data["memory_percent"], 45.0)
+        self.assertEqual(sample_data["cpu_temp"], 48.5)
+
+        # 3. Query history via GET
+        get_resp = asgi_get(api.app, "/api/telemetry/history?range=1h&points=30", cookies=self.auth_cookies)
+        self.assertEqual(get_resp.status_code, 200)
+        hist_data = get_resp.json()
+        self.assertEqual(hist_data["range"], "1h")
+        self.assertEqual(hist_data["total_samples"], 1)
+        self.assertEqual(len(hist_data["points"]), 1)
+        self.assertEqual(hist_data["points"][0]["cpu_percent"], 25.0)
+
+        # 4. Invalid range validation returns 400
+        invalid_resp = asgi_get(api.app, "/api/telemetry/history?range=invalid", cookies=self.auth_cookies)
+        self.assertEqual(invalid_resp.status_code, 400)
+        self.assertIn("Invalid range", invalid_resp.json()["detail"])
+
+    def test_empty_telemetry_history_and_clamped_points(self):
+        # Empty DB returns graceful 0-sample summary
+        empty_hist = main.get_telemetry_history(range_key="1h", points_limit=5, db_path=self.db_path)
+        self.assertEqual(empty_hist["total_samples"], 0)
+        self.assertEqual(empty_hist["points"], [])
+        self.assertEqual(empty_hist["summary"]["cpu"]["avg"], 0.0)
+        # points_limit clamped to 10 minimum: 3600 // 10 = 360 bucket_seconds
+        self.assertEqual(empty_hist["bucket_seconds"], 360)
+
+        # points_limit clamped to 300 maximum: 3600 // 300 = 12 bucket_seconds
+        clamped_high = main.get_telemetry_history(range_key="1h", points_limit=999, db_path=self.db_path)
+        self.assertEqual(clamped_high["bucket_seconds"], 12)
+
+    def test_evaluator_loop_telemetry_integration(self):
+        record_called = False
+        prune_called = False
+
+        def fake_record():
+            nonlocal record_called
+            record_called = True
+            return {}
+
+        def fake_prune(days=7):
+            nonlocal prune_called
+            prune_called = True
+            return 0
+
+        async def run_one_iteration():
+            with patch.object(main, "record_telemetry_sample", side_effect=fake_record), \
+                 patch.object(main, "prune_telemetry_samples", side_effect=fake_prune), \
+                 patch.object(main, "evaluate_threshold_alerts", return_value=None), \
+                 patch.object(main, "evaluate_scheduled_reports", return_value=None), \
+                 patch.object(main, "evaluate_due_cron_jobs", return_value=None), \
+                 patch("asyncio.sleep", side_effect=asyncio.CancelledError):
+                api._eval_loop_count = 119  # next iteration triggers prune (120)
+                try:
+                    await api.notifications_evaluator_loop()
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run_one_iteration())
+        self.assertTrue(record_called)
+        self.assertTrue(prune_called)
+
+    def test_historical_telemetry_frontend_dom_and_vm_contracts(self):
+        import subprocess
+
+        root = Path(__file__).resolve().parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        app_js = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+        # 1. HTML DOM Element contracts
+        required_ids = [
+            "telemetry-timemachine-bar",
+            "btn-telemetry-range-live",
+            "btn-telemetry-range-1h",
+            "btn-telemetry-range-6h",
+            "btn-telemetry-range-24h",
+            "btn-telemetry-range-7d",
+            "telemetry-history-summary",
+            "telemetry-history-title",
+            "telemetry-history-samples-count",
+            "telemetry-stat-cpu",
+            "telemetry-stat-mem",
+            "telemetry-stat-net",
+            "telemetry-stat-temp",
+            "telemetry-historical-chart-container",
+            "telemetry-historical-canvas",
+            "telemetry-historical-tooltip",
+            "telemetry-history-empty",
+        ]
+        for el_id in required_ids:
+            self.assertIn(f'id="{el_id}"', html, f"Missing required telemetry DOM element: id='{el_id}'")
+
+        # 2. Key app.js functions present
+        for fn_name in [
+            "getRangeDescription",
+            "setTelemetryRange",
+            "fetchTelemetryHistory",
+            "renderTelemetryHistorySummary",
+            "renderTelemetryHistoricalChart",
+            "positionTelemetryTooltip",
+            "initTelemetryTimeMachine",
+        ]:
+            self.assertIn(f"function {fn_name}", app_js, f"Missing telemetry JS function: {fn_name}")
+
+        # 3. Node.js VM Contract Execution
+        node_script = """
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) {
+    idx = source.indexOf('function ' + name + '(');
+  }
+  if (idx === -1) throw new Error('Not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') { depth--; if (started && depth === 0) return source.slice(idx, i + 1); }
+    i++;
+  }
+  throw new Error('Unbalanced: ' + name);
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id,
+      textContent: '',
+      innerHTML: '',
+      value: '',
+      style: {},
+      attributes: {},
+      setAttribute(k, v) { this.attributes[k] = String(v); },
+      getAttribute(k) { return this.attributes[k] || ''; },
+      parentElement: { clientWidth: 900, clientHeight: 260 },
+      classList: {
+        _set: new Set(),
+        add(...cls) { cls.forEach(c => this._set.add(c)); },
+        remove(...cls) { cls.forEach(c => this._set.delete(c)); },
+        toggle(c, force) {
+          if (force === undefined) {
+            if (this._set.has(c)) this._set.delete(c); else this._set.add(c);
+          } else if (force) this._set.add(c); else this._set.delete(c);
+        },
+        contains(c) { return this._set.has(c); }
+      }
+    };
+  }
+  return elements[id];
+}
+
+let fetchTelemetryHistoryCalledWith = null;
+const sandbox = {
+  document: { getElementById: getEl, createElement: () => getEl('tmp') },
+  currentTelemetryRange: 'live',
+  cachedTelemetryHistory: null,
+  isFetchingTelemetryHistory: false,
+  activeTelemetryHoverIndex: null,
+  escapeHtml: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+  formatNetworkRate: (bps) => `${Number(bps || 0).toFixed(0)} B/s`,
+  formatDateTime: (ts) => '2026-11-05 12:00:00',
+  fetchTelemetryHistory: async (r) => { fetchTelemetryHistoryCalledWith = r; },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(extractFunc(code, 'getRangeDescription'), sandbox);
+vm.runInContext(extractFunc(code, 'renderTelemetryHistorySummary'), sandbox);
+vm.runInContext(extractFunc(code, 'positionTelemetryTooltip'), sandbox);
+vm.runInContext(extractFunc(code, 'setTelemetryRange'), sandbox);
+
+// Test getRangeDescription
+if (sandbox.getRangeDescription('1h') !== 'Historical Telemetry (Last 1 Hour)') throw new Error('Bad 1h description');
+if (sandbox.getRangeDescription('7d') !== 'Historical Telemetry (Last 7 Days)') throw new Error('Bad 7d description');
+
+// Test setTelemetryRange to 6h
+sandbox.setTelemetryRange('6h');
+if (sandbox.currentTelemetryRange !== '6h') throw new Error('currentTelemetryRange not updated to 6h');
+if (!getEl('btn-telemetry-range-6h').classList.contains('active')) throw new Error('6h button not marked active');
+if (getEl('btn-telemetry-range-live').classList.contains('active')) throw new Error('live button still marked active');
+if (getEl('telemetry-history-summary').classList.contains('hidden')) throw new Error('history summary not visible');
+if (getEl('telemetry-historical-chart-container').classList.contains('hidden')) throw new Error('chart container not visible');
+if (fetchTelemetryHistoryCalledWith !== '6h') throw new Error('fetchTelemetryHistory was not called with 6h');
+
+// Test setTelemetryRange back to live
+sandbox.setTelemetryRange('live');
+if (sandbox.currentTelemetryRange !== 'live') throw new Error('currentTelemetryRange not updated to live');
+if (!getEl('btn-telemetry-range-live').classList.contains('active')) throw new Error('live button not marked active');
+if (!getEl('telemetry-history-summary').classList.contains('hidden')) throw new Error('history summary should be hidden in live');
+if (!getEl('telemetry-historical-chart-container').classList.contains('hidden')) throw new Error('chart container should be hidden in live');
+
+// Test renderTelemetryHistorySummary
+const sampleData = {
+  total_samples: 42,
+  summary: {
+    cpu: { min: 12.5, max: 78.2, avg: 34.1 },
+    memory: { min: 40.0, max: 55.0, avg: 48.0 },
+    net_rx_rate_bps: { min: 100, max: 2000, avg: 500 },
+    net_tx_rate_bps: { min: 50, max: 1000, avg: 250 },
+    cpu_temp: { min: 45.0, max: 68.0, avg: 53.5 }
+  }
+};
+sandbox.renderTelemetryHistorySummary(sampleData);
+if (getEl('telemetry-history-samples-count').textContent !== '42 samples') throw new Error('Bad sample count: ' + getEl('telemetry-history-samples-count').textContent);
+if (!getEl('telemetry-stat-cpu').textContent.includes('Avg: 34.1%')) throw new Error('Bad cpu avg: ' + getEl('telemetry-stat-cpu').textContent);
+if (!getEl('telemetry-stat-mem').textContent.includes('Avg: 48.0%')) throw new Error('Bad mem avg: ' + getEl('telemetry-stat-mem').textContent);
+if (!getEl('telemetry-stat-net').textContent.includes('RX: 500 B/s')) throw new Error('Bad net rx: ' + getEl('telemetry-stat-net').textContent);
+if (!getEl('telemetry-stat-temp').textContent.includes('Avg: 53.5°C')) throw new Error('Bad temp avg: ' + getEl('telemetry-stat-temp').textContent);
+
+// Test positionTelemetryTooltip
+const mockCanvas = { parentElement: { clientWidth: 900, clientHeight: 260 } };
+sandbox.positionTelemetryTooltip(mockCanvas, 150, 80, {
+  timestamp: 1700000000,
+  cpu_percent: 42.0,
+  memory_percent: 60.5,
+  net_rx_rate_bps: 1250,
+  net_tx_rate_bps: 750,
+  cpu_temp: 51.2
+});
+const tooltipEl = getEl('telemetry-historical-tooltip');
+if (tooltipEl.classList.contains('hidden')) throw new Error('Tooltip should not be hidden');
+if (!tooltipEl.innerHTML.includes('42.0%')) throw new Error('Tooltip missing CPU 42.0%');
+if (!tooltipEl.innerHTML.includes('60.5%')) throw new Error('Tooltip missing Mem 60.5%');
+if (!tooltipEl.innerHTML.includes('51.2°C')) throw new Error('Tooltip missing Temp 51.2°C');
+
+console.log('OK');
+"""
+        proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"Telemetry Frontend VM test failed: {proc.stderr or proc.stdout}")
         self.assertIn("OK", proc.stdout)
 
 

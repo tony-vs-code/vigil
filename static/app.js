@@ -1092,6 +1092,563 @@ function renderSystemMetrics(system) {
 }
 
 // ==========================================================================
+// System Telemetry Time-Machine (1h / 6h / 24h / 7d)
+// ==========================================================================
+
+let currentTelemetryRange = "live"; // "live" | "1h" | "6h" | "24h" | "7d"
+let cachedTelemetryHistory = null;
+let isFetchingTelemetryHistory = false;
+let activeTelemetryHoverIndex = null;
+
+function formatNetworkRate(bps) {
+  const num = Number(bps);
+  if (!Number.isFinite(num) || num < 0) return "--";
+  if (num === 0) return "0 bps";
+  if (num >= 1e9) return `${(num / 1e9).toFixed(1)} Gbps`;
+  if (num >= 1e6) return `${(num / 1e6).toFixed(1)} Mbps`;
+  if (num >= 1e3) return `${(num / 1e3).toFixed(1)} Kbps`;
+  return `${Math.round(num)} bps`;
+}
+
+function getRangeDescription(range) {
+  switch (range) {
+    case "1h":
+      return "Historical Telemetry (Last 1 Hour)";
+    case "6h":
+      return "Historical Telemetry (Last 6 Hours)";
+    case "24h":
+      return "Historical Telemetry (Last 24 Hours)";
+    case "7d":
+      return "Historical Telemetry (Last 7 Days)";
+    default:
+      return "Historical Telemetry";
+  }
+}
+
+/**
+ * Switch telemetry display between Live mode and Historical ranges (1h, 6h, 24h, 7d).
+ */
+async function setTelemetryRange(range) {
+  const validRanges = ["live", "1h", "6h", "24h", "7d"];
+  const targetRange = validRanges.includes(range) ? range : "live";
+  currentTelemetryRange = targetRange;
+
+  const buttons = {
+    live: document.getElementById("btn-telemetry-range-live"),
+    "1h": document.getElementById("btn-telemetry-range-1h"),
+    "6h": document.getElementById("btn-telemetry-range-6h"),
+    "24h": document.getElementById("btn-telemetry-range-24h"),
+    "7d": document.getElementById("btn-telemetry-range-7d"),
+  };
+
+  Object.entries(buttons).forEach(([key, btn]) => {
+    if (!btn) return;
+    const isActive = key === targetRange;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+  });
+
+  const badgeEl = document.getElementById("telemetry-timemachine-badge");
+  const summaryEl = document.getElementById("telemetry-history-summary");
+  const chartContainerEl = document.getElementById("telemetry-historical-chart-container");
+
+  if (targetRange === "live") {
+    if (badgeEl) {
+      badgeEl.textContent = "LIVE STREAM";
+      badgeEl.classList.remove("mode-historical");
+    }
+    summaryEl?.classList.add("hidden");
+    chartContainerEl?.classList.add("hidden");
+    activeTelemetryHoverIndex = null;
+    return;
+  }
+
+  // Historical Range Selected (1h, 6h, 24h, 7d)
+  if (badgeEl) {
+    badgeEl.textContent = `HISTORICAL (${targetRange.toUpperCase()})`;
+    badgeEl.classList.add("mode-historical");
+  }
+  summaryEl?.classList.remove("hidden");
+  chartContainerEl?.classList.remove("hidden");
+
+  await fetchTelemetryHistory(targetRange);
+}
+
+/**
+ * Fetch historical telemetry from backend API /api/telemetry/history and update UI.
+ */
+async function fetchTelemetryHistory(range) {
+  if (isFetchingTelemetryHistory) return;
+  isFetchingTelemetryHistory = true;
+
+  const hintEl = document.getElementById("telemetry-chart-status-hint");
+  if (hintEl) hintEl.textContent = `Loading ${range} telemetry history...`;
+
+  const titleEl = document.getElementById("telemetry-history-title");
+  if (titleEl) {
+    titleEl.textContent = getRangeDescription(range);
+  }
+
+  try {
+    const resp = await apiFetch("/api/telemetry/history?range=" + encodeURIComponent(range) + "&points=80");
+    if (!resp.ok) {
+      throw new Error(`GET /api/telemetry/history failed with status ${resp.status}`);
+    }
+    const data = await resp.json();
+    cachedTelemetryHistory = data;
+    renderTelemetryHistorySummary(data);
+    renderTelemetryHistoricalChart(data);
+    if (hintEl) hintEl.textContent = "Hover or drag across chart to inspect point details";
+  } catch (err) {
+    console.error("Failed to fetch telemetry history:", err);
+    if (hintEl) hintEl.textContent = "Failed to load telemetry history.";
+    showToast({
+      title: "Telemetry History Error",
+      message: `Failed to load ${range} historical telemetry: ${err instanceof Error ? err.message : String(err)}`,
+      type: "danger",
+    });
+  } finally {
+    isFetchingTelemetryHistory = false;
+  }
+}
+
+/**
+ * Populate historical summary badges (CPU, Memory, Network, Temp).
+ */
+function renderTelemetryHistorySummary(data) {
+  if (!data) return;
+
+  const samplesBadge = document.getElementById("telemetry-history-samples-count");
+  if (samplesBadge) {
+    const total = data.total_samples ?? (Array.isArray(data.points) ? data.points.length : 0);
+    samplesBadge.textContent = `${total} ${total === 1 ? "sample" : "samples"}`;
+  }
+
+  const summary = data.summary || {};
+
+  // 1. CPU Load
+  const cpuEl = document.getElementById("telemetry-stat-cpu");
+  if (cpuEl) {
+    const s = summary.cpu;
+    if (s && s.avg !== null && s.avg !== undefined) {
+      cpuEl.textContent = `Avg: ${Number(s.avg).toFixed(1)}% (Min: ${Number(s.min).toFixed(1)}% / Max: ${Number(s.max).toFixed(1)}%)`;
+    } else {
+      cpuEl.textContent = "Avg: --% (Min: --% / Max: --%)";
+    }
+  }
+
+  // 2. Memory
+  const memEl = document.getElementById("telemetry-stat-mem");
+  if (memEl) {
+    const s = summary.memory;
+    if (s && s.avg !== null && s.avg !== undefined) {
+      memEl.textContent = `Avg: ${Number(s.avg).toFixed(1)}% (Min: ${Number(s.min).toFixed(1)}% / Max: ${Number(s.max).toFixed(1)}%)`;
+    } else {
+      memEl.textContent = "Avg: --% (Min: --% / Max: --%)";
+    }
+  }
+
+  // 3. Network Throughput
+  const netEl = document.getElementById("telemetry-stat-net");
+  if (netEl) {
+    const rx = summary.net_rx_rate_bps || summary.net_rx;
+    const tx = summary.net_tx_rate_bps || summary.net_tx;
+    if (rx || tx) {
+      const rxAvg = rx?.avg ?? 0;
+      const rxMax = rx?.max ?? 0;
+      const txAvg = tx?.avg ?? 0;
+      const txMax = tx?.max ?? 0;
+      netEl.textContent = `RX: ${formatNetworkRate(rxAvg)} (Max: ${formatNetworkRate(rxMax)}) / TX: ${formatNetworkRate(txAvg)} (Max: ${formatNetworkRate(txMax)})`;
+    } else {
+      netEl.textContent = "RX: -- / TX: --";
+    }
+  }
+
+  // 4. CPU Temperature
+  const tempEl = document.getElementById("telemetry-stat-temp");
+  if (tempEl) {
+    const s = summary.cpu_temp;
+    if (s && s.avg !== null && s.avg !== undefined) {
+      tempEl.textContent = `Avg: ${Number(s.avg).toFixed(1)}°C (Min: ${Number(s.min).toFixed(1)}°C / Max: ${Number(s.max).toFixed(1)}°C)`;
+    } else {
+      tempEl.textContent = "Avg: --°C (Min: --°C / Max: --°C)";
+    }
+  }
+}
+
+/**
+ * Render multi-line time-series graph on #telemetry-historical-canvas.
+ */
+function renderTelemetryHistoricalChart(data) {
+  const canvas = document.getElementById("telemetry-historical-canvas");
+  const emptyEl = document.getElementById("telemetry-history-empty");
+  if (!canvas) return;
+
+  const points = Array.isArray(data?.points) ? data.points : [];
+  if (points.length === 0) {
+    emptyEl?.classList.remove("hidden");
+    const ctx = canvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+
+  emptyEl?.classList.add("hidden");
+
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const w = Math.floor(rect.width) || canvas.clientWidth || 900;
+  const h = Math.floor(rect.height) || canvas.clientHeight || 260;
+
+  const targetW = Math.round(w * dpr);
+  const targetH = Math.round(h * dpr);
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
+  }
+
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  // 1. Dark cockpit background
+  ctx.fillStyle = "rgba(4, 9, 20, 0.85)";
+  ctx.fillRect(0, 0, w, h);
+
+  // 2. Plot margins
+  const padLeft = 44;
+  const padRight = 56;
+  const padTop = 18;
+  const padBottom = 28;
+  const plotW = Math.max(10, w - padLeft - padRight);
+  const plotH = Math.max(10, h - padTop - padBottom);
+
+  // 3. Gridlines and Left Y-Axis (0 - 100%)
+  const yTicks = [100, 75, 50, 25, 0];
+  ctx.lineWidth = 1;
+  yTicks.forEach((pct) => {
+    const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
+    ctx.strokeStyle = pct === 0 ? "rgba(148, 163, 184, 0.35)" : "rgba(71, 85, 105, 0.22)";
+    ctx.beginPath();
+    ctx.moveTo(padLeft, y);
+    ctx.lineTo(w - padRight, y);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
+    ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(`${pct}%`, padLeft - 5, y);
+  });
+
+  // Secondary scale for Net Throughput (Right Y-Axis)
+  let maxNetBps = 1000;
+  points.forEach((p) => {
+    if (p.net_rx_rate_bps && p.net_rx_rate_bps > maxNetBps) maxNetBps = p.net_rx_rate_bps;
+    if (p.net_tx_rate_bps && p.net_tx_rate_bps > maxNetBps) maxNetBps = p.net_tx_rate_bps;
+  });
+  maxNetBps = Math.ceil(maxNetBps * 1.15);
+
+  const rightYTop = Math.round(padTop) + 0.5;
+  const rightYMid = Math.round(padTop + plotH * 0.5) + 0.5;
+  ctx.fillStyle = "rgba(16, 185, 129, 0.75)";
+  ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(formatNetworkRate(maxNetBps), w - padRight + 6, rightYTop);
+  ctx.fillText(formatNetworkRate(maxNetBps / 2), w - padRight + 6, rightYMid);
+
+  // 4. X-Axis Time Span and Vertical Ticks
+  const startTime = data.start_time || points[0].timestamp;
+  const endTime = data.end_time || points[points.length - 1].timestamp;
+  const timeSpan = Math.max(1, endTime - startTime);
+
+  const numVTicks = Math.min(6, Math.max(3, Math.floor(plotW / 140)));
+  ctx.strokeStyle = "rgba(71, 85, 105, 0.16)";
+  ctx.fillStyle = "rgba(148, 163, 184, 0.65)";
+  ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+
+  for (let i = 0; i <= numVTicks; i++) {
+    const fraction = i / numVTicks;
+    const x = Math.round(padLeft + plotW * fraction) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, padTop);
+    ctx.lineTo(x, padTop + plotH);
+    ctx.stroke();
+
+    const tVal = startTime + fraction * timeSpan;
+    const timeLabel = formatDateTime(tVal, {
+      month: data.range === "7d" ? "numeric" : undefined,
+      day: data.range === "7d" ? "numeric" : undefined,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: undefined,
+    });
+    ctx.fillText(timeLabel, x, padTop + plotH + 6);
+  }
+
+  // 5. Compute coordinates for each series
+  const seriesCoords = points.map((p) => {
+    const t = p.timestamp || startTime;
+    const x = padLeft + ((t - startTime) / timeSpan) * plotW;
+    p._x = x;
+
+    const cpuP = Math.max(0, Math.min(100, Number(p.cpu_percent) || 0));
+    const memP = Math.max(0, Math.min(100, Number(p.memory_percent) || 0));
+    const rxP = Math.max(0, Math.min(maxNetBps, Number(p.net_rx_rate_bps) || 0));
+    const txP = Math.max(0, Math.min(maxNetBps, Number(p.net_tx_rate_bps) || 0));
+
+    const yCpu = padTop + plotH * (1 - cpuP / 100);
+    const yMem = padTop + plotH * (1 - memP / 100);
+    const yRx = padTop + plotH * (1 - rxP / maxNetBps);
+    const yTx = padTop + plotH * (1 - txP / maxNetBps);
+
+    return { x, yCpu, yMem, yRx, yTx, p };
+  });
+
+  // Helper to draw a line
+  const drawLine = (prop, color, width, isDashed = false) => {
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    if (isDashed) {
+      ctx.setLineDash([4, 3]);
+    }
+    ctx.beginPath();
+    seriesCoords.forEach((pt, idx) => {
+      if (idx === 0) ctx.moveTo(pt.x, pt[prop]);
+      else ctx.lineTo(pt.x, pt[prop]);
+    });
+    ctx.stroke();
+    ctx.restore();
+  };
+
+  // Subtle Area Gradient Under CPU Line
+  if (seriesCoords.length > 0) {
+    ctx.save();
+    const areaGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+    areaGrad.addColorStop(0, "rgba(0, 240, 255, 0.14)");
+    areaGrad.addColorStop(1, "rgba(0, 240, 255, 0.0)");
+    ctx.beginPath();
+    ctx.moveTo(seriesCoords[0].x, padTop + plotH);
+    seriesCoords.forEach((pt) => ctx.lineTo(pt.x, pt.yCpu));
+    ctx.lineTo(seriesCoords[seriesCoords.length - 1].x, padTop + plotH);
+    ctx.closePath();
+    ctx.fillStyle = areaGrad;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Draw Series in Order (Net RX, Net TX, Memory, CPU)
+  drawLine("yRx", "#10b981", 1.6, true);
+  drawLine("yTx", "#f59e0b", 1.6, true);
+  drawLine("yMem", "#c084fc", 2.0, false);
+  drawLine("yCpu", "#00f0ff", 2.2, false);
+
+  // 6. Interactive Hover Crosshair and Tooltip
+  if (
+    activeTelemetryHoverIndex !== null &&
+    activeTelemetryHoverIndex >= 0 &&
+    activeTelemetryHoverIndex < seriesCoords.length
+  ) {
+    const hoverItem = seriesCoords[activeTelemetryHoverIndex];
+    const hx = hoverItem.x;
+
+    // Vertical crosshair
+    ctx.save();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 2]);
+    ctx.beginPath();
+    ctx.moveTo(hx, padTop);
+    ctx.lineTo(hx, padTop + plotH);
+    ctx.stroke();
+    ctx.restore();
+
+    // Data point circles
+    const drawDot = (y, color) => {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.strokeStyle = "#0b0f19";
+      ctx.lineWidth = 2;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 6;
+      ctx.beginPath();
+      ctx.arc(hx, y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    };
+
+    drawDot(hoverItem.yRx, "#10b981");
+    drawDot(hoverItem.yTx, "#f59e0b");
+    drawDot(hoverItem.yMem, "#c084fc");
+    drawDot(hoverItem.yCpu, "#00f0ff");
+  }
+
+  ctx.restore();
+}
+
+/**
+ * Position and format hover tooltip over #telemetry-historical-canvas.
+ */
+function positionTelemetryTooltip(canvas, mouseX, mouseY, point) {
+  const tooltip = document.getElementById("telemetry-historical-tooltip");
+  if (!tooltip || !point) return;
+
+  const isoTime = point.iso_time || point.timestamp;
+  const timeFormatted = formatDateTime(isoTime);
+
+  const cpu = point.cpu_percent !== null && point.cpu_percent !== undefined ? `${Number(point.cpu_percent).toFixed(1)}%` : "--";
+  const mem = point.memory_percent !== null && point.memory_percent !== undefined ? `${Number(point.memory_percent).toFixed(1)}%` : "--";
+  const rx = formatNetworkRate(point.net_rx_rate_bps);
+  const tx = formatNetworkRate(point.net_tx_rate_bps);
+  const tempStr = point.cpu_temp !== null && point.cpu_temp !== undefined ? `${Number(point.cpu_temp).toFixed(1)}°C` : null;
+
+  tooltip.innerHTML = `
+    <div class="tt-header">${escapeHtml(timeFormatted)}</div>
+    <div class="tt-row">
+      <div class="tt-label-group">
+        <span class="tt-dot" style="background-color: #00f0ff;"></span>
+        <span class="tt-label">CPU:</span>
+      </div>
+      <span class="tt-val">${cpu}</span>
+    </div>
+    <div class="tt-row">
+      <div class="tt-label-group">
+        <span class="tt-dot" style="background-color: #c084fc;"></span>
+        <span class="tt-label">Memory:</span>
+      </div>
+      <span class="tt-val">${mem}</span>
+    </div>
+    <div class="tt-row">
+      <div class="tt-label-group">
+        <span class="tt-dot" style="background-color: #10b981;"></span>
+        <span class="tt-label">Net Rx:</span>
+      </div>
+      <span class="tt-val">${rx}</span>
+    </div>
+    <div class="tt-row">
+      <div class="tt-label-group">
+        <span class="tt-dot" style="background-color: #f59e0b;"></span>
+        <span class="tt-label">Net Tx:</span>
+      </div>
+      <span class="tt-val">${tx}</span>
+    </div>
+    ${tempStr ? `
+    <div class="tt-row">
+      <div class="tt-label-group">
+        <span class="tt-dot" style="background-color: #f43f5e;"></span>
+        <span class="tt-label">CPU Temp:</span>
+      </div>
+      <span class="tt-val">${tempStr}</span>
+    </div>
+    ` : ""}
+  `;
+
+  tooltip.classList.remove("hidden");
+
+  // Constrain tooltip coordinates within canvas wrapper
+  const wrapper = canvas.parentElement;
+  const wrapW = wrapper?.clientWidth || 900;
+  const wrapH = wrapper?.clientHeight || 260;
+
+  const clampedX = Math.max(90, Math.min(wrapW - 90, mouseX));
+  const clampedY = Math.max(10, Math.min(wrapH - 10, mouseY));
+
+  tooltip.style.left = `${clampedX}px`;
+  tooltip.style.top = `${clampedY}px`;
+}
+
+/**
+ * Initialize event listeners for System Telemetry Time-Machine.
+ */
+function initTelemetryTimeMachine() {
+  const rangeButtons = [
+    { id: "btn-telemetry-range-live", range: "live" },
+    { id: "btn-telemetry-range-1h", range: "1h" },
+    { id: "btn-telemetry-range-6h", range: "6h" },
+    { id: "btn-telemetry-range-24h", range: "24h" },
+    { id: "btn-telemetry-range-7d", range: "7d" },
+  ];
+
+  rangeButtons.forEach(({ id, range }) => {
+    const btn = document.getElementById(id);
+    btn?.addEventListener("click", () => setTelemetryRange(range));
+  });
+
+  const canvas = document.getElementById("telemetry-historical-canvas");
+  if (canvas) {
+    const handleMove = (clientX, clientY) => {
+      if (!cachedTelemetryHistory || !Array.isArray(cachedTelemetryHistory.points) || cachedTelemetryHistory.points.length === 0) {
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = clientX - rect.left;
+      const mouseY = clientY - rect.top;
+
+      let nearestIdx = 0;
+      let minDist = Infinity;
+      const points = cachedTelemetryHistory.points;
+      for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+        if (pt._x !== undefined) {
+          const dist = Math.abs(mouseX - pt._x);
+          if (dist < minDist) {
+            minDist = dist;
+            nearestIdx = i;
+          }
+        }
+      }
+
+      activeTelemetryHoverIndex = nearestIdx;
+      renderTelemetryHistoricalChart(cachedTelemetryHistory);
+      positionTelemetryTooltip(canvas, mouseX, mouseY, points[nearestIdx]);
+    };
+
+    const handleLeave = () => {
+      activeTelemetryHoverIndex = null;
+      const tooltip = document.getElementById("telemetry-historical-tooltip");
+      tooltip?.classList.add("hidden");
+      if (cachedTelemetryHistory) {
+        renderTelemetryHistoricalChart(cachedTelemetryHistory);
+      }
+    };
+
+    canvas.addEventListener("mousemove", (e) => handleMove(e.clientX, e.clientY));
+    canvas.addEventListener("mouseleave", handleLeave);
+
+    canvas.addEventListener("touchstart", (e) => {
+      if (e.touches && e.touches.length > 0) {
+        handleMove(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: true });
+
+    canvas.addEventListener("touchmove", (e) => {
+      if (e.touches && e.touches.length > 0) {
+        handleMove(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: true });
+
+    canvas.addEventListener("touchend", handleLeave, { passive: true });
+    canvas.addEventListener("touchcancel", handleLeave, { passive: true });
+  }
+
+  // Redraw chart on window resize if in historical mode
+  window.addEventListener("resize", () => {
+    if (currentTelemetryRange !== "live" && cachedTelemetryHistory) {
+      renderTelemetryHistoricalChart(cachedTelemetryHistory);
+    }
+  });
+}
+
+// ==========================================================================
 // Hardware Health Cockpit: S.M.A.R.T. Disks & Thermal Telemetry
 // ==========================================================================
 
@@ -11798,6 +12355,8 @@ function initDashboard() {
   });
 
   updateCronFormTaskConfigVisibility();
+
+  initTelemetryTimeMachine();
 
   checkAuthStatus();
 }

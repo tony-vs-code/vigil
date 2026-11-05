@@ -467,6 +467,21 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
         "status TEXT NOT NULL, "
         "output TEXT NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS telemetry_samples ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "timestamp INTEGER NOT NULL, "
+        "cpu_percent REAL NOT NULL, "
+        "memory_percent REAL NOT NULL, "
+        "memory_used_bytes INTEGER NOT NULL DEFAULT 0, "
+        "memory_total_bytes INTEGER NOT NULL DEFAULT 0, "
+        "net_rx_rate_bps REAL NOT NULL DEFAULT 0, "
+        "net_tx_rate_bps REAL NOT NULL DEFAULT 0, "
+        "cpu_temp REAL DEFAULT NULL)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_telemetry_samples_timestamp ON telemetry_samples(timestamp)"
+    )
     connection.commit()
     return connection
 
@@ -551,6 +566,9 @@ def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
             conn.commit()
     finally:
         conn.close()
+
+
+init_db = init_state_db
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -8499,6 +8517,290 @@ def get_system_metrics_data() -> dict[str, Any]:
         "os_distro": os_distro,
         "hostname": platform.node() or "localhost",
     }
+
+
+_last_telemetry_net_sample: Optional[tuple[float, int, int]] = None
+TELEMETRY_RANGE_SECONDS: dict[str, int] = {
+    "1h": 3600,
+    "6h": 21600,
+    "24h": 86400,
+    "7d": 604800,
+}
+
+
+def record_telemetry_sample(
+    db_path: Path = STATE_DB_PATH,
+    timestamp: Optional[int] = None,
+    cpu_percent: Optional[float] = None,
+    memory_percent: Optional[float] = None,
+    memory_used_bytes: Optional[int] = None,
+    memory_total_bytes: Optional[int] = None,
+    net_rx_rate_bps: Optional[float] = None,
+    net_tx_rate_bps: Optional[float] = None,
+    cpu_temp: Optional[float] = None,
+) -> dict[str, Any]:
+    """Collect real-time system telemetry and record a new historical sample into SQLite."""
+    global _last_telemetry_net_sample
+    now_f = time.time()
+    ts = int(now_f) if timestamp is None else int(timestamp)
+
+    if cpu_percent is None:
+        try:
+            cpu_percent = round(float(psutil.cpu_percent(interval=None)), 1)
+        except Exception:
+            cpu_percent = 0.0
+    else:
+        cpu_percent = round(float(cpu_percent), 1)
+
+    if memory_percent is None or memory_used_bytes is None or memory_total_bytes is None:
+        try:
+            vm = psutil.virtual_memory()
+            if memory_percent is None:
+                memory_percent = round(float(getattr(vm, "percent", 0.0) or 0.0), 1)
+            if memory_used_bytes is None:
+                memory_used_bytes = int(getattr(vm, "used", 0) or 0)
+            if memory_total_bytes is None:
+                memory_total_bytes = int(getattr(vm, "total", 0) or 0)
+        except Exception:
+            if memory_percent is None:
+                memory_percent = 0.0
+            if memory_used_bytes is None:
+                memory_used_bytes = 0
+            if memory_total_bytes is None:
+                memory_total_bytes = 0
+    else:
+        memory_percent = round(float(memory_percent), 1)
+        memory_used_bytes = int(memory_used_bytes)
+        memory_total_bytes = int(memory_total_bytes)
+
+    if net_rx_rate_bps is None or net_tx_rate_bps is None:
+        calc_rx = 0.0
+        calc_tx = 0.0
+        try:
+            cur_rx = 0
+            cur_tx = 0
+            if hasattr(psutil, "net_io_counters"):
+                tot_io = psutil.net_io_counters(pernic=False)
+                if tot_io and not isinstance(tot_io, dict):
+                    cur_rx = int(getattr(tot_io, "bytes_recv", 0) or 0)
+                    cur_tx = int(getattr(tot_io, "bytes_sent", 0) or 0)
+            if cur_rx == 0 and cur_tx == 0:
+                net_m = get_network_metrics()
+                cur_rx = int(net_m.get("total_bytes_recv", 0) or 0)
+                cur_tx = int(net_m.get("total_bytes_sent", 0) or 0)
+
+            if _last_telemetry_net_sample is not None:
+                prev_t, prev_rx, prev_tx = _last_telemetry_net_sample
+                dt = now_f - prev_t
+                if dt > 0.001:
+                    calc_rx = max(0.0, float(cur_rx - prev_rx) / dt)
+                    calc_tx = max(0.0, float(cur_tx - prev_tx) / dt)
+            _last_telemetry_net_sample = (now_f, cur_rx, cur_tx)
+        except Exception:
+            pass
+
+        if net_rx_rate_bps is None:
+            net_rx_rate_bps = round(calc_rx, 2)
+        else:
+            net_rx_rate_bps = round(float(net_rx_rate_bps), 2)
+        if net_tx_rate_bps is None:
+            net_tx_rate_bps = round(calc_tx, 2)
+        else:
+            net_tx_rate_bps = round(float(net_tx_rate_bps), 2)
+    else:
+        net_rx_rate_bps = round(float(net_rx_rate_bps), 2)
+        net_tx_rate_bps = round(float(net_tx_rate_bps), 2)
+
+    if cpu_temp is None:
+        try:
+            thermal = get_hardware_thermal_metrics()
+            temp_val = thermal.get("cpu_package_c")
+            if temp_val is None:
+                cores = thermal.get("cores") or []
+                if cores:
+                    temp_val = cores[0].get("temp_c")
+                else:
+                    sensors = thermal.get("sensors") or []
+                    if sensors:
+                        temp_val = sensors[0].get("temp_c")
+            if temp_val is not None:
+                cpu_temp = round(float(temp_val), 1)
+        except Exception:
+            cpu_temp = None
+    else:
+        cpu_temp = round(float(cpu_temp), 1)
+
+    conn = _connect_state_db(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO telemetry_samples
+            (timestamp, cpu_percent, memory_percent, memory_used_bytes, memory_total_bytes, net_rx_rate_bps, net_tx_rate_bps, cpu_temp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                cpu_percent,
+                memory_percent,
+                memory_used_bytes,
+                memory_total_bytes,
+                net_rx_rate_bps,
+                net_tx_rate_bps,
+                cpu_temp,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "timestamp": ts,
+        "cpu_percent": cpu_percent,
+        "memory_percent": memory_percent,
+        "memory_used_bytes": memory_used_bytes,
+        "memory_total_bytes": memory_total_bytes,
+        "net_rx_rate_bps": net_rx_rate_bps,
+        "net_tx_rate_bps": net_tx_rate_bps,
+        "cpu_temp": cpu_temp,
+    }
+
+
+def prune_telemetry_samples(max_age_days: int = 7, db_path: Path = STATE_DB_PATH) -> int:
+    """Delete historical telemetry samples older than max_age_days. Returns deleted count."""
+    cutoff = int(time.time()) - (int(max_age_days) * 86400)
+    conn = _connect_state_db(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM telemetry_samples WHERE timestamp < ?", (cutoff,))
+        deleted = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def get_telemetry_history(
+    range_key: str = "1h",
+    points_limit: int = 60,
+    db_path: Path = STATE_DB_PATH,
+    end_time: Optional[int] = None,
+) -> dict[str, Any]:
+    """Retrieve historical telemetry samples bucketed and summarized over a requested window."""
+    norm_range = range_key if range_key in TELEMETRY_RANGE_SECONDS else "1h"
+    range_seconds = TELEMETRY_RANGE_SECONDS[norm_range]
+
+    try:
+        points_limit_val = int(points_limit)
+    except (ValueError, TypeError):
+        points_limit_val = 60
+    points_limit_val = max(10, min(300, points_limit_val))
+
+    bucket_seconds = max(1, range_seconds // points_limit_val)
+
+    if end_time is None:
+        end_time_val = int(time.time())
+    else:
+        end_time_val = int(end_time)
+    start_time_val = end_time_val - range_seconds
+
+    conn = _connect_state_db(db_path)
+    try:
+        summary_row = conn.execute(
+            """
+            SELECT
+                COUNT(*),
+                MIN(cpu_percent), MAX(cpu_percent), AVG(cpu_percent),
+                MIN(memory_percent), MAX(memory_percent), AVG(memory_percent),
+                MIN(net_rx_rate_bps), MAX(net_rx_rate_bps), AVG(net_rx_rate_bps),
+                MIN(net_tx_rate_bps), MAX(net_tx_rate_bps), AVG(net_tx_rate_bps),
+                MIN(cpu_temp), MAX(cpu_temp), AVG(cpu_temp)
+            FROM telemetry_samples
+            WHERE timestamp >= ? AND timestamp <= ?
+            """,
+            (start_time_val, end_time_val),
+        ).fetchone()
+
+        total_samples = summary_row[0] if summary_row else 0
+
+        if total_samples > 0 and summary_row is not None:
+            summary = {
+                "cpu": {
+                    "min": round(summary_row[1], 1) if summary_row[1] is not None else 0.0,
+                    "max": round(summary_row[2], 1) if summary_row[2] is not None else 0.0,
+                    "avg": round(summary_row[3], 1) if summary_row[3] is not None else 0.0,
+                },
+                "memory": {
+                    "min": round(summary_row[4], 1) if summary_row[4] is not None else 0.0,
+                    "max": round(summary_row[5], 1) if summary_row[5] is not None else 0.0,
+                    "avg": round(summary_row[6], 1) if summary_row[6] is not None else 0.0,
+                },
+                "net_rx": {
+                    "min": round(summary_row[7], 2) if summary_row[7] is not None else 0.0,
+                    "max": round(summary_row[8], 2) if summary_row[8] is not None else 0.0,
+                    "avg": round(summary_row[9], 2) if summary_row[9] is not None else 0.0,
+                },
+                "net_tx": {
+                    "min": round(summary_row[10], 2) if summary_row[10] is not None else 0.0,
+                    "max": round(summary_row[11], 2) if summary_row[11] is not None else 0.0,
+                    "avg": round(summary_row[12], 2) if summary_row[12] is not None else 0.0,
+                },
+                "cpu_temp": {
+                    "min": round(summary_row[13], 1) if summary_row[13] is not None else None,
+                    "max": round(summary_row[14], 1) if summary_row[14] is not None else None,
+                    "avg": round(summary_row[15], 1) if summary_row[15] is not None else None,
+                },
+            }
+        else:
+            summary = {
+                "cpu": {"min": 0.0, "max": 0.0, "avg": 0.0},
+                "memory": {"min": 0.0, "max": 0.0, "avg": 0.0},
+                "net_rx": {"min": 0.0, "max": 0.0, "avg": 0.0},
+                "net_tx": {"min": 0.0, "max": 0.0, "avg": 0.0},
+                "cpu_temp": {"min": None, "max": None, "avg": None},
+            }
+
+        rows = conn.execute(
+            """
+            SELECT
+                (timestamp / ?) AS bucket_idx,
+                MIN(timestamp) AS bucket_time,
+                AVG(cpu_percent) AS avg_cpu,
+                AVG(memory_percent) AS avg_mem,
+                AVG(net_rx_rate_bps) AS avg_net_rx,
+                AVG(net_tx_rate_bps) AS avg_net_tx,
+                AVG(cpu_temp) AS avg_cpu_temp
+            FROM telemetry_samples
+            WHERE timestamp >= ? AND timestamp <= ?
+            GROUP BY (timestamp / ?)
+            ORDER BY bucket_idx ASC
+            """,
+            (bucket_seconds, start_time_val, end_time_val, bucket_seconds),
+        ).fetchall()
+
+        points: list[dict[str, Any]] = []
+        for r in rows:
+            b_time = int(r[1])
+            points.append({
+                "timestamp": b_time,
+                "iso_time": datetime.fromtimestamp(b_time, tz=timezone.utc).isoformat(),
+                "cpu_percent": round(r[2], 1) if r[2] is not None else 0.0,
+                "memory_percent": round(r[3], 1) if r[3] is not None else 0.0,
+                "net_rx_rate_bps": round(r[4], 2) if r[4] is not None else 0.0,
+                "net_tx_rate_bps": round(r[5], 2) if r[5] is not None else 0.0,
+                "cpu_temp": round(r[6], 1) if r[6] is not None else None,
+            })
+
+        return {
+            "range": norm_range,
+            "start_time": start_time_val,
+            "end_time": end_time_val,
+            "bucket_seconds": bucket_seconds,
+            "total_samples": total_samples,
+            "summary": summary,
+            "points": points,
+        }
+    finally:
+        conn.close()
 
 
 def get_system_users() -> dict[str, Any]:

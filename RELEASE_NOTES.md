@@ -1,27 +1,27 @@
-# Release v1.0.25: Configurable Backup Storage, Pure Host Directory Backups & Notification Cron Consolidation
+# Release v1.0.26: Historical Telemetry Time-Machine (1h / 6h / 24h / 7d Charts)
 
 ## Overview
-Vigil v1.0.25 streamlines system data protection and schedule management by introducing a **Configurable Backup Archive Storage Directory**, simplifying the backup architecture to **Pure Host Directory Backups**, and **Consolidating Notification Crons** directly into the unified Cron Scheduler.
+Vigil v1.0.26 introduces the **Historical Telemetry Time-Machine**, giving host operators deep operational visibility into past system performance. Operating alongside real-time live telemetry, the Time-Machine features an embedded SQLite time-series persistence engine, adaptive bucketed aggregation, and a responsive High-DPI multi-series chart with interactive tooltips and summary metrics across 1-hour, 6-hour, 24-hour, and 7-day observation windows.
 
 ## Highlights & Enhancements
 
-### 1. Configurable Backup Archive Storage Directory
-- **Custom Archive Destination**: Users can now configure custom host filesystem storage locations (e.g., dedicated storage pools or external mount paths) for backup tarballs directly from the Backups & Cron settings (`POST /api/backups/config`).
-- **Persistent App Settings**: The configured directory path is persisted in SQLite `app_settings` under `backup_storage_dir` and resolves dynamically at runtime with fallback to `~/.vigil/backups`.
-- **Safety Validation Guards**: Enforces strict path security, rejecting dangerous destinations such as root (`/`), `/etc`, `/usr`, `/proc`, `/sys`, and virtual kernel filesystems.
-- **Modern Dashboard Controls**: Added `#backup-dir-input` and `#backup-dir-save-btn` inline controls with feedback indicators in the Backups & Cron view.
+### 1. SQLite Time-Series Persistence & 7-Day Auto-Pruning
+- **Dedicated Telemetry Storage**: Persists periodic host resource snapshots into a indexed SQLite table (`telemetry_samples`) capturing CPU load, memory utilization, swap usage, disk capacity, temperature, and network RX/TX transfer rates.
+- **Background Sampling Engine**: Automatic background evaluation captures system metrics every 15 seconds without blocking API requests or degrading host performance.
+- **Automated Retention Pruning**: Enforces a rolling 7-day data retention policy (`prune_telemetry_samples`), automatically cleaning up expired records to maintain a lean database footprint.
 
-### 2. Streamlined Pure Directory Backups
-- **Focused Host Directory Operations**: Replaced stack-specific container discovery and intrusive container pause/stop logic with clean, high-performance host directory backups (e.g., `~/appdata` or `~/docker/plex`).
-- **Archive Integrity & Pruning**: Full support for `.tar.gz` archive creation, SHA-256 integrity checksumming, customizable exclusion glob patterns, and automated retention pruning.
-- **Cron Task Harmonization**: Replaced `backup.stack` cron task types with `backup.directory` across the job creation UI, schema, and scheduler engine.
+### 2. Bucketed Aggregation Engine & Telemetry History API
+- **Dynamic Downsampling**: Added `GET /api/telemetry/history?range={1h|6h|24h|7d}&points={10-300}` delivering time-bucketed averages and interpolated points tailored for canvas rendering.
+- **Statistical Summaries**: Computes comprehensive min, max, and average resource utilization metrics for each window, providing operators with immediate high-level capacity insights.
+- **Manual Sample Ingestion Endpoint**: Added `POST /api/telemetry/sample` enabling on-demand sample capture or external metric ingestion.
 
-### 3. Consolidated Notification Crons in Backups & Cron
-- **Unified Scheduling Architecture**: Centralized all periodic report schedules (`notifications.summary`) inside the Backups & Cron scheduler engine, eliminating duplicate schedule implementations.
-- **Direct Navigation Workflows**: Notification Center schedule management buttons now link directly to the Backups & Cron scheduler view, providing seamless cross-tab coordination.
+### 3. Interactive Overview Time-Machine Canvas & Selector Toolbar
+- **Modern Selector Toolbar**: Introduced intuitive pill controls (`Live`, `1h`, `6h`, `24h`, `7d`) in the dashboard Overview tab, allowing instant switching between real-time ticks and historical windows.
+- **High-DPI Multi-Series Canvas Chart**: Custom retina-ready canvas renderer graphing CPU (%), Memory (%), and Network Transfer Rates (KB/s) with clean grid lines and formatted time axes.
+- **Interactive Hover Tooltips & Summary Stats**: Real-time crosshair and hover tooltips showing precise timestamped metrics at any cursor position, backed by min/avg/max summary indicator chips.
 
 ## Reliability & Fixes
 
 ### Quality & Contract Verification
-- **Cross-Tier Contract Integrity**: Verified 57 frontend API route contracts and 589 DOM element bindings across the dashboard with 0 mismatches or broken selectors.
-- **Comprehensive Automated Test Suite**: 221 out of 221 tests passed cleanly (`221 passed, 0 failures`) in pytest, verifying backup configuration endpoints, directory path safety validation, cron scheduler execution, and frontend DOM bindings.
+- **Cross-Tier Contract Integrity**: Verified 58 frontend API route endpoints and 607 DOM element bindings with zero mismatches or unhandled exceptions.
+- **Comprehensive Automated Test Suite**: Expanded test suite to 229 tests (`229 passed, 0 failures`) covering time-series schema creation, retention pruning, bucket downsampling, summary statistics, API authentication, and UI DOM bindings.
