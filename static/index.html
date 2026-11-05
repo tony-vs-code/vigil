@@ -1486,6 +1486,9 @@
                       <span>Due: <span id="weekly-due-at">--</span></span>
                       <span id="weekly-last-status" class="hidden">--</span>
                     </div>
+                    <div class="schedule-helper-text text-secondary">
+                      Manage Report Schedule in Backups &amp; Cron &rarr;
+                    </div>
                   </div>
                 </div>
 
@@ -1518,12 +1521,12 @@
                   </svg>
                   <span>Configure Channels</span>
                 </button>
-                <button id="btn-open-notif-schedule" class="btn-secondary" type="button">
+                <button id="btn-open-notif-schedule" class="btn-secondary" type="button" title="Manage Report Schedule in Backups &amp; Cron">
                   <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="12" cy="12" r="10"></circle>
                     <polyline points="12 6 12 12 16 14"></polyline>
                   </svg>
-                  <span>Schedule &amp; Topics</span>
+                  <span>Report Schedule &rarr;</span>
                 </button>
                 <button id="btn-open-notif-thresholds" class="btn-secondary" type="button">
                   <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2629,7 +2632,7 @@
               </div>
               <div class="status-ribbon-item">
                 <div class="status-ribbon-badge-group">
-                  <span class="status-ribbon-label">Discovered Stack Folders</span>
+                  <span class="status-ribbon-label">Configured Targets</span>
                   <span id="backups-stacks-count" class="count-number count-ok">0</span>
                 </div>
               </div>
@@ -2642,49 +2645,34 @@
             </div>
 
             <div class="backups-content-grid">
-              <!-- Section 1: Docker Stack & Host Directory Backup Manager (#backups-manager-card) -->
+              <!-- Section 1: Host Directory Backup Manager (#backups-manager-card) -->
               <article class="card backups-card" id="backups-manager-card">
                 <div class="card-header">
                   <div>
-                    <h3 class="card-title">Docker Stack &amp; Host Directory Backup Manager</h3>
-                    <p class="card-subtitle">Create compressed .tar.gz snapshots of Docker Compose stack folders or custom host directories</p>
+                    <h3 class="card-title">Host Directory Backup Manager</h3>
+                    <p class="card-subtitle">Create compressed .tar.gz snapshots of host or appdata directories with automated retention</p>
                   </div>
                 </div>
 
-                <!-- Quick Directory / Stack Backup & Target Creator Form (#backup-create-form) -->
+                <!-- Host Directory Backup Form (#backup-create-form) -->
                 <form id="backup-create-form" class="backups-form-panel" onsubmit="return false;">
                   <div class="backups-form-grid">
                     <div class="form-group">
-                      <label for="backup-target-type">Target Type</label>
-                      <select id="backup-target-type" class="module-interval-select full-width">
-                        <option value="stack">Docker Stack Folder</option>
-                        <option value="directory">Custom Host Directory</option>
-                      </select>
-                    </div>
-
-                    <div class="form-group" id="backup-stack-select-group">
-                      <label for="backup-stack-select">Docker Compose Stack</label>
-                      <select id="backup-stack-select" class="module-interval-select full-width">
-                        <option value="">-- Select a discovered stack --</option>
-                      </select>
-                    </div>
-
-                    <div class="form-group">
-                      <label for="backup-source-path">Host Source Path</label>
+                      <label for="backup-source-path">Directory Path</label>
                       <input
                         id="backup-source-path"
                         type="text"
                         class="mono-input"
-                        placeholder="/home/anthony/docker/plex or /home/anthony/appdata"
+                        placeholder="/home/anthony/appdata or /home/anthony/docker/plex"
                       />
                     </div>
 
                     <div class="form-group">
-                      <label for="backup-target-name">Backup Name / Label</label>
+                      <label for="backup-target-name">Target Name</label>
                       <input
                         id="backup-target-name"
                         type="text"
-                        placeholder="e.g. plex or appdata"
+                        placeholder="plex or appdata"
                       />
                     </div>
 
@@ -2711,10 +2699,6 @@
                   </div>
 
                   <div class="backups-form-footer">
-                    <label class="checkbox-label" for="backup-stop-containers">
-                      <input type="checkbox" id="backup-stop-containers" />
-                      <span>Stop stack containers briefly during backup for consistent database state</span>
-                    </label>
                     <div class="backups-form-actions">
                       <button id="backup-save-target-btn" type="button" class="btn-secondary btn-sm">
                         Save Target
@@ -2726,25 +2710,24 @@
                   </div>
                 </form>
 
-                <!-- Discovered Stack Folders & Saved Targets Table -->
+                <!-- Configured Directory Targets Table -->
                 <div class="backups-subsection">
                   <div class="sec-subsection-header">
-                    <h4 class="sec-subsection-title">Discovered Stack Folders &amp; Saved Targets</h4>
+                    <h4 class="sec-subsection-title">Configured Backup Targets</h4>
                   </div>
                   <div class="table-container">
                     <table class="data-table" id="backup-targets-table">
                       <thead>
                         <tr>
-                          <th>Type</th>
-                          <th>Name / Stack</th>
+                          <th>Target Name</th>
                           <th>Host Directory Path</th>
-                          <th>Details / Options</th>
+                          <th>Retention &amp; Excludes</th>
                           <th style="text-align: right;">Actions</th>
                         </tr>
                       </thead>
                       <tbody id="backup-targets-tbody">
                         <tr>
-                          <td colspan="5" class="empty-state">Loading discovered Docker stack folders and saved targets...</td>
+                          <td colspan="4" class="empty-state">Loading configured backup targets...</td>
                         </tr>
                       </tbody>
                     </table>
@@ -2761,6 +2744,24 @@
                   </div>
                   <div class="sec-card-actions">
                     <span id="backup-dir-badge" class="status-badge status-info mono-text" title="Host Backup Storage Directory">~/.vigil/backups</span>
+                  </div>
+                </div>
+
+                <!-- Backup Archives Destination Directory Control Panel -->
+                <div class="backup-dir-control-panel">
+                  <div class="backup-dir-group">
+                    <label for="backup-dir-input" class="backup-dir-label">Archive Storage Directory</label>
+                    <div class="backup-dir-row">
+                      <input
+                        id="backup-dir-input"
+                        type="text"
+                        class="mono-input backup-dir-input"
+                        placeholder="/home/anthony/.vigil/backups or custom path"
+                      />
+                      <button id="backup-dir-save-btn" type="button" class="btn-secondary btn-sm">
+                        Save Archive Path
+                      </button>
+                    </div>
                   </div>
                 </div>
 
@@ -2791,7 +2792,7 @@
                 <div class="card-header">
                   <div>
                     <h3 class="card-title">Unified Vigil Cron Scheduler</h3>
-                    <p class="card-subtitle">Schedule automated stack/directory backups, health digests, Docker pruning, S.M.A.R.T. checks, and APT refreshes</p>
+                    <p class="card-subtitle">Schedule automated host backups, health digests, Docker pruning, S.M.A.R.T. checks, and APT refreshes</p>
                   </div>
                 </div>
 
@@ -2803,7 +2804,7 @@
                       <input
                         id="cron-job-name"
                         type="text"
-                        placeholder="e.g. Nightly Plex Backup or Weekly Docker Prune"
+                        placeholder="e.g. Nightly AppData Backup or Weekly System Health Digest"
                         required
                       />
                     </div>
@@ -2811,8 +2812,7 @@
                     <div class="form-group">
                       <label for="cron-task-type">Task Type</label>
                       <select id="cron-task-type" class="module-interval-select full-width">
-                        <option value="backup.stack">Docker Stack Backup</option>
-                        <option value="backup.directory">Host Directory Backup</option>
+                        <option value="backup.directory" selected>Host Directory Backup</option>
                         <option value="notifications.summary">System Health Digest Notification</option>
                         <option value="docker.prune">Docker Resource Prune</option>
                         <option value="packages.refresh">APT Package Cache Refresh</option>
@@ -2845,18 +2845,7 @@
                     </div>
 
                     <!-- Dynamic Task Configuration Fields -->
-                    <div class="form-group" id="cron-config-stack-group">
-                      <label for="cron-config-stack-name">Target Stack Name (or 'all')</label>
-                      <input
-                        id="cron-config-stack-name"
-                        type="text"
-                        class="mono-input"
-                        value="all"
-                        placeholder="all or stack name (e.g. plex)"
-                      />
-                    </div>
-
-                    <div class="form-group hidden" id="cron-config-path-group">
+                    <div class="form-group" id="cron-config-path-group">
                       <label for="cron-config-source-path">Directory Source Path</label>
                       <input
                         id="cron-config-source-path"
@@ -2880,10 +2869,6 @@
 
                   <div class="backups-form-footer">
                     <div class="cron-checkbox-row">
-                      <label class="checkbox-label" id="cron-config-stop-group" for="cron-config-stop-containers">
-                        <input type="checkbox" id="cron-config-stop-containers" />
-                        <span>Stop stack containers during backup</span>
-                      </label>
                       <label class="checkbox-label hidden" id="cron-config-prune-group" for="cron-config-prune-volumes">
                         <input type="checkbox" id="cron-config-prune-volumes" />
                         <span>Prune unused volumes</span>

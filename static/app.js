@@ -9664,7 +9664,6 @@ async function fetchBackups() {
 function renderBackups(data) {
   if (!data) return;
 
-  const stackTargets = Array.isArray(data.stack_targets) ? data.stack_targets : [];
   const savedTargets = Array.isArray(data.saved_targets) ? data.saved_targets : [];
   const archives = Array.isArray(data.archives) ? data.archives : [];
 
@@ -9679,9 +9678,9 @@ function renderBackups(data) {
     totalSizeEl.textContent = formatBytes(data.total_size_bytes ?? 0);
   }
 
-  const stacksCountEl = document.getElementById("backups-stacks-count");
-  if (stacksCountEl) {
-    stacksCountEl.textContent = String(stackTargets.length);
+  const targetsCountEl = document.getElementById("backups-stacks-count");
+  if (targetsCountEl) {
+    targetsCountEl.textContent = String(savedTargets.length);
   }
 
   const dirBadge = document.getElementById("backup-dir-badge");
@@ -9689,149 +9688,74 @@ function renderBackups(data) {
     dirBadge.textContent = data.backup_dir;
   }
 
-  // 2. Stack selector dropdown (#backup-stack-select)
-  const stackSelect = document.getElementById("backup-stack-select");
-  if (stackSelect) {
-    const currentVal = stackSelect.value;
-    const options = [`<option value="">-- Select a discovered stack (${stackTargets.length}) --</option>`];
-    stackTargets.forEach((st) => {
-      const nameSafe = escapeHtml(st.stack_name || "");
-      const pathSafe = escapeHtml(st.source_path || "");
-      const statusSafe = escapeHtml(st.status || "discovered");
-      options.push(
-        `<option value="${nameSafe}" data-source-path="${pathSafe}">${nameSafe} — ${pathSafe} (${statusSafe})</option>`
-      );
-    });
-    stackSelect.innerHTML = options.join("");
-    if (currentVal && stackTargets.some((s) => s.stack_name === currentVal)) {
-      stackSelect.value = currentVal;
-    } else if (stackTargets.length > 0 && !currentVal) {
-      stackSelect.value = stackTargets[0].stack_name;
-      syncBackupFormWithSelectedStack();
-    }
+  const dirInput = document.getElementById("backup-dir-input");
+  if (dirInput && data.backup_dir && document.activeElement !== dirInput) {
+    dirInput.value = data.backup_dir;
   }
 
-  // 3. Discovered Stack Folders & Saved Targets Table (#backup-targets-tbody)
+  // 2. Configured Directory Targets Table (#backup-targets-tbody)
   const targetsTbody = document.getElementById("backup-targets-tbody");
   if (targetsTbody) {
-    const rows = [];
-
-    stackTargets.forEach((st) => {
-      const stackName = st.stack_name || "unknown";
-      const sourcePath = st.source_path || "";
-      const servicesCount = Number(st.services || 0);
-      const statusText = st.status || "discovered";
-      const existsBadge = st.exists
-        ? `<span class="status-badge status-ok">${escapeHtml(statusText)}</span>`
-        : `<span class="status-badge status-warn">Path Missing</span>`;
-
-      rows.push(`
-        <tr>
-          <td><span class="target-kind-badge kind-stack">STACK</span></td>
-          <td class="font-bold">${escapeHtml(stackName)}</td>
-          <td class="mono-text text-secondary">${escapeHtml(sourcePath)}</td>
-          <td>
-            ${existsBadge}
-            <span class="text-secondary" style="font-size: 0.78rem; margin-left: 6px;">${servicesCount} container(s)</span>
-          </td>
-          <td style="text-align: right;">
-            <div class="table-actions-cell">
-              <button
-                type="button"
-                class="btn-backup-action"
-                data-backup-now="stack"
-                data-stack-name="${escapeHtml(stackName)}"
-                data-source-path="${escapeHtml(sourcePath)}"
-                data-target-name="${escapeHtml(stackName)}"
-                title="Create backup archive for stack ${escapeHtml(stackName)} now"
-              >
-                1-Click Backup Now
-              </button>
-              <button
-                type="button"
-                class="btn-backup-action btn-schedule"
-                data-schedule-backup="stack"
-                data-stack-name="${escapeHtml(stackName)}"
-                data-source-path="${escapeHtml(sourcePath)}"
-                data-target-name="${escapeHtml(stackName)}"
-                title="Pre-fill Cron Scheduler for ${escapeHtml(stackName)}"
-              >
-                Schedule in Cron
-              </button>
-            </div>
-          </td>
-        </tr>
-      `);
-    });
-
-    savedTargets.forEach((t) => {
-      const targetId = t.id;
-      const name = t.name || t.stack_name || "custom";
-      const tType = t.target_type === "stack" ? "stack" : "directory";
-      const sourcePath = t.source_path || "";
-      const retainCount = Number(t.retain_count || 7);
-      const excludesList = Array.isArray(t.excludes) ? t.excludes.join(", ") : "";
-      const badgeHtml =
-        tType === "stack"
-          ? `<span class="target-kind-badge kind-stack">STACK TARGET</span>`
-          : `<span class="target-kind-badge kind-directory">DIRECTORY</span>`;
-
-      const detailsParts = [`Retain: ${retainCount}`];
-      if (excludesList) detailsParts.push(`Excludes: ${excludesList}`);
-      if (t.stop_containers) detailsParts.push("Stop Containers");
-
-      rows.push(`
-        <tr>
-          <td>${badgeHtml}</td>
-          <td class="font-bold">${escapeHtml(name)}</td>
-          <td class="mono-text text-secondary">${escapeHtml(sourcePath)}</td>
-          <td class="text-secondary" style="font-size: 0.8rem;">${escapeHtml(detailsParts.join(" • "))}</td>
-          <td style="text-align: right;">
-            <div class="table-actions-cell">
-              <button
-                type="button"
-                class="btn-backup-action"
-                data-backup-now="${escapeHtml(tType)}"
-                data-stack-name="${escapeHtml(t.stack_name || "")}"
-                data-source-path="${escapeHtml(sourcePath)}"
-                data-target-name="${escapeHtml(name)}"
-                data-retain-count="${retainCount}"
-                data-excludes="${escapeHtml(excludesList)}"
-                data-stop-containers="${t.stop_containers ? "true" : "false"}"
-                title="Run backup now for ${escapeHtml(name)}"
-              >
-                1-Click Backup Now
-              </button>
-              <button
-                type="button"
-                class="btn-backup-action btn-schedule"
-                data-schedule-backup="${escapeHtml(tType)}"
-                data-stack-name="${escapeHtml(t.stack_name || name)}"
-                data-source-path="${escapeHtml(sourcePath)}"
-                data-target-name="${escapeHtml(name)}"
-                data-retain-count="${retainCount}"
-                title="Schedule ${escapeHtml(name)} in Cron"
-              >
-                Schedule in Cron
-              </button>
-              <button
-                type="button"
-                class="btn-icon-danger"
-                data-delete-target-id="${escapeHtml(String(targetId))}"
-                title="Delete saved target ${escapeHtml(name)}"
-              >
-                Delete Target
-              </button>
-            </div>
-          </td>
-        </tr>
-      `);
-    });
-
-    if (rows.length === 0) {
-      targetsTbody.innerHTML = `<tr><td colspan="5" class="empty-state">No Docker Compose stack directories or saved backup targets found. Add a custom host directory above.</td></tr>`;
+    if (savedTargets.length === 0) {
+      targetsTbody.innerHTML = `<tr><td colspan="4" class="empty-state">No saved directory backup targets found. Add a host directory above.</td></tr>`;
     } else {
-      targetsTbody.innerHTML = rows.join("");
+      targetsTbody.innerHTML = savedTargets
+        .map((t) => {
+          const targetId = t.id;
+          const name = t.name || t.target_name || "backup";
+          const sourcePath = t.source_path || "";
+          const retainCount = Number(t.retain_count || 7);
+          const excludesList = Array.isArray(t.excludes) ? t.excludes.join(", ") : (t.excludes || "");
+          const detailsParts = [`Retain: ${retainCount}`];
+          if (excludesList) detailsParts.push(`Excludes: ${excludesList}`);
+
+          return `
+            <tr>
+              <td class="font-bold">
+                <span class="target-kind-badge kind-directory" style="margin-right: 6px;">DIR</span>
+                ${escapeHtml(name)}
+              </td>
+              <td class="mono-text text-secondary">${escapeHtml(sourcePath)}</td>
+              <td class="text-secondary" style="font-size: 0.8rem;">${escapeHtml(detailsParts.join(" • "))}</td>
+              <td style="text-align: right;">
+                <div class="table-actions-cell">
+                  <button
+                    type="button"
+                    class="btn-backup-action"
+                    data-backup-now="directory"
+                    data-source-path="${escapeHtml(sourcePath)}"
+                    data-target-name="${escapeHtml(name)}"
+                    data-retain-count="${retainCount}"
+                    data-excludes="${escapeHtml(excludesList)}"
+                    title="Run backup now for ${escapeHtml(name)}"
+                  >
+                    1-Click Backup Now
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-backup-action btn-schedule"
+                    data-schedule-backup="directory"
+                    data-source-path="${escapeHtml(sourcePath)}"
+                    data-target-name="${escapeHtml(name)}"
+                    data-retain-count="${retainCount}"
+                    title="Schedule ${escapeHtml(name)} in Cron"
+                  >
+                    Schedule in Cron
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-icon-danger"
+                    data-delete-target-id="${escapeHtml(String(targetId))}"
+                    title="Delete target ${escapeHtml(name)}"
+                  >
+                    Delete Target
+                  </button>
+                </div>
+              </td>
+            </tr>
+          `;
+        })
+        .join("");
     }
   }
 
@@ -9905,44 +9829,20 @@ function renderBackups(data) {
 }
 
 /**
- * Sync #backup-source-path and #backup-target-name when a stack is selected in #backup-stack-select.
+ * Retained for backwards-compatibility; host directory backups are pure directory targets.
  */
 function syncBackupFormWithSelectedStack() {
-  const targetTypeEl = document.getElementById("backup-target-type");
-  const stackSelect = document.getElementById("backup-stack-select");
-  const sourcePathInput = document.getElementById("backup-source-path");
-  const targetNameInput = document.getElementById("backup-target-name");
-  const stackGroup = document.getElementById("backup-stack-select-group");
-
-  const targetType = targetTypeEl ? targetTypeEl.value : "stack";
-  if (stackGroup) {
-    stackGroup.classList.toggle("hidden", targetType !== "stack");
-  }
-
-  if (targetType === "stack" && stackSelect) {
-    const selectedOpt = stackSelect.options[stackSelect.selectedIndex];
-    const stackName = stackSelect.value || "";
-    const sourcePath = selectedOpt ? selectedOpt.getAttribute("data-source-path") || "" : "";
-    if (sourcePathInput && sourcePath) {
-      sourcePathInput.value = sourcePath;
-    }
-    if (targetNameInput && stackName) {
-      targetNameInput.value = stackName;
-    }
-  }
+  // Pure directory backups mode active
 }
 
 /**
- * Read current values from #backup-create-form.
+ * Read current values from #backup-create-form for directory backups.
  */
 function getBackupFormPayload() {
-  const target_type = document.getElementById("backup-target-type")?.value || "stack";
-  const stack_name = document.getElementById("backup-stack-select")?.value || "";
   const source_path = (document.getElementById("backup-source-path")?.value || "").trim();
-  const target_name = (
-    document.getElementById("backup-target-name")?.value ||
-    (target_type === "stack" ? stack_name : "")
-  ).trim();
+  const rawTargetName = (document.getElementById("backup-target-name")?.value || "").trim();
+  const defaultTargetName = source_path ? source_path.split("/").filter(Boolean).pop() || "backup" : "backup";
+  const target_name = rawTargetName || defaultTargetName;
   const rawExcludes = (document.getElementById("backup-excludes")?.value || "").trim();
   const excludes = rawExcludes
     ? rawExcludes
@@ -9954,18 +9854,75 @@ function getBackupFormPayload() {
     1,
     parseInt(document.getElementById("backup-retain-count")?.value || "7", 10) || 7
   );
-  const stop_containers = Boolean(document.getElementById("backup-stop-containers")?.checked);
 
   return {
-    target_type,
-    stack_name: target_type === "stack" ? stack_name || target_name : "",
+    target_type: "directory",
     source_path,
-    target_name: target_name || stack_name || "backup",
-    name: target_name || stack_name || "Backup Target",
+    target_name: target_name || "backup",
+    name: target_name || "backup",
     excludes,
-    stop_containers,
+    stop_containers: false,
     retain_count,
   };
+}
+
+/**
+ * Update the backup archives storage destination directory via POST /api/backups/config.
+ */
+async function saveBackupDirectoryConfig(buttonEl = null) {
+  const dirInput = document.getElementById("backup-dir-input");
+  const backup_dir = (dirInput?.value || "").trim();
+  if (!backup_dir) {
+    showToast({
+      title: "Storage Path Required",
+      message: "Please enter a valid directory path for backup archives.",
+      type: "warning",
+    });
+    return;
+  }
+
+  const origText = buttonEl ? buttonEl.textContent : "";
+  if (buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = "Saving...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/backups/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backup_dir }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || data.message || `Failed to update backup directory (HTTP ${resp.status})`);
+    }
+
+    showToast({
+      title: "Archive Path Updated",
+      message: data.message || `Backup archive path saved to "${backup_dir}".`,
+      type: "success",
+    });
+
+    const dirBadge = document.getElementById("backup-dir-badge");
+    if (dirBadge) {
+      dirBadge.textContent = data.backup_dir || backup_dir;
+    }
+
+    await fetchBackups();
+  } catch (err) {
+    console.error("saveBackupDirectoryConfig error:", err);
+    showToast({
+      title: "Save Archive Path Failed",
+      message: err instanceof Error ? err.message : String(err),
+      type: "danger",
+    });
+  } finally {
+    if (buttonEl) {
+      buttonEl.disabled = false;
+      buttonEl.textContent = origText;
+    }
+  }
 }
 
 /**
@@ -10016,7 +9973,7 @@ async function executeBackupRun(payload, buttonEl = null) {
  */
 async function saveBackupTarget(buttonEl = null) {
   const payload = getBackupFormPayload();
-  if (!payload.source_path && payload.target_type === "directory") {
+  if (!payload.source_path) {
     showToast({
       title: "Source Path Required",
       message: "Please enter a host directory path to save as a backup target.",
@@ -10164,29 +10121,24 @@ async function deleteBackupArchive(filename) {
 }
 
 /**
- * Pre-fill the Cron Job form (#cron-job-form) for a given stack or directory target and scroll to it.
+ * Pre-fill the Cron Job form (#cron-job-form) for a given directory target and scroll to it.
  */
-function prefillCronFormForTarget({ targetType, stackName, sourcePath, targetName, retainCount }) {
+function prefillCronFormForTarget({ sourcePath = "", targetName = "", retainCount = 7 } = {}) {
   const jobNameInput = document.getElementById("cron-job-name");
   const taskTypeSelect = document.getElementById("cron-task-type");
-  const stackInput = document.getElementById("cron-config-stack-name");
   const pathInput = document.getElementById("cron-config-source-path");
   const retainInput = document.getElementById("cron-config-retain-count");
 
-  const isStack = targetType === "stack";
-  const label = targetName || stackName || "Directory";
+  const label = targetName || (sourcePath ? sourcePath.split("/").filter(Boolean).pop() : "Directory");
 
   if (jobNameInput) {
     jobNameInput.value = `Nightly ${label} Backup`;
   }
   if (taskTypeSelect) {
-    taskTypeSelect.value = isStack ? "backup.stack" : "backup.directory";
+    taskTypeSelect.value = "backup.directory";
     updateCronFormTaskConfigVisibility();
   }
-  if (isStack && stackInput) {
-    stackInput.value = stackName || targetName || "all";
-  }
-  if (!isStack && pathInput) {
+  if (pathInput) {
     pathInput.value = sourcePath || "";
   }
   if (retainInput && retainCount) {
@@ -10202,22 +10154,16 @@ function prefillCronFormForTarget({ targetType, stackName, sourcePath, targetNam
  * Show/hide dynamic task configuration fields in #cron-job-form based on #cron-task-type.
  */
 function updateCronFormTaskConfigVisibility() {
-  const taskType = document.getElementById("cron-task-type")?.value || "backup.stack";
-  const stackGroup = document.getElementById("cron-config-stack-group");
+  const taskType = document.getElementById("cron-task-type")?.value || "backup.directory";
   const pathGroup = document.getElementById("cron-config-path-group");
   const retainGroup = document.getElementById("cron-config-retain-group");
-  const stopGroup = document.getElementById("cron-config-stop-group");
   const pruneGroup = document.getElementById("cron-config-prune-group");
 
-  const isStackBackup = taskType === "backup.stack";
   const isDirBackup = taskType === "backup.directory";
-  const isBackup = isStackBackup || isDirBackup;
   const isDockerPrune = taskType === "docker.prune";
 
-  stackGroup?.classList.toggle("hidden", !isStackBackup);
   pathGroup?.classList.toggle("hidden", !isDirBackup);
-  retainGroup?.classList.toggle("hidden", !isBackup);
-  stopGroup?.classList.toggle("hidden", !isStackBackup);
+  retainGroup?.classList.toggle("hidden", !isDirBackup);
   pruneGroup?.classList.toggle("hidden", !isDockerPrune);
 }
 
@@ -10276,12 +10222,16 @@ function renderCronJobs(data) {
           const taskLabel = escapeHtml(typeLabelMap.get(taskType) || taskType);
           const cfg = job.task_config || {};
           let targetDesc = "";
-          if (taskType === "backup.stack") {
-            targetDesc = `Stack: ${cfg.stack_name || "all"} (Retain ${cfg.retain_count ?? 7})`;
-          } else if (taskType === "backup.directory") {
+          if (taskType === "backup.directory") {
             targetDesc = `Path: ${cfg.source_path || "-"} (Retain ${cfg.retain_count ?? 7})`;
+          } else if (taskType === "notifications.summary") {
+            targetDesc = "System Health Digest Notification";
           } else if (taskType === "docker.prune" && cfg.prune_volumes) {
             targetDesc = "Include unused volumes";
+          } else if (taskType === "packages.refresh") {
+            targetDesc = "APT Package Cache Refresh";
+          } else if (taskType === "storage.smart_check") {
+            targetDesc = "Storage S.M.A.R.T. & RAID Diagnostics";
           }
 
           const cronExpr = escapeHtml(job.cron_expression || "");
@@ -10408,7 +10358,7 @@ async function handleSaveCronJob(e) {
   if (e) e.preventDefault();
 
   const name = (document.getElementById("cron-job-name")?.value || "").trim();
-  const task_type = document.getElementById("cron-task-type")?.value || "backup.stack";
+  const task_type = document.getElementById("cron-task-type")?.value || "backup.directory";
   const cron_expression = (document.getElementById("cron-expression-input")?.value || "").trim();
   const notify_on_failure = Boolean(document.getElementById("cron-notify-failure")?.checked);
   const notify_on_success = Boolean(document.getElementById("cron-notify-success")?.checked);
@@ -10424,14 +10374,7 @@ async function handleSaveCronJob(e) {
   }
 
   const task_config = {};
-  if (task_type === "backup.stack") {
-    task_config.stack_name = (document.getElementById("cron-config-stack-name")?.value || "all").trim() || "all";
-    task_config.retain_count = Math.max(
-      1,
-      parseInt(document.getElementById("cron-config-retain-count")?.value || "7", 10) || 7
-    );
-    task_config.stop_containers = Boolean(document.getElementById("cron-config-stop-containers")?.checked);
-  } else if (task_type === "backup.directory") {
+  if (task_type === "backup.directory") {
     const srcPath = (document.getElementById("cron-config-source-path")?.value || "").trim();
     if (!srcPath) {
       showToast({
@@ -11067,7 +11010,20 @@ function initDashboard() {
   document.getElementById("btn-close-notif-channels")?.addEventListener("click", closeNotifChannelsModal);
   document.getElementById("btn-cancel-notif-channels")?.addEventListener("click", closeNotifChannelsModal);
 
-  document.getElementById("btn-open-notif-schedule")?.addEventListener("click", openNotifScheduleModal);
+  document.getElementById("btn-open-notif-schedule")?.addEventListener("click", () => {
+    switchViewTab("backups", true);
+    const taskTypeSelect = document.getElementById("cron-task-type");
+    if (taskTypeSelect) {
+      taskTypeSelect.value = "notifications.summary";
+      updateCronFormTaskConfigVisibility();
+    }
+    const jobNameInput = document.getElementById("cron-job-name");
+    if (jobNameInput && !jobNameInput.value) {
+      jobNameInput.value = "System Health Digest";
+    }
+    const cronCard = document.getElementById("cron-scheduler-card");
+    cronCard?.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
   document.getElementById("btn-close-notif-schedule")?.addEventListener("click", closeNotifScheduleModal);
   document.getElementById("btn-cancel-notif-schedule")?.addEventListener("click", closeNotifScheduleModal);
   document.getElementById("btn-save-notif-schedule")?.addEventListener("click", async () => {
@@ -11703,20 +11659,22 @@ function initDashboard() {
     .getElementById("backups-refresh-btn")
     ?.addEventListener("click", () => refreshBackupsAndCron(true));
 
-  document
-    .getElementById("backup-target-type")
-    ?.addEventListener("change", () => syncBackupFormWithSelectedStack());
+  const backupDirSaveBtn = document.getElementById("backup-dir-save-btn");
+  backupDirSaveBtn?.addEventListener("click", () => saveBackupDirectoryConfig(backupDirSaveBtn));
 
-  document
-    .getElementById("backup-stack-select")
-    ?.addEventListener("change", () => syncBackupFormWithSelectedStack());
+  document.getElementById("backup-dir-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      saveBackupDirectoryConfig(backupDirSaveBtn);
+    }
+  });
 
   const backupRunNowBtn = document.getElementById("backup-run-now-btn");
   backupRunNowBtn?.addEventListener("click", async () => {
     const payload = getBackupFormPayload();
-    if (!payload.source_path && payload.target_type === "directory") {
+    if (!payload.source_path) {
       showToast({
-        title: "Source Path Required",
+        title: "Directory Path Required",
         message: "Please enter a host directory path to back up.",
         type: "warning",
       });
@@ -11732,10 +11690,8 @@ function initDashboard() {
   backupTargetsTbody?.addEventListener("click", (e) => {
     const runBtn = e.target.closest("[data-backup-now]");
     if (runBtn) {
-      const target_type = runBtn.getAttribute("data-backup-now") || "stack";
-      const stack_name = runBtn.getAttribute("data-stack-name") || "";
       const source_path = runBtn.getAttribute("data-source-path") || "";
-      const target_name = runBtn.getAttribute("data-target-name") || stack_name || "backup";
+      const target_name = runBtn.getAttribute("data-target-name") || "backup";
       const retain_count = parseInt(runBtn.getAttribute("data-retain-count") || "7", 10) || 7;
       const rawExcludes = runBtn.getAttribute("data-excludes") || "";
       const excludes = rawExcludes
@@ -11744,16 +11700,15 @@ function initDashboard() {
             .map((s) => s.trim())
             .filter(Boolean)
         : [];
-      const stop_containers = runBtn.getAttribute("data-stop-containers") === "true";
 
       executeBackupRun(
         {
-          target_type,
-          stack_name,
+          target_type: "directory",
           source_path,
           target_name,
+          name: target_name,
           excludes,
-          stop_containers,
+          stop_containers: false,
           retain_count,
         },
         runBtn
@@ -11764,8 +11719,6 @@ function initDashboard() {
     const schedBtn = e.target.closest("[data-schedule-backup]");
     if (schedBtn) {
       prefillCronFormForTarget({
-        targetType: schedBtn.getAttribute("data-schedule-backup") || "stack",
-        stackName: schedBtn.getAttribute("data-stack-name") || "",
         sourcePath: schedBtn.getAttribute("data-source-path") || "",
         targetName: schedBtn.getAttribute("data-target-name") || "",
         retainCount: schedBtn.getAttribute("data-retain-count") || "7",

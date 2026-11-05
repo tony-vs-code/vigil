@@ -103,6 +103,7 @@ APP_SETTING_KEYS = (
     "docker_auto_update_schedule",
     "timezone",
     "notification_center_config",
+    "backup_dir",
 )
 
 client = discord.Client(intents=discord.Intents.default())
@@ -472,7 +473,84 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
 
 def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
     conn = _connect_state_db(db_path)
-    conn.close()
+    try:
+        row = conn.execute(
+            "SELECT id FROM cron_jobs WHERE task_type = 'notifications.summary'"
+        ).fetchone()
+        if not row:
+            now = time.time()
+            cron_expr = "0 9 * * *"
+            enabled = 1
+            name = "Nightly Health Summary"
+            try:
+                set_row = conn.execute(
+                    "SELECT value FROM app_settings WHERE key = 'notification_center_config'"
+                ).fetchone()
+                if set_row and set_row[0]:
+                    cfg = json.loads(set_row[0])
+                    sched = cfg.get("schedule", {})
+                    if sched.get("enabled") is False:
+                        enabled = 0
+                    t_str = str(sched.get("time") or "09:00").strip()
+                    parts = t_str.split(":")
+                    h = int(parts[0]) if parts else 9
+                    m = int(parts[1]) if len(parts) > 1 else 0
+                    freq = str(sched.get("frequency") or "daily").lower()
+                    if freq == "weekly":
+                        dow_map = {
+                            "sunday": 0,
+                            "monday": 1,
+                            "tuesday": 2,
+                            "wednesday": 3,
+                            "thursday": 4,
+                            "friday": 5,
+                            "saturday": 6,
+                        }
+                        dow = dow_map.get(
+                            str(
+                                sched.get("day_of_week")
+                                or sched.get("day")
+                                or "monday"
+                            ).lower(),
+                            1,
+                        )
+                        cron_expr = f"{m} {h} * * {dow}"
+                    elif freq == "hourly":
+                        cron_expr = f"{m} * * * *"
+                    else:
+                        cron_expr = f"{m} {h} * * *"
+            except Exception:
+                pass
+
+            try:
+                next_ts = get_next_cron_run_timestamp(cron_expr, now)
+            except Exception:
+                next_ts = now + 86400.0
+
+            conn.execute(
+                """
+                INSERT INTO cron_jobs
+                (name, task_type, cron_expression, task_config_json, enabled,
+                 notify_on_failure, notify_on_success, last_run_at, last_status,
+                 last_duration_ms, last_output, next_run_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 'never', 0, '', ?, ?, ?)
+                """,
+                (
+                    name,
+                    "notifications.summary",
+                    cron_expr,
+                    "{}",
+                    enabled,
+                    1,
+                    0,
+                    next_ts,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -809,6 +887,13 @@ def _default_app_settings_from_env() -> dict[str, str]:
         ),
         "timezone": str(config("TIMEZONE", default="UTC") or "UTC"),
         "notification_center_config": json.dumps(default_nc_cfg),
+        "backup_dir": str(
+            config(
+                "VIGIL_BACKUP_DIR",
+                default=str(Path.home() / ".vigil" / "backups"),
+            )
+            or str(Path.home() / ".vigil" / "backups")
+        ),
     }
 
 
@@ -1727,6 +1812,23 @@ def get_masked_notification_center_config(
     if "day_of_week" in schedule and "day" not in schedule:
         schedule["day"] = schedule["day_of_week"]
 
+    try:
+        conn = _connect_state_db()
+        try:
+            crow = conn.execute(
+                "SELECT id, cron_expression, enabled, next_run_at FROM cron_jobs WHERE task_type = 'notifications.summary'"
+            ).fetchone()
+            if crow:
+                schedule["cron_job_id"] = int(crow[0])
+                schedule["cron_expression"] = str(crow[1])
+                schedule["enabled"] = bool(crow[2])
+                schedule["next_run_at"] = float(crow[3] or 0.0)
+                schedule["cron_jobs_url"] = "/api/cron/jobs"
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
     return result
 
 
@@ -1818,6 +1920,82 @@ def update_notification_center_config(updates: dict[str, Any]) -> dict[str, Any]
                 ("channel_id", channel_id_str, now),
             )
             CHANNEL_ID = channel_id_str
+
+        # Synchronize schedule with notifications.summary cron job
+        if "schedule" in updates and isinstance(updates["schedule"], dict):
+            try:
+                cron_row = connection.execute(
+                    "SELECT id, cron_expression FROM cron_jobs WHERE task_type = 'notifications.summary'"
+                ).fetchone()
+                sched = current["schedule"]
+                s_enabled = 1 if sched.get("enabled", True) else 0
+                time_str = str(sched.get("time") or "09:00").strip()
+                t_parts = time_str.split(":")
+                hour = int(t_parts[0]) if t_parts else 9
+                minute = int(t_parts[1]) if len(t_parts) > 1 else 0
+                freq = str(sched.get("frequency") or "daily").lower()
+                if freq == "weekly":
+                    dow_map = {
+                        "sunday": 0,
+                        "monday": 1,
+                        "tuesday": 2,
+                        "wednesday": 3,
+                        "thursday": 4,
+                        "friday": 5,
+                        "saturday": 6,
+                    }
+                    dow = dow_map.get(
+                        str(
+                            sched.get("day_of_week")
+                            or sched.get("day")
+                            or "monday"
+                        ).lower(),
+                        1,
+                    )
+                    new_expr = f"{minute} {hour} * * {dow}"
+                elif freq == "hourly":
+                    new_expr = f"{minute} * * * *"
+                else:
+                    new_expr = f"{minute} {hour} * * *"
+
+                try:
+                    next_ts = get_next_cron_run_timestamp(new_expr, now)
+                except Exception:
+                    next_ts = now + 86400.0
+
+                if cron_row:
+                    connection.execute(
+                        """
+                        UPDATE cron_jobs
+                        SET cron_expression = ?, enabled = ?, next_run_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (new_expr, s_enabled, next_ts, now, cron_row[0]),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO cron_jobs
+                        (name, task_type, cron_expression, task_config_json, enabled,
+                         notify_on_failure, notify_on_success, last_run_at, last_status,
+                         last_duration_ms, last_output, next_run_at, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 'never', 0, '', ?, ?, ?)
+                        """,
+                        (
+                            "Nightly Health Summary",
+                            "notifications.summary",
+                            new_expr,
+                            "{}",
+                            s_enabled,
+                            1,
+                            0,
+                            next_ts,
+                            now,
+                            now,
+                        ),
+                    )
+            except Exception as exc:
+                logging.debug(f"Error synchronizing schedule to cron_jobs: {exc}")
 
         connection.commit()
     finally:
@@ -9523,24 +9701,43 @@ FORBIDDEN_BACKUP_ROOTS = ("/proc", "/sys", "/dev", "/run")
 
 def get_backups_dir(db_path: Path = STATE_DB_PATH) -> Path:
     """Resolve and create the directory used to store backup .tar.gz archives."""
-    env_dir = os.environ.get("VIGIL_BACKUP_DIR", "").strip()
-    if env_dir:
-        out_dir = Path(env_dir).expanduser()
+    if Path(db_path) != DEFAULT_STATE_DB_PATH:
+        out_dir = Path(db_path).parent / "backups"
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
-    eff_db = _resolve_db_path(db_path)
-    if eff_db != DEFAULT_STATE_DB_PATH:
-        out_dir = eff_db.parent / "backups"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir
+    configured = ""
+    try:
+        configured = str(get_app_settings().get("backup_dir") or "").strip()
+    except Exception:
+        pass
+    if not configured:
+        configured = os.environ.get("VIGIL_BACKUP_DIR", "").strip()
+
+    if configured:
+        try:
+            norm_raw = os.path.normpath(configured)
+            if norm_raw != "/" and not any(
+                norm_raw == f or norm_raw.startswith(f + "/")
+                for f in FORBIDDEN_BACKUP_ROOTS
+            ):
+                out_dir = Path(configured).expanduser().resolve()
+                res_str = str(out_dir)
+                if res_str != "/" and not any(
+                    res_str == f or res_str.startswith(f + "/")
+                    for f in FORBIDDEN_BACKUP_ROOTS
+                ):
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    return out_dir
+        except OSError:
+            pass
 
     default_dir = Path.home() / ".vigil" / "backups"
     try:
         default_dir.mkdir(parents=True, exist_ok=True)
         return default_dir
     except OSError:
-        fallback_dir = eff_db.parent / "backups"
+        fallback_dir = Path(STATE_DB_PATH).parent / "backups"
         fallback_dir.mkdir(parents=True, exist_ok=True)
         return fallback_dir
 
@@ -9572,150 +9769,6 @@ def _validate_safe_host_directory(path_str: str, purpose: str = "backup") -> Pat
     return resolved
 
 
-def discover_stack_backup_targets(
-    db_path: Path = STATE_DB_PATH,
-) -> list[dict[str, Any]]:
-    """Auto-discover Docker Compose stack folders from managed stacks, compose ls, and container labels."""
-    mgr = DOCKER_MANAGER
-    stacks_dir = getattr(mgr, "stacks_dir", STACKS_DIR)
-
-    # 1. Gather from DOCKER_MANAGER.list_stacks()
-    try:
-        listed_stacks = mgr.list_stacks()
-    except Exception as exc:
-        logging.debug(f"discover_stack_backup_targets list_stacks error: {exc}")
-        listed_stacks = []
-
-    # 2. Gather compose project config_files if docker is running
-    compose_config_map: dict[str, str] = {}
-    try:
-        if mgr.is_running():
-            out = mgr._run_compose(["ls", "--all", "--format", "json"], timeout=8)
-            for item in mgr._parse_json_lines(out):
-                p_name = str(item.get("Name") or item.get("name") or "").strip()
-                c_files = str(
-                    item.get("ConfigFiles") or item.get("configFiles") or ""
-                ).strip()
-                if p_name and c_files:
-                    compose_config_map[p_name] = c_files
-    except Exception:
-        pass
-
-    # 3. Inspect container labels if available
-    container_working_dir: dict[str, str] = {}
-    container_config_files: dict[str, str] = {}
-    container_counts: dict[str, int] = {}
-    try:
-        if mgr.is_running():
-            for c in mgr.list_containers(all=True):
-                st = str(c.get("stack") or "").strip()
-                if st:
-                    container_counts[st] = container_counts.get(st, 0) + 1
-                labels = c.get("labels") or c.get("Labels")
-                if isinstance(labels, dict):
-                    proj = str(labels.get("com.docker.compose.project") or st).strip()
-                    wdir = str(
-                        labels.get("com.docker.compose.project.working_dir") or ""
-                    ).strip()
-                    cfiles = str(
-                        labels.get("com.docker.compose.project.config_files") or ""
-                    ).strip()
-                    if proj:
-                        if wdir and proj not in container_working_dir:
-                            container_working_dir[proj] = wdir
-                        if cfiles and proj not in container_config_files:
-                            container_config_files[proj] = cfiles
-    except Exception:
-        pass
-
-    discovered_map: dict[str, dict[str, Any]] = {}
-
-    for st in listed_stacks:
-        name = str(st.get("name") or st.get("stack_name") or "").strip()
-        if not name:
-            continue
-        managed = bool(st.get("managed", False))
-        status = str(st.get("status") or "unknown")
-        services = int(
-            st.get("services")
-            or st.get("containers_count")
-            or container_counts.get(name, 0)
-        )
-        c_files = str(
-            st.get("config_files")
-            or compose_config_map.get(name)
-            or container_config_files.get(name)
-            or ""
-        ).strip()
-        w_dir = str(
-            st.get("working_dir") or container_working_dir.get(name) or ""
-        ).strip()
-
-        managed_dir = Path(stacks_dir) / name
-        source_path = ""
-        if managed and managed_dir.is_dir():
-            source_path = str(managed_dir.resolve())
-            if not c_files:
-                for fname in ("docker-compose.yml", "docker-compose.yaml"):
-                    if (managed_dir / fname).is_file():
-                        c_files = str((managed_dir / fname).resolve())
-                        break
-        elif c_files:
-            first_cfg = c_files.split(",")[0].strip()
-            if first_cfg:
-                source_path = str(Path(first_cfg).expanduser().parent)
-        elif w_dir:
-            source_path = str(Path(w_dir).expanduser())
-        elif managed_dir.is_dir():
-            source_path = str(managed_dir.resolve())
-        elif st.get("source_path"):
-            source_path = str(st.get("source_path"))
-        else:
-            source_path = str(managed_dir)
-
-        exists = False
-        try:
-            exists = bool(source_path and Path(source_path).is_dir())
-        except OSError:
-            exists = False
-
-        discovered_map[name] = {
-            "stack_name": name,
-            "name": name,
-            "source_path": source_path,
-            "exists": exists,
-            "managed": managed,
-            "status": status,
-            "services": services,
-            "config_files": c_files,
-        }
-
-    # 4. Also scan stacks_dir on disk for any stack folders not yet in listed_stacks
-    try:
-        if stacks_dir and Path(stacks_dir).is_dir():
-            for child in sorted(Path(stacks_dir).iterdir()):
-                if not child.is_dir() or child.name in discovered_map:
-                    continue
-                compose_yml = child / "docker-compose.yml"
-                compose_yaml = child / "docker-compose.yaml"
-                if compose_yml.is_file() or compose_yaml.is_file():
-                    cfg_file = compose_yml if compose_yml.is_file() else compose_yaml
-                    discovered_map[child.name] = {
-                        "stack_name": child.name,
-                        "name": child.name,
-                        "source_path": str(child.resolve()),
-                        "exists": True,
-                        "managed": True,
-                        "status": "saved",
-                        "services": container_counts.get(child.name, 0),
-                        "config_files": str(cfg_file.resolve()),
-                    }
-    except OSError:
-        pass
-
-    return sorted(discovered_map.values(), key=lambda x: x["stack_name"])
-
-
 def _matches_exclude_patterns(rel_posix: str, name: str, patterns: list[str]) -> bool:
     for pat in patterns:
         clean_pat = pat.strip()
@@ -9731,7 +9784,7 @@ def _matches_exclude_patterns(rel_posix: str, name: str, patterns: list[str]) ->
 
 
 def create_backup_archive(
-    target_type: str,
+    target_type: str = "directory",
     source_path: str = "",
     stack_name: str = "",
     target_name: str = "",
@@ -9741,31 +9794,17 @@ def create_backup_archive(
     actor: str = "admin",
     db_path: Path = STATE_DB_PATH,
 ) -> dict[str, Any]:
-    """Create a compressed .tar.gz backup archive of a Docker stack folder or custom host directory."""
-    t_type = str(target_type or "").strip().lower()
-    if t_type not in ("stack", "directory"):
-        raise ValueError("target_type must be 'stack' or 'directory'.")
-
-    clean_stack = str(stack_name or "").strip()
+    """Create a compressed .tar.gz backup archive of a host directory."""
+    t_type = "directory"
     resolved_source_str = str(source_path or "").strip()
-
-    if t_type == "stack" and not resolved_source_str:
-        if not clean_stack:
-            raise ValueError("stack_name or source_path is required for stack backups.")
-        discovered = discover_stack_backup_targets(db_path=db_path)
-        for item in discovered:
-            if item.get("stack_name") == clean_stack and item.get("source_path"):
-                resolved_source_str = str(item["source_path"])
-                break
-        if not resolved_source_str:
-            mgr_stacks_dir = getattr(DOCKER_MANAGER, "stacks_dir", STACKS_DIR)
-            resolved_source_str = str(Path(mgr_stacks_dir) / clean_stack)
+    if not resolved_source_str:
+        raise ValueError("source_path is required for directory backups.")
 
     src = _validate_safe_host_directory(resolved_source_str, purpose="backup")
     if not src.exists() or not src.is_dir():
         raise ValueError(f"Backup source directory does not exist: {src}")
 
-    raw_label = (target_name or clean_stack or src.name).strip()
+    raw_label = (target_name or src.name).strip()
     clean_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_label).strip("-") or "backup"
 
     backups_dir = get_backups_dir(db_path).resolve()
@@ -9786,94 +9825,63 @@ def create_backup_archive(
     except (ValueError, TypeError):
         retain_val = 7
 
-    stopped_stack = False
-    stopped_container_ids: list[str] = []
-    if t_type == "stack" and stop_containers and clean_stack:
-        try:
-            if DOCKER_MANAGER.is_running():
-                try:
-                    DOCKER_MANAGER.execute_stack_action(clean_stack, "stop")
-                    stopped_stack = True
-                except Exception:
-                    for c in DOCKER_MANAGER.list_containers(all=False):
-                        if c.get("stack") == clean_stack and c.get("id"):
-                            try:
-                                DOCKER_MANAGER.execute_container_action(c["id"], "stop")
-                                stopped_container_ids.append(c["id"])
-                            except Exception:
-                                pass
-        except Exception as exc:
-            logging.warning(
-                f"Could not stop containers for stack '{clean_stack}' before backup: {exc}"
-            )
-
     file_count = 0
-    try:
-        with tarfile.open(archive_path, "w:gz") as tar:
-            root_arcname = src.name or clean_name
-            tar.add(str(src), arcname=root_arcname, recursive=False)
-            for dirpath, dirnames, filenames in os.walk(str(src)):
-                curr_dir = Path(dirpath)
-                # Always skip backups_dir if nested inside src
+    with tarfile.open(archive_path, "w:gz") as tar:
+        root_arcname = src.name or clean_name
+        tar.add(str(src), arcname=root_arcname, recursive=False)
+        for dirpath, dirnames, filenames in os.walk(str(src)):
+            curr_dir = Path(dirpath)
+            # Always skip backups_dir if nested inside src
+            try:
+                if (
+                    curr_dir.resolve() == backups_dir
+                    or backups_dir in curr_dir.resolve().parents
+                ):
+                    dirnames[:] = []
+                    continue
+            except OSError:
+                pass
+
+            rel_dir = curr_dir.relative_to(src)
+            # Filter dirnames in-place
+            filtered_dirs: list[str] = []
+            for d in sorted(dirnames):
+                d_path = curr_dir / d
                 try:
-                    if curr_dir.resolve() == backups_dir or backups_dir in curr_dir.resolve().parents:
-                        dirnames[:] = []
+                    if d_path.resolve() == backups_dir:
                         continue
                 except OSError:
                     pass
+                d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
+                if _matches_exclude_patterns(d_rel, d, exclude_list):
+                    continue
+                filtered_dirs.append(d)
+            dirnames[:] = filtered_dirs
 
-                rel_dir = curr_dir.relative_to(src)
-                # Filter dirnames in-place
-                filtered_dirs: list[str] = []
-                for d in sorted(dirnames):
-                    d_path = curr_dir / d
-                    try:
-                        if d_path.resolve() == backups_dir:
-                            continue
-                    except OSError:
-                        pass
-                    d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
-                    if _matches_exclude_patterns(d_rel, d, exclude_list):
-                        continue
-                    filtered_dirs.append(d)
-                dirnames[:] = filtered_dirs
+            for d in dirnames:
+                d_full = curr_dir / d
+                d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
+                arcname = f"{root_arcname}/{d_rel}"
+                tar.add(str(d_full), arcname=arcname, recursive=False)
 
-                for d in dirnames:
-                    d_full = curr_dir / d
-                    d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
-                    arcname = f"{root_arcname}/{d_rel}"
-                    tar.add(str(d_full), arcname=arcname, recursive=False)
-
-                for f in sorted(filenames):
-                    f_full = curr_dir / f
-                    try:
-                        if f_full.resolve() == archive_path.resolve():
-                            continue
-                    except OSError:
-                        pass
-                    f_rel = (rel_dir / f).as_posix() if rel_dir != Path(".") else f
-                    if _matches_exclude_patterns(f_rel, f, exclude_list):
-                        continue
-                    arcname = f"{root_arcname}/{f_rel}"
-                    try:
-                        tar.add(str(f_full), arcname=arcname, recursive=False)
-                        file_count += 1
-                    except OSError as exc:
-                        logging.warning(f"Skipping unreadable file in backup {f_full}: {exc}")
-    finally:
-        if stopped_stack:
-            try:
-                DOCKER_MANAGER.execute_stack_action(clean_stack, "start")
-            except Exception as exc:
-                logging.warning(
-                    f"Could not restart stack '{clean_stack}' after backup: {exc}"
-                )
-        elif stopped_container_ids:
-            for cid in stopped_container_ids:
+            for f in sorted(filenames):
+                f_full = curr_dir / f
                 try:
-                    DOCKER_MANAGER.execute_container_action(cid, "start")
-                except Exception:
+                    if f_full.resolve() == archive_path.resolve():
+                        continue
+                except OSError:
                     pass
+                f_rel = (rel_dir / f).as_posix() if rel_dir != Path(".") else f
+                if _matches_exclude_patterns(f_rel, f, exclude_list):
+                    continue
+                arcname = f"{root_arcname}/{f_rel}"
+                try:
+                    tar.add(str(f_full), arcname=arcname, recursive=False)
+                    file_count += 1
+                except OSError as exc:
+                    logging.warning(
+                        f"Skipping unreadable file in backup {f_full}: {exc}"
+                    )
 
     size_bytes = int(archive_path.stat().st_size)
     sha256_hash = hashlib.sha256()
@@ -9923,7 +9931,9 @@ def create_backup_archive(
                             old_path.unlink()
                     except OSError:
                         pass
-                    conn.execute("DELETE FROM backup_archives WHERE id = ?", (old_id,))
+                    conn.execute(
+                        "DELETE FROM backup_archives WHERE id = ?", (old_id,)
+                    )
 
         conn.commit()
     finally:
@@ -10213,50 +10223,28 @@ def save_backup_target(
     actor: str = "admin",
     db_path: Path = STATE_DB_PATH,
 ) -> dict[str, Any]:
-    """Create or update a saved backup target in backup_targets."""
+    """Create or update a saved directory backup target in backup_targets."""
     if isinstance(target_data, dict):
         target_id = target_data.get("id", target_id)
         name = str(target_data.get("name") or target_data.get("target_name") or name)
-        target_type = str(target_data.get("target_type") or target_type or "directory")
         source_path = str(target_data.get("source_path") or source_path)
-        stack_name = str(target_data.get("stack_name") or stack_name)
         raw_ex = target_data.get("excludes", excludes)
         if isinstance(raw_ex, str):
             excludes = [p.strip() for p in raw_ex.split(",") if p.strip()]
         elif isinstance(raw_ex, list):
             excludes = [str(p).strip() for p in raw_ex if str(p).strip()]
-        stop_containers = bool(target_data.get("stop_containers", stop_containers))
         try:
             retain_count = int(target_data.get("retain_count", retain_count) or 7)
         except (ValueError, TypeError):
             retain_count = 7
 
-    t_type = str(target_type or "directory").strip().lower()
-    if t_type not in ("stack", "directory"):
-        raise ValueError("target_type must be 'stack' or 'directory'.")
-
-    clean_stack = str(stack_name or "").strip()
+    t_type = "directory"
     clean_source = str(source_path or "").strip()
-    if t_type == "stack" and not clean_source and clean_stack:
-        for item in discover_stack_backup_targets(db_path=db_path):
-            if item.get("stack_name") == clean_stack and item.get("source_path"):
-                clean_source = str(item["source_path"])
-                break
-        if not clean_source:
-            mgr_stacks_dir = getattr(DOCKER_MANAGER, "stacks_dir", STACKS_DIR)
-            clean_source = str(Path(mgr_stacks_dir) / clean_stack)
-
     if not clean_source:
         raise ValueError("source_path is required for saving a backup target.")
 
-    # Validate path is not root or virtual kernel FS
-    norm_raw = os.path.normpath(clean_source)
-    if norm_raw == "/" or any(
-        norm_raw == f or norm_raw.startswith(f + "/") for f in FORBIDDEN_BACKUP_ROOTS
-    ):
-        raise ValueError(f"Invalid or restricted backup target path: '{clean_source}'")
-
-    clean_name = str(name or clean_stack or Path(clean_source).name).strip()
+    src = _validate_safe_host_directory(clean_source, purpose="backup")
+    clean_name = str(name or src.name).strip()
     if not clean_name:
         raise ValueError("Target name cannot be empty.")
 
@@ -10278,10 +10266,10 @@ def save_backup_target(
                 (
                     clean_name,
                     t_type,
-                    clean_source,
-                    clean_stack,
+                    str(src),
+                    "",
                     excludes_json,
-                    1 if stop_containers else 0,
+                    0,
                     retain_val,
                     int(target_id),
                 ),
@@ -10297,10 +10285,10 @@ def save_backup_target(
                 (
                     clean_name,
                     t_type,
-                    clean_source,
-                    clean_stack,
+                    str(src),
+                    "",
                     excludes_json,
-                    1 if stop_containers else 0,
+                    0,
                     retain_val,
                     now_ts,
                 ),
@@ -10312,10 +10300,10 @@ def save_backup_target(
 
     record_audit_event(
         "backup.target.saved",
-        f"Saved {t_type} backup target '{clean_name}' ({clean_source})",
+        f"Saved {t_type} backup target '{clean_name}' ({src})",
         actor=actor,
         severity="info",
-        metadata={"id": saved_id, "name": clean_name, "source_path": clean_source},
+        metadata={"id": saved_id, "name": clean_name, "source_path": str(src)},
         db_path=db_path,
     )
 
@@ -10323,13 +10311,13 @@ def save_backup_target(
         "id": saved_id,
         "name": clean_name,
         "target_type": t_type,
-        "source_path": clean_source,
-        "stack_name": clean_stack,
+        "source_path": str(src),
+        "stack_name": "",
         "excludes": exclude_list,
-        "stop_containers": bool(stop_containers),
+        "stop_containers": False,
         "retain_count": retain_val,
         "created_at": now_ts,
-        "exists": Path(clean_source).is_dir(),
+        "exists": src.is_dir(),
     }
 
 
@@ -10363,7 +10351,7 @@ def delete_backup_target(
 
 
 def get_backups_overview(db_path: Path = STATE_DB_PATH) -> dict[str, Any]:
-    """Return full overview of backup directory, discovered stack folders, saved targets, and archives."""
+    """Return full overview of backup directory, saved targets, and archives."""
     archives = list_backup_archives(db_path=db_path)
     total_size = sum(int(a.get("size_bytes") or 0) for a in archives)
     return {
@@ -10371,14 +10359,12 @@ def get_backups_overview(db_path: Path = STATE_DB_PATH) -> dict[str, Any]:
         "total_archives": len(archives),
         "total_size_bytes": total_size,
         "total_size_human": _format_bytes(total_size),
-        "stack_targets": discover_stack_backup_targets(db_path=db_path),
         "saved_targets": list_backup_targets(db_path=db_path),
         "archives": archives,
     }
 
 
 SUPPORTED_CRON_TASK_TYPES: dict[str, str] = {
-    "backup.stack": "Back up a specific Docker Compose stack folder (or 'all' discovered stacks)",
     "backup.directory": "Back up a custom host directory with optional glob exclusions and retention",
     "notifications.summary": "Dispatch Vigil system health & telemetry digest across enabled notification channels",
     "docker.prune": "Prune unused Docker images and optionally unused volumes",
@@ -10732,12 +10718,7 @@ def create_or_update_cron_job(
 
     task_config = copy.deepcopy(raw_cfg)
     # Task-specific validation
-    if task_type == "backup.stack":
-        st_name = str(task_config.get("stack_name") or "all").strip() or "all"
-        task_config["stack_name"] = st_name
-        task_config["retain_count"] = max(1, int(task_config.get("retain_count", 7) or 7))
-        task_config["stop_containers"] = bool(task_config.get("stop_containers", False))
-    elif task_type == "backup.directory":
+    if task_type == "backup.directory":
         src_path = str(task_config.get("source_path") or "").strip()
         if not src_path:
             raise ValueError("source_path is required in task_config for backup.directory.")
@@ -10836,6 +10817,24 @@ def create_or_update_cron_job(
         conn.close()
 
     saved_job = _format_cron_job_row(row)
+    if task_type == "notifications.summary":
+        try:
+            cfg = get_notification_center_config()
+            cfg.setdefault("schedule", {})["enabled"] = bool(enabled)
+            cfg["schedule"]["cron_expression"] = cron_expr
+            now_nc = time.time()
+            conn_nc = _connect_state_db(db_path)
+            try:
+                conn_nc.execute(
+                    "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                    ("notification_center_config", json.dumps(cfg), now_nc),
+                )
+                conn_nc.commit()
+            finally:
+                conn_nc.close()
+        except Exception:
+            pass
+
     record_audit_event(
         audit_event,
         f"{'Updated' if audit_event.endswith('updated') else 'Created'} cron job '{clean_name}' ({task_type} @ {cron_expr})",
@@ -10889,6 +10888,23 @@ def toggle_cron_job(
         conn.close()
 
     job_dict = _format_cron_job_row(updated_row)
+    if job_dict.get("task_type") == "notifications.summary":
+        try:
+            cfg = get_notification_center_config()
+            cfg.setdefault("schedule", {})["enabled"] = bool(new_enabled)
+            now_nc = time.time()
+            conn_nc = _connect_state_db(db_path)
+            try:
+                conn_nc.execute(
+                    "INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                    ("notification_center_config", json.dumps(cfg), now_nc),
+                )
+                conn_nc.commit()
+            finally:
+                conn_nc.close()
+        except Exception:
+            pass
+
     record_audit_event(
         "cron.job.toggled",
         f"{'Enabled' if new_enabled else 'Disabled'} cron job '{job_dict['name']}'",
@@ -10949,48 +10965,6 @@ def _execute_cron_task(
     db_path: Path = STATE_DB_PATH,
 ) -> str:
     """Execute the underlying system task for a cron job and return a human-readable output string."""
-    if task_type == "backup.stack":
-        stack_name = str(task_config.get("stack_name") or "all").strip() or "all"
-        retain_count = int(task_config.get("retain_count", 7) or 7)
-        stop_containers = bool(task_config.get("stop_containers", False))
-        excludes = task_config.get("excludes") or []
-        if stack_name.lower() == "all":
-            targets = [
-                t
-                for t in discover_stack_backup_targets(db_path=db_path)
-                if t.get("exists")
-            ]
-            if not targets:
-                return "No existing Docker stack directories found to back up."
-            created_files = []
-            for t in targets:
-                arch = create_backup_archive(
-                    target_type="stack",
-                    source_path=str(t["source_path"]),
-                    stack_name=str(t["stack_name"]),
-                    target_name=str(t["stack_name"]),
-                    excludes=excludes,
-                    stop_containers=stop_containers,
-                    retain_count=retain_count,
-                    actor=actor,
-                    db_path=db_path,
-                )
-                created_files.append(arch["filename"])
-            return f"Backed up {len(created_files)} stack(s): {', '.join(created_files)}"
-        else:
-            arch = create_backup_archive(
-                target_type="stack",
-                source_path=str(task_config.get("source_path") or ""),
-                stack_name=stack_name,
-                target_name=str(task_config.get("target_name") or stack_name),
-                excludes=excludes,
-                stop_containers=stop_containers,
-                retain_count=retain_count,
-                actor=actor,
-                db_path=db_path,
-            )
-            return f"Created stack backup '{arch['filename']}' ({arch['size_human']}, {arch['file_count']} files)"
-
     if task_type == "backup.directory":
         src_path = str(task_config.get("source_path") or "").strip()
         target_name = str(task_config.get("target_name") or "").strip()
@@ -11015,7 +10989,10 @@ def _execute_cron_task(
         title, desc, embed_data = build_periodic_report_data(topics)
         mgr = NotificationManager(config_dict)
         results = _dispatch_async_coro_sync(mgr.send_all(title, desc, embed_data))
-        record_notification("scheduled_report", time.time(), weekly=True)
+        current_time = time.time()
+        record_notification("scheduled_report", current_time, weekly=True)
+        set_notification_state_entry("raid_summary", current_time, current_time + WEEK_SECONDS, "scheduled_report")
+        set_notification_state_entry("periodic_report", current_time, current_time + WEEK_SECONDS, "scheduled_report")
         ok_channels = [ch for ch, (ok, _) in results.items() if ok]
         if ok_channels:
             return f"System health digest sent via {', '.join(ok_channels)}."
@@ -11315,6 +11292,7 @@ async def monitor_notifications() -> None:
     try:
         await evaluate_threshold_alerts()
         await evaluate_scheduled_reports()
+        evaluate_due_cron_jobs()
     except Exception as exc:
         logging.error(f"Error checking notification thresholds and schedule: {exc}")
 

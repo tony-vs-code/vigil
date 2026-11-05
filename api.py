@@ -127,6 +127,7 @@ async def notifications_evaluator_loop() -> None:
         try:
             await main.evaluate_threshold_alerts()
             await main.evaluate_scheduled_reports()
+            main.evaluate_due_cron_jobs()
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -2362,6 +2363,10 @@ class CronJobRequest(BaseModel):
     notify_on_success: bool = False
 
 
+class BackupConfigRequest(BaseModel):
+    backup_dir: str
+
+
 class CronJobToggleRequest(BaseModel):
     enabled: Optional[bool] = None
 
@@ -2375,6 +2380,43 @@ def api_get_backups(_user: str = Depends(require_auth)) -> dict[str, Any]:
         raise HTTPException(
             status_code=500, detail=f"Failed to fetch backups overview: {exc}"
         )
+
+
+@app.post("/api/backups/config")
+def api_configure_backup_dir(
+    payload: BackupConfigRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    raw_dir = str(payload.backup_dir or "").strip()
+    if not raw_dir:
+        raise HTTPException(status_code=400, detail="backup_dir is required.")
+    try:
+        resolved_path = str(
+            main._validate_safe_host_directory(raw_dir, purpose="backup storage")
+        )
+        out_path = Path(resolved_path)
+        out_path.mkdir(parents=True, exist_ok=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Cannot create backup directory: {exc}"
+        )
+
+    actor = (
+        _user.get("username", "admin")
+        if isinstance(_user, dict)
+        else (str(_user) if _user else "admin")
+    )
+    main.update_app_settings({"backup_dir": resolved_path})
+    main.record_audit_event(
+        "backup.config.updated",
+        f"Updated backup archive storage directory to '{resolved_path}'",
+        actor=actor,
+        severity="info",
+        metadata={"backup_dir": resolved_path},
+    )
+    return {"status": "ok", "backup_dir": resolved_path}
 
 
 @app.post("/api/backups/run")

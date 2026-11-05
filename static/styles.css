@@ -6516,4 +6516,55 @@ hr.overview-flow-divider {
   vertical-align: middle;
 }
 
+.backup-dir-control-panel {
+  display: flex;
+  align-items: center;
+  padding: 12px 14px;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.backup-dir-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.backup-dir-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.backup-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.backup-dir-input {
+  flex: 1;
+  background: var(--bg-card-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 7px 10px;
+  font-size: 0.85rem;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.backup-dir-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.schedule-helper-text {
+  font-size: 0.76rem;
+  margin-top: 6px;
+}
+
 
