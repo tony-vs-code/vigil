@@ -186,6 +186,19 @@ def asgi_post(
     )
 
 
+def asgi_put(
+    app,
+    path: str,
+    *,
+    json_body: dict | None = None,
+    headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+) -> AsgiResponse:
+    return asgi_request(
+        app, "PUT", path, json_body=json_body, headers=headers, cookies=cookies
+    )
+
+
 def asgi_delete(
     app,
     path: str,
@@ -10389,6 +10402,8 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
                     "target_name": "bihourly-dir",
                 },
                 "enabled": True,
+                "notify_on_failure": False,
+                "notify_on_success": True,
             },
             actor="admin",
             db_path=self.db_path,
@@ -10396,6 +10411,56 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.assertEqual(updated["id"], jid)
         self.assertEqual(updated["name"], "Bi-Hourly Directory Backup")
         self.assertEqual(updated["cron_expression"], "0 */2 * * *")
+        self.assertFalse(updated["notify_on_failure"])
+        self.assertTrue(updated["notify_on_success"])
+
+        # Directly verify all updated columns in cron_jobs table
+        conn = main._connect_state_db(self.db_path)
+        row = conn.execute(
+            """
+            SELECT name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success, next_run_at, updated_at
+            FROM cron_jobs WHERE id = ?
+            """,
+            (jid,),
+        ).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "Bi-Hourly Directory Backup")
+        self.assertEqual(row[1], "backup.directory")
+        self.assertEqual(row[2], "0 */2 * * *")
+        self.assertIn("bihourly-dir", row[3])
+        self.assertEqual(row[4], 1)
+        self.assertEqual(row[5], 0)
+        self.assertEqual(row[6], 1)
+        self.assertGreater(row[7], 0)
+        self.assertGreater(row[8], 0)
+
+        # Updating non-existent job ID raises ValueError
+        with self.assertRaises(ValueError):
+            main.create_or_update_cron_job(
+                {
+                    "id": 99999,
+                    "name": "Missing Job",
+                    "task_type": "docker.prune",
+                    "cron_expression": "0 0 * * *",
+                },
+                actor="admin",
+                db_path=self.db_path,
+            )
+
+        # Status reporting tasks default notify_on_success to True
+        smart_job = main.create_or_update_cron_job(
+            {
+                "name": "Default Notify Test",
+                "task_type": "storage.smart_check",
+                "cron_expression": "0 5 * * *",
+            },
+            actor="admin",
+            db_path=self.db_path,
+        )
+        self.assertTrue(smart_job["notify_on_success"])
+        main.delete_cron_job(smart_job["id"], actor="admin", db_path=self.db_path)
 
         # List cron jobs
         listing = main.list_cron_jobs(self.db_path)
@@ -10498,7 +10563,10 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
 
         # 3. storage.smart_check
         with patch("main.get_all_disks_smart_metrics", return_value=[{"device": "sda", "passed": True}]), \
-             patch("main.check_raid_status", return_value=("clean", [])):
+             patch("main.check_raid_status", return_value=("clean", "md0 : active raid1 sda1[0] sdb1[1]")), \
+             patch("main.get_duf_output", return_value="duf stats"), \
+             patch.object(main.NotificationManager, "send_all", new_callable=AsyncMock) as mock_send_smart:
+            mock_send_smart.return_value = {"discord": (True, 200)}
             job_smart = main.create_or_update_cron_job(
                 {
                     "name": "SMART Check",
@@ -10509,9 +10577,32 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
                 actor="admin",
                 db_path=self.db_path,
             )
+            self.assertTrue(job_smart["notify_on_success"])
             run_smart = main.run_cron_job_now(job_smart["id"], actor="admin", db_path=self.db_path)
             self.assertEqual(run_smart["status"], "success")
             self.assertIn("Checked 1 disk(s)", run_smart["output"])
+            self.assertIn("posted status embed to Discord", run_smart["output"])
+            mock_send_smart.assert_called_once()
+            call_args = mock_send_smart.call_args[0]
+            self.assertIn("Vigil RAID Status: CLEAN", call_args[0])
+            self.assertIn("Checked 1 disk(s)", call_args[1])
+            self.assertIsInstance(call_args[2], dict)
+            self.assertEqual(call_args[2].get("color"), 0x2ECC71)
+
+        # storage.smart_check with degraded raid and failed smart disk
+        with patch("main.get_all_disks_smart_metrics", return_value=[{"device": "sdb", "passed": False, "status": "failed"}]), \
+             patch("main.check_raid_status", return_value=("degraded", "md0 : degraded raid1 sda1[0]")), \
+             patch("main.get_duf_output", return_value="duf stats degraded"), \
+             patch.object(main.NotificationManager, "send_all", new_callable=AsyncMock) as mock_send_degraded:
+            mock_send_degraded.return_value = {"discord": (True, 200)}
+            run_degraded = main.run_cron_job_now(job_smart["id"], actor="admin", db_path=self.db_path)
+            self.assertEqual(run_degraded["status"], "success")
+            self.assertIn("failed_smart=1", run_degraded["output"])
+            mock_send_degraded.assert_called_once()
+            deg_args = mock_send_degraded.call_args[0]
+            self.assertEqual(deg_args[0], "Vigil Storage Health Warning")
+            self.assertEqual(deg_args[2].get("color"), 0xF39C12)
+            self.assertTrue(any("S.M.A.R.T. Disks Failing" in f.get("name", "") for f in deg_args[2].get("fields", [])))
 
         # Invalid task_type raises ValueError
         with self.assertRaises(ValueError):
@@ -10524,6 +10615,17 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
                 actor="admin",
                 db_path=self.db_path,
             )
+
+    def test_cron_initial_seed_defaults(self):
+        seed_db = Path(self.temp_dir.name) / "test_initial_seed.db"
+        main.init_state_db(seed_db)
+        listing = main.list_cron_jobs(seed_db)["jobs"]
+        notif_job = next((j for j in listing if j["task_type"] == "notifications.summary"), None)
+        smart_job = next((j for j in listing if j["task_type"] == "storage.smart_check"), None)
+        self.assertIsNotNone(notif_job)
+        self.assertIsNotNone(smart_job)
+        self.assertTrue(notif_job["notify_on_success"])
+        self.assertTrue(smart_job["notify_on_success"])
 
     def test_fastapi_backups_endpoints_auth_and_lifecycle(self):
         # 1. Unauthenticated requests rejected
@@ -10773,6 +10875,75 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         job_data = good_job.json()["job"]
         jid = job_data["id"]
 
+        # Update existing job via POST /api/cron/jobs with id
+        update_post = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={
+                "id": jid,
+                "name": "Nightly Prune Updated",
+                "task_type": "docker.prune",
+                "cron_expression": "0 4 * * *",
+                "task_config": {"prune_images": True, "prune_volumes": True},
+                "enabled": True,
+                "notify_on_failure": False,
+                "notify_on_success": True,
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(update_post.status_code, 200)
+        self.assertEqual(update_post.json()["job"]["id"], jid)
+        self.assertEqual(update_post.json()["job"]["name"], "Nightly Prune Updated")
+        self.assertEqual(update_post.json()["job"]["cron_expression"], "0 4 * * *")
+        self.assertTrue(update_post.json()["job"]["notify_on_success"])
+        self.assertFalse(update_post.json()["job"]["notify_on_failure"])
+
+        # Update existing job via PUT /api/cron/jobs/{job_id}
+        update_put = asgi_put(
+            api.app,
+            f"/api/cron/jobs/{jid}",
+            json_body={
+                "name": "Nightly Prune via PUT",
+                "task_type": "docker.prune",
+                "cron_expression": "0 5 * * *",
+                "task_config": {"prune_images": False, "prune_volumes": True},
+                "enabled": True,
+                "notify_on_failure": True,
+                "notify_on_success": True,
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(update_put.status_code, 200)
+        self.assertEqual(update_put.json()["job"]["name"], "Nightly Prune via PUT")
+        self.assertEqual(update_put.json()["job"]["cron_expression"], "0 5 * * *")
+
+        # Update non-existent job via POST /api/cron/jobs with unknown id returns 404
+        post_missing = asgi_post(
+            api.app,
+            "/api/cron/jobs",
+            json_body={
+                "id": 99999,
+                "name": "Missing Job",
+                "task_type": "docker.prune",
+                "cron_expression": "0 0 * * *",
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(post_missing.status_code, 404)
+
+        # Update non-existent job via PUT /api/cron/jobs/{id} returns 404
+        put_missing = asgi_put(
+            api.app,
+            "/api/cron/jobs/99999",
+            json_body={
+                "name": "Missing Job",
+                "task_type": "docker.prune",
+                "cron_expression": "0 0 * * *",
+            },
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(put_missing.status_code, 404)
+
         # 4. POST /api/cron/jobs/{id}/toggle
         togg = asgi_post(
             api.app,
@@ -10860,6 +11031,10 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
             "backup-archives-tbody",
             "cron-scheduler-card",
             "cron-job-form",
+            "cron-job-id",
+            "cron-job-edit-indicator",
+            "cron-editing-job-name",
+            "cron-cancel-edit-btn",
             "cron-job-name",
             "cron-task-type",
             "cron-preset-select",
@@ -10881,11 +11056,16 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         for dom_id in required_backup_cron_ids:
             self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
 
+        self.assertIn("<th>Notifications</th>", html, "Missing Notifications header in static/index.html")
+
         required_fns = [
             "async function fetchBackups(",
             "function renderBackups(",
             "async function fetchCronJobs(",
             "function renderCronJobs(",
+            "function editCronJob(",
+            "function cancelEditCronJob(",
+            "function handleCronTaskTypeChange(",
             "async function handleSaveCronJob(",
             "async function toggleCronJob(",
             "async function runCronJobNow(",
@@ -10907,6 +11087,9 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
             ".backups-form-panel",
             ".backups-form-grid",
             ".btn-backup-action",
+            ".btn-backup-action.btn-edit",
+            ".cron-edit-banner",
+            ".cron-notif-badge",
             ".target-kind-badge",
             "#backup-targets-table",
             "#backup-archives-table",
@@ -10945,9 +11128,16 @@ function getEl(id) {
       innerHTML: '',
       value: '',
       className: '',
+      checked: false,
+      style: {},
       selectedIndex: 0,
-      options: [{ value: 'plex', getAttribute: () => '/home/anthony/docker/plex' }],
+      options: [
+        { value: '0 2 * * *', text: 'Daily at 02:00' },
+        { value: 'custom', text: 'Custom Expression' }
+      ],
       children: [],
+      scrollIntoView: () => {},
+      focus: () => {},
       getAttribute: () => '',
       classList: {
         _set: new Set(),
@@ -10970,11 +11160,17 @@ const sandbox = {
   escapeHtml: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
   formatBytes: (bytes) => (bytes / (1024 * 1024)).toFixed(1) + ' MB',
   formatDateTime: (ts) => '2026-11-04 12:00:00',
+  showToast: () => {},
+  cachedCronData: null,
 };
 vm.createContext(sandbox);
 vm.runInContext(extractFunc(code, 'syncBackupFormWithSelectedStack'), sandbox);
 vm.runInContext(extractFunc(code, 'renderBackups'), sandbox);
+vm.runInContext(extractFunc(code, 'updateCronFormTaskConfigVisibility'), sandbox);
 vm.runInContext(extractFunc(code, 'renderCronJobs'), sandbox);
+vm.runInContext(extractFunc(code, 'editCronJob'), sandbox);
+vm.runInContext(extractFunc(code, 'cancelEditCronJob'), sandbox);
+vm.runInContext(extractFunc(code, 'handleCronTaskTypeChange'), sandbox);
 
 const backupsPayload = {
   backup_dir: '/home/anthony/.vigil/backups',
@@ -11001,21 +11197,61 @@ if (!getEl('backup-archives-tbody').innerHTML.includes('data-restore-archive')) 
 
 const cronPayload = {
   jobs: [
-    { id: 10, name: 'Nightly Backup', task_type: 'backup.directory', cron_expression: '0 2 * * *', enabled: true, task_config: { source_path: '/home/anthony/appdata' }, last_status: 'success', next_run_at: 1700000000 }
+    { id: 10, name: 'Nightly Backup', task_type: 'backup.directory', cron_expression: '0 2 * * *', enabled: true, notify_on_failure: true, notify_on_success: true, task_config: { source_path: '/home/anthony/appdata', retain_count: 5 }, last_status: 'success', next_run_at: 1700000000 },
+    { id: 11, name: 'Failure Only Job', task_type: 'docker.prune', cron_expression: '0 3 * * *', enabled: true, notify_on_failure: true, notify_on_success: false, task_config: { prune_volumes: true }, last_status: 'never', next_run_at: 1700003600 },
+    { id: 12, name: 'Success Only Job', task_type: 'storage.smart_check', cron_expression: '0 6 * * *', enabled: true, notify_on_failure: false, notify_on_success: true, task_config: {}, last_status: 'success', next_run_at: 1700010000 },
+    { id: 13, name: 'Silent Job', task_type: 'notifications.summary', cron_expression: '0 9 * * *', enabled: false, notify_on_failure: false, notify_on_success: false, task_config: {}, last_status: 'never', next_run_at: 1700020000 }
   ],
   recent_runs: [
     { id: 101, job_id: 10, job_name: 'Nightly Backup', task_type: 'backup.directory', trigger_source: 'schedule', status: 'success', started_at: 1700000000, duration_ms: 1200, output: 'Created backup archive appdata.tar.gz' }
   ],
   supported_task_types: [
-    { type: 'backup.directory', label: 'Custom Directory Backup' }
+    { type: 'backup.directory', label: 'Custom Directory Backup' },
+    { type: 'docker.prune', label: 'Docker System & Volume Prune' },
+    { type: 'storage.smart_check', label: 'S.M.A.R.T. & RAID Health Check' },
+    { type: 'notifications.summary', label: 'Periodic System Notification Summary' }
   ]
 };
 
+sandbox.cachedCronData = cronPayload;
 sandbox.renderCronJobs(cronPayload);
-if (!getEl('cron-active-jobs-count').textContent.includes('1 Active')) throw new Error('Bad active cron jobs count: ' + getEl('cron-active-jobs-count').textContent);
-if (!getEl('cron-jobs-tbody').innerHTML.includes('Nightly Backup')) throw new Error('Missing Nightly Backup in jobs tbody');
-if (!getEl('cron-jobs-tbody').innerHTML.includes('0 2 * * *')) throw new Error('Missing cron expression in jobs tbody');
+
+if (!getEl('cron-active-jobs-count').textContent.includes('3 Active')) throw new Error('Bad active cron jobs count: ' + getEl('cron-active-jobs-count').textContent);
+const jobsTbodyHtml = getEl('cron-jobs-tbody').innerHTML;
+if (!jobsTbodyHtml.includes('Nightly Backup')) throw new Error('Missing Nightly Backup in jobs tbody');
+if (!jobsTbodyHtml.includes('0 2 * * *')) throw new Error('Missing cron expression in jobs tbody');
+if (!jobsTbodyHtml.includes('data-edit-cron-id="10"')) throw new Error('Missing data-edit-cron-id="10" button in jobs tbody');
+if (!jobsTbodyHtml.includes('data-edit-cron-id="11"')) throw new Error('Missing data-edit-cron-id="11" button in jobs tbody');
+
+// Verify notification badge representations
+if (!jobsTbodyHtml.includes('🔔 Success + Failure')) throw new Error('Missing Success + Failure badge');
+if (!jobsTbodyHtml.includes('🔔 Failure Only')) throw new Error('Missing Failure Only badge');
+if (!jobsTbodyHtml.includes('🔔 Success Only')) throw new Error('Missing Success Only badge');
+if (!jobsTbodyHtml.includes('🔕 None')) throw new Error('Missing None badge');
+
 if (!getEl('cron-runs-tbody').innerHTML.includes('Created backup archive appdata.tar.gz')) throw new Error('Missing run output in runs tbody');
+
+// Test editCronJob(10)
+sandbox.editCronJob(10);
+if (getEl('cron-job-id').value !== '10') throw new Error('editCronJob failed to set cron-job-id: ' + getEl('cron-job-id').value);
+if (getEl('cron-job-name').value !== 'Nightly Backup') throw new Error('editCronJob failed to set name');
+if (getEl('cron-editing-job-name').textContent !== 'Nightly Backup') throw new Error('editCronJob failed to set banner job name');
+if (getEl('cron-save-job-btn').textContent !== 'Update Scheduled Job') throw new Error('editCronJob failed to toggle button text: ' + getEl('cron-save-job-btn').textContent);
+if (getEl('cron-job-edit-indicator').classList.contains('hidden')) throw new Error('edit banner should not be hidden in edit mode');
+
+// Test cancelEditCronJob()
+sandbox.cancelEditCronJob();
+if (getEl('cron-job-id').value !== '') throw new Error('cancelEditCronJob failed to clear id');
+if (getEl('cron-job-name').value !== '') throw new Error('cancelEditCronJob failed to clear name');
+if (getEl('cron-save-job-btn').textContent !== 'Save Scheduled Job') throw new Error('cancelEditCronJob failed to reset button text: ' + getEl('cron-save-job-btn').textContent);
+if (!getEl('cron-job-edit-indicator').classList.contains('hidden')) throw new Error('edit banner should be hidden after cancel');
+
+// Test handleCronTaskTypeChange()
+getEl('cron-task-type').value = 'storage.smart_check';
+getEl('cron-notify-success').checked = false;
+sandbox.handleCronTaskTypeChange();
+if (!getEl('cron-notify-success').checked) throw new Error('handleCronTaskTypeChange should auto-check notify_on_success for storage.smart_check');
+
 console.log('OK');
 """
         proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)

@@ -10681,6 +10681,7 @@ async function deleteBackupArchive(filename) {
  * Pre-fill the Cron Job form (#cron-job-form) for a given directory target and scroll to it.
  */
 function prefillCronFormForTarget({ sourcePath = "", targetName = "", retainCount = 7 } = {}) {
+  cancelEditCronJob();
   const jobNameInput = document.getElementById("cron-job-name");
   const taskTypeSelect = document.getElementById("cron-task-type");
   const pathInput = document.getElementById("cron-config-source-path");
@@ -10722,6 +10723,122 @@ function updateCronFormTaskConfigVisibility() {
   pathGroup?.classList.toggle("hidden", !isDirBackup);
   retainGroup?.classList.toggle("hidden", !isDirBackup);
   pruneGroup?.classList.toggle("hidden", !isDockerPrune);
+}
+
+/**
+ * Handle manual task type changes, toggling dynamic inputs and auto-checking notifications for status digests.
+ */
+function handleCronTaskTypeChange() {
+  updateCronFormTaskConfigVisibility();
+  const taskType = document.getElementById("cron-task-type")?.value;
+  if (taskType === "storage.smart_check" || taskType === "notifications.summary") {
+    const notifySuccessCheckbox = document.getElementById("cron-notify-success");
+    const notifyFailureCheckbox = document.getElementById("cron-notify-failure");
+    if (notifySuccessCheckbox) notifySuccessCheckbox.checked = true;
+    if (notifyFailureCheckbox) notifyFailureCheckbox.checked = true;
+  }
+}
+
+/**
+ * Populate #cron-job-form to edit an existing scheduled cron job.
+ */
+function editCronJob(jobId) {
+  const jobs = Array.isArray(cachedCronData?.jobs) ? cachedCronData.jobs : [];
+  const job = jobs.find((j) => String(j.id) === String(jobId));
+  if (!job) {
+    showToast({
+      title: "Job Not Found",
+      message: `Could not find scheduled job #${jobId} to edit.`,
+      type: "warning",
+    });
+    return;
+  }
+
+  const idInput = document.getElementById("cron-job-id");
+  const nameInput = document.getElementById("cron-job-name");
+  const taskTypeSelect = document.getElementById("cron-task-type");
+  const presetSelect = document.getElementById("cron-preset-select");
+  const exprInput = document.getElementById("cron-expression-input");
+  const pathInput = document.getElementById("cron-config-source-path");
+  const retainInput = document.getElementById("cron-config-retain-count");
+  const pruneVolCheckbox = document.getElementById("cron-config-prune-volumes");
+  const notifyFailureCheckbox = document.getElementById("cron-notify-failure");
+  const notifySuccessCheckbox = document.getElementById("cron-notify-success");
+  const editBanner = document.getElementById("cron-job-edit-indicator");
+  const editJobName = document.getElementById("cron-editing-job-name");
+  const saveBtn = document.getElementById("cron-save-job-btn");
+
+  if (idInput) idInput.value = String(job.id);
+  if (nameInput) nameInput.value = job.name || "";
+  if (taskTypeSelect) {
+    taskTypeSelect.value = job.task_type || "backup.directory";
+    updateCronFormTaskConfigVisibility();
+  }
+
+  const expr = job.cron_expression || "";
+  if (exprInput) exprInput.value = expr;
+  if (presetSelect) {
+    const matchingOpt = Array.from(presetSelect.options).find((o) => o.value === expr);
+    presetSelect.value = matchingOpt ? expr : "custom";
+  }
+
+  const cfg = job.task_config || {};
+  if (pathInput) pathInput.value = cfg.source_path || "";
+  if (retainInput) retainInput.value = String(cfg.retain_count ?? 7);
+  if (pruneVolCheckbox) pruneVolCheckbox.checked = Boolean(cfg.prune_volumes);
+
+  if (notifyFailureCheckbox) notifyFailureCheckbox.checked = Boolean(job.notify_on_failure);
+  if (notifySuccessCheckbox) notifySuccessCheckbox.checked = Boolean(job.notify_on_success);
+
+  if (editBanner) {
+    editBanner.classList.remove("hidden");
+    editBanner.style.display = "flex";
+  }
+  if (editJobName) editJobName.textContent = job.name || `Job #${job.id}`;
+  if (saveBtn) saveBtn.textContent = "Update Scheduled Job";
+
+  const formEl = document.getElementById("cron-job-form");
+  formEl?.scrollIntoView({ behavior: "smooth", block: "start" });
+  nameInput?.focus();
+}
+
+/**
+ * Cancel editing and reset the Cron Job form to default creation mode.
+ */
+function cancelEditCronJob() {
+  const idInput = document.getElementById("cron-job-id");
+  const nameInput = document.getElementById("cron-job-name");
+  const taskTypeSelect = document.getElementById("cron-task-type");
+  const presetSelect = document.getElementById("cron-preset-select");
+  const exprInput = document.getElementById("cron-expression-input");
+  const pathInput = document.getElementById("cron-config-source-path");
+  const retainInput = document.getElementById("cron-config-retain-count");
+  const pruneVolCheckbox = document.getElementById("cron-config-prune-volumes");
+  const notifyFailureCheckbox = document.getElementById("cron-notify-failure");
+  const notifySuccessCheckbox = document.getElementById("cron-notify-success");
+  const editBanner = document.getElementById("cron-job-edit-indicator");
+  const editJobName = document.getElementById("cron-editing-job-name");
+  const saveBtn = document.getElementById("cron-save-job-btn");
+
+  if (idInput) idInput.value = "";
+  if (nameInput) nameInput.value = "";
+  if (taskTypeSelect) taskTypeSelect.value = "backup.directory";
+  if (presetSelect) presetSelect.value = "0 2 * * *";
+  if (exprInput) exprInput.value = "0 2 * * *";
+  if (pathInput) pathInput.value = "";
+  if (retainInput) retainInput.value = "7";
+  if (pruneVolCheckbox) pruneVolCheckbox.checked = false;
+  if (notifyFailureCheckbox) notifyFailureCheckbox.checked = true;
+  if (notifySuccessCheckbox) notifySuccessCheckbox.checked = false;
+
+  updateCronFormTaskConfigVisibility();
+
+  if (editBanner) {
+    editBanner.classList.add("hidden");
+    editBanner.style.display = "none";
+  }
+  if (editJobName) editJobName.textContent = "--";
+  if (saveBtn) saveBtn.textContent = "Save Scheduled Job";
 }
 
 /**
@@ -10792,9 +10909,16 @@ function renderCronJobs(data) {
           }
 
           const cronExpr = escapeHtml(job.cron_expression || "");
-          const nextRun = job.enabled
-            ? escapeHtml(job.next_run_iso || formatDateTime(job.next_run_at))
-            : `<span class="text-muted">Paused</span>`;
+          let notifBadgeHtml = "";
+          if (job.notify_on_success && job.notify_on_failure) {
+            notifBadgeHtml = '<span class="status-badge cron-notif-badge status-ok" title="Notifies on success and failure">🔔 Success + Failure</span>';
+          } else if (job.notify_on_failure) {
+            notifBadgeHtml = '<span class="status-badge cron-notif-badge status-muted" title="Notifies on failure only">🔔 Failure Only</span>';
+          } else if (job.notify_on_success) {
+            notifBadgeHtml = '<span class="status-badge cron-notif-badge status-info" title="Notifies on success only">🔔 Success Only</span>';
+          } else {
+            notifBadgeHtml = '<span class="status-badge cron-notif-badge status-muted" title="No notifications configured">🔕 None</span>';
+          }
 
           let lastRunHtml = `<span class="text-muted">Never run</span>`;
           if (job.last_run_at || job.last_run_iso) {
@@ -10829,7 +10953,7 @@ function renderCronJobs(data) {
                 ${targetDesc ? `<div class="mono-text text-secondary" style="font-size: 0.78rem;">${escapeHtml(targetDesc)}</div>` : ""}
               </td>
               <td class="mono-text font-bold">${cronExpr}</td>
-              <td class="mono-text text-secondary">${nextRun}</td>
+              <td>${notifBadgeHtml}</td>
               <td>${lastRunHtml}</td>
               <td>${enabledBadge}</td>
               <td style="text-align: right;">
@@ -10841,6 +10965,14 @@ function renderCronJobs(data) {
                     title="Execute job ${nameSafe} immediately"
                   >
                     Run Now
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-backup-action btn-edit"
+                    data-edit-cron-id="${jobId}"
+                    title="Edit job ${nameSafe}"
+                  >
+                    Edit
                   </button>
                   <button
                     type="button"
@@ -10914,6 +11046,9 @@ function renderCronJobs(data) {
 async function handleSaveCronJob(e) {
   if (e) e.preventDefault();
 
+  const editingJobId = document.getElementById("cron-job-id")?.value;
+  const isEditing = Boolean(editingJobId);
+
   const name = (document.getElementById("cron-job-name")?.value || "").trim();
   const task_type = document.getElementById("cron-task-type")?.value || "backup.directory";
   const cron_expression = (document.getElementById("cron-expression-input")?.value || "").trim();
@@ -10951,9 +11086,18 @@ async function handleSaveCronJob(e) {
     task_config.prune_volumes = Boolean(document.getElementById("cron-config-prune-volumes")?.checked);
   }
 
+  let isEnabled = true;
+  if (isEditing) {
+    const jobs = Array.isArray(cachedCronData?.jobs) ? cachedCronData.jobs : [];
+    const existing = jobs.find((j) => String(j.id) === String(editingJobId));
+    if (existing && typeof existing.enabled === "boolean") {
+      isEnabled = existing.enabled;
+    }
+  }
+
   if (saveBtn) {
     saveBtn.disabled = true;
-    saveBtn.textContent = "Saving...";
+    saveBtn.textContent = isEditing ? "Updating..." : "Saving...";
   }
 
   try {
@@ -10961,12 +11105,12 @@ async function handleSaveCronJob(e) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        id: null,
+        id: isEditing ? Number(editingJobId) : null,
         name,
         task_type,
         cron_expression,
         task_config,
-        enabled: true,
+        enabled: isEnabled,
         notify_on_failure,
         notify_on_success,
       }),
@@ -10977,24 +11121,26 @@ async function handleSaveCronJob(e) {
     }
 
     showToast({
-      title: "Scheduled Job Saved",
-      message: `Cron job "${name}" (${cron_expression}) saved.`,
+      title: isEditing ? "Scheduled Job Updated" : "Scheduled Job Saved",
+      message: isEditing
+        ? `Scheduled job "${name}" updated successfully.`
+        : `Cron job "${name}" (${cron_expression}) saved.`,
       type: "success",
     });
-    const nameInput = document.getElementById("cron-job-name");
-    if (nameInput) nameInput.value = "";
+    cancelEditCronJob();
     await fetchCronJobs();
   } catch (err) {
     console.error("handleSaveCronJob error:", err);
     showToast({
-      title: "Save Cron Job Failed",
+      title: isEditing ? "Update Cron Job Failed" : "Save Cron Job Failed",
       message: err instanceof Error ? err.message : String(err),
       type: "danger",
     });
   } finally {
     if (saveBtn) {
       saveBtn.disabled = false;
-      saveBtn.textContent = "Save Scheduled Job";
+      const stillEditing = Boolean(document.getElementById("cron-job-id")?.value);
+      saveBtn.textContent = stillEditing ? "Update Scheduled Job" : "Save Scheduled Job";
     }
   }
 }
@@ -12309,7 +12455,11 @@ function initDashboard() {
 
   document
     .getElementById("cron-task-type")
-    ?.addEventListener("change", updateCronFormTaskConfigVisibility);
+    ?.addEventListener("change", handleCronTaskTypeChange);
+
+  document
+    .getElementById("cron-cancel-edit-btn")
+    ?.addEventListener("click", cancelEditCronJob);
 
   const cronPresetSelect = document.getElementById("cron-preset-select");
   const cronExprInput = document.getElementById("cron-expression-input");
@@ -12336,6 +12486,13 @@ function initDashboard() {
     if (runBtn) {
       const jobId = runBtn.getAttribute("data-run-cron-id");
       if (jobId) runCronJobNow(jobId, runBtn);
+      return;
+    }
+
+    const editBtn = e.target.closest("[data-edit-cron-id]");
+    if (editBtn) {
+      const jobId = editBtn.getAttribute("data-edit-cron-id");
+      if (jobId) editCronJob(jobId);
       return;
     }
 

@@ -2911,6 +2911,11 @@
 
                 <!-- Create / Edit Cron Job Form (#cron-job-form) -->
                 <form id="cron-job-form" class="backups-form-panel" onsubmit="return false;">
+                  <input type="hidden" id="cron-job-id" value="" />
+                  <div id="cron-job-edit-indicator" class="cron-edit-banner hidden" style="display: none;">
+                    <span class="cron-edit-title">Editing: <strong id="cron-editing-job-name">--</strong></span>
+                    <button type="button" id="cron-cancel-edit-btn" class="btn-backup-action btn-sm">Cancel Edit</button>
+                  </div>
                   <div class="backups-form-grid">
                     <div class="form-group">
                       <label for="cron-job-name">Job Name</label>
@@ -3015,7 +3020,7 @@
                           <th>Job Name</th>
                           <th>Task Type &amp; Target</th>
                           <th>Schedule (Cron)</th>
-                          <th>Next Run</th>
+                          <th>Notifications</th>
                           <th>Last Run &amp; Status</th>
                           <th>Enabled</th>
                           <th style="text-align: right;">Actions</th>

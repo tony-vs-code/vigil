@@ -557,7 +557,40 @@ def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
                     "{}",
                     enabled,
                     1,
-                    0,
+                    1,
+                    next_ts,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+
+        row_smart = conn.execute(
+            "SELECT id FROM cron_jobs WHERE task_type = 'storage.smart_check'"
+        ).fetchone()
+        if not row_smart:
+            now = time.time()
+            cron_expr = "0 6 * * *"
+            try:
+                next_ts = get_next_cron_run_timestamp(cron_expr, now)
+            except Exception:
+                next_ts = now + 86400.0
+            conn.execute(
+                """
+                INSERT INTO cron_jobs
+                (name, task_type, cron_expression, task_config_json, enabled,
+                 notify_on_failure, notify_on_success, last_run_at, last_status,
+                 last_duration_ms, last_output, next_run_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 'never', 0, '', ?, ?, ?)
+                """,
+                (
+                    "Daily S.M.A.R.T. & RAID Check",
+                    "storage.smart_check",
+                    cron_expr,
+                    "{}",
+                    1,
+                    1,
+                    1,
                     next_ts,
                     now,
                     now,
@@ -10991,6 +11024,13 @@ def create_or_update_cron_job(
         raise ValueError("job_data must be a dictionary.")
 
     job_id = job_data.get("id")
+    if job_id is not None and str(job_id).strip() != "":
+        try:
+            job_id = int(job_id)
+        except (ValueError, TypeError):
+            job_id = None
+    else:
+        job_id = None
     clean_name = str(job_data.get("name") or "").strip()
     if not clean_name:
         raise ValueError("Job name is required.")
@@ -11037,8 +11077,14 @@ def create_or_update_cron_job(
         task_config["prune_volumes"] = bool(task_config.get("prune_volumes", False))
 
     enabled = bool(job_data.get("enabled", True))
-    notify_on_failure = bool(job_data.get("notify_on_failure", True))
-    notify_on_success = bool(job_data.get("notify_on_success", False))
+    raw_notify_failure = job_data.get("notify_on_failure")
+    notify_on_failure = True if raw_notify_failure is None else bool(raw_notify_failure)
+
+    raw_notify_success = job_data.get("notify_on_success")
+    if raw_notify_success is None:
+        notify_on_success = task_type in ("storage.smart_check", "notifications.summary")
+    else:
+        notify_on_success = bool(raw_notify_success)
 
     now_ts = time.time()
     next_run_at = get_next_cron_run_timestamp(cron_expr, now_ts)
@@ -11049,10 +11095,11 @@ def create_or_update_cron_job(
         is_update = False
         if job_id is not None:
             existing = conn.execute(
-                "SELECT id FROM cron_jobs WHERE id = ?", (int(job_id),)
+                "SELECT id FROM cron_jobs WHERE id = ?", (job_id,)
             ).fetchone()
-            if existing:
-                is_update = True
+            if not existing:
+                raise ValueError(f"Cron job {job_id} not found.")
+            is_update = True
 
         if is_update:
             jid = int(job_id)
@@ -11331,26 +11378,68 @@ def _execute_cron_task(
             if not d.get("passed", True) or d.get("status") == "failed"
         ]
         try:
-            raid_status, _ = check_raid_status()
+            raid_status, raid_details = check_raid_status()
+        except Exception as exc:
+            raid_status, raid_details = "unknown", f"Failed to check RAID status: {exc}"
+
+        if isinstance(raid_details, list):
+            raid_details = "\n".join(str(item) for item in raid_details)
+        elif not isinstance(raid_details, str):
+            raid_details = str(raid_details or "")
+
+        try:
+            duf_output = get_duf_output()
         except Exception:
-            raid_status = "unknown"
-        degraded = raid_status in ("degraded", "failed", "error") or bool(failed_disks)
-        summary_msg = (
-            f"Checked {len(smart_list)} disk(s), RAID status='{raid_status}', "
+            duf_output = ""
+        if not isinstance(duf_output, str):
+            duf_output = str(duf_output or "")
+
+        raid_status_clean = str(raid_status or "unknown").strip().lower()
+
+        try:
+            embed_obj = build_raid_embed(raid_status_clean, raid_details, duf_output)
+            embed_payload = embed_obj.to_dict()
+        except Exception as exc:
+            logging.debug(f"Error building RAID embed: {exc}")
+            embed_payload = {
+                "title": f"RAID Status | {raid_status_clean.upper()}",
+                "description": f"Status: {raid_status_clean}\n{raid_details}",
+                "color": 0x2ECC71 if raid_status_clean in ("clean", "active") else 0xE74C3C,
+            }
+
+        if failed_disks:
+            fields = embed_payload.setdefault("fields", [])
+            fields.append({
+                "name": "⚠️ S.M.A.R.T. Disks Failing",
+                "value": f"Disks: {', '.join(failed_disks)}",
+                "inline": False,
+            })
+
+        degraded = raid_status_clean in ("degraded", "failed", "error") or bool(failed_disks)
+        title = "Vigil Storage Health Warning" if degraded else f"Vigil RAID Status: {raid_status_clean.upper()}"
+        notif_msg = (
+            f"Checked {len(smart_list)} disk(s), RAID status='{raid_status_clean}', "
             f"failed_smart={len(failed_disks)}."
         )
-        if degraded:
-            try:
-                mgr = NotificationManager(get_notification_center_config())
-                _dispatch_async_coro_sync(
-                    mgr.send_all(
-                        "Vigil Storage Health Warning",
-                        summary_msg,
-                        {"title": "Vigil Storage Health Warning", "description": summary_msg},
-                    )
+
+        try:
+            mgr = NotificationManager(get_notification_center_config())
+            _dispatch_async_coro_sync(
+                mgr.send_all(
+                    title,
+                    notif_msg,
+                    embed_payload,
                 )
-            except Exception:
-                pass
+            )
+        except Exception as exc:
+            logging.warning(f"Failed to dispatch storage.smart_check notification: {exc}")
+
+        summary_msg = (
+            f"Checked {len(smart_list)} disk(s), RAID status='{raid_status_clean}'; "
+            f"posted status embed to Discord."
+        )
+        if failed_disks:
+            summary_msg += f" (failed_smart={len(failed_disks)})"
         return summary_msg
 
     raise ValueError(f"Unsupported cron task_type '{task_type}'.")
@@ -11456,7 +11545,9 @@ def run_cron_job_now(
 
     # Optional notification dispatch on failure / success
     if (status == "failed" and job.get("notify_on_failure")) or (
-        status == "success" and job.get("notify_on_success")
+        status == "success"
+        and job.get("notify_on_success")
+        and job.get("task_type") not in ("notifications.summary", "storage.smart_check")
     ):
         try:
             mgr = NotificationManager(get_notification_center_config())
