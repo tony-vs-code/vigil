@@ -10087,6 +10087,11 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_backups_cron.db"
         main.init_state_db(self.db_path)
+        # Clear default seeded jobs so test starts with clean slate
+        conn = main._connect_state_db(self.db_path)
+        conn.execute("DELETE FROM cron_jobs")
+        conn.commit()
+        conn.close()
         self.db_patcher1 = patch.object(main, "RAID_STATE_DB", self.db_path)
         self.db_patcher2 = patch.object(main, "STATE_DB_PATH", self.db_path)
         self.db_patcher1.start()
@@ -10117,11 +10122,24 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.assertTrue(backups_dir.is_dir())
         self.assertEqual(backups_dir, self.db_path.parent / "backups")
 
+        # Test configurable backup_dir when using DEFAULT_STATE_DB_PATH
         custom_env_dir = Path(self.temp_dir.name) / "custom_env_backups"
         with patch.dict(os.environ, {"VIGIL_BACKUP_DIR": str(custom_env_dir)}):
-            resolved = main.get_backups_dir(self.db_path)
-            self.assertEqual(resolved, custom_env_dir)
+            resolved = main.get_backups_dir(main.DEFAULT_STATE_DB_PATH)
+            self.assertEqual(resolved, custom_env_dir.resolve())
             self.assertTrue(custom_env_dir.is_dir())
+
+        # Test app_settings backup_dir override with DEFAULT_STATE_DB_PATH
+        custom_settings_dir = Path(self.temp_dir.name) / "custom_settings_backups"
+        with patch.dict(os.environ, {"VIGIL_BACKUP_DIR": ""}):
+            with patch.object(
+                main,
+                "get_app_settings",
+                return_value={"backup_dir": str(custom_settings_dir)},
+            ):
+                resolved_cfg = main.get_backups_dir(main.DEFAULT_STATE_DB_PATH)
+                self.assertEqual(resolved_cfg, custom_settings_dir.resolve())
+                self.assertTrue(custom_settings_dir.is_dir())
 
     def test_security_guards_path_validation(self):
         with self.assertRaises(ValueError):
@@ -10294,27 +10312,14 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         with self.assertRaises(ValueError):
             main.delete_backup_target(target["id"], actor="admin", db_path=self.db_path)
 
-    def test_discover_stack_backup_targets_and_overview(self):
-        # Create a mock stack dir
-        mock_stacks_dir = Path(self.temp_dir.name) / "stacks"
-        (mock_stacks_dir / "webstack").mkdir(parents=True, exist_ok=True)
-        (mock_stacks_dir / "webstack" / "docker-compose.yml").write_text(
-            "services:\n  web:\n    image: nginx\n", encoding="utf-8"
-        )
-        with patch.object(main.DOCKER_MANAGER, "stacks_dir", str(mock_stacks_dir)):
-            stacks = main.discover_stack_backup_targets(self.db_path)
-            self.assertTrue(isinstance(stacks, list))
-            matching = [s for s in stacks if s.get("stack_name") == "webstack"]
-            self.assertEqual(len(matching), 1)
-            self.assertTrue(matching[0]["exists"])
-
-            overview = main.get_backups_overview(self.db_path)
-            self.assertIn("backup_dir", overview)
-            self.assertIn("total_archives", overview)
-            self.assertIn("total_size_bytes", overview)
-            self.assertIn("stack_targets", overview)
-            self.assertIn("saved_targets", overview)
-            self.assertIn("archives", overview)
+    def test_get_backups_overview(self):
+        overview = main.get_backups_overview(self.db_path)
+        self.assertIn("backup_dir", overview)
+        self.assertIn("total_archives", overview)
+        self.assertIn("total_size_bytes", overview)
+        self.assertIn("saved_targets", overview)
+        self.assertIn("archives", overview)
+        self.assertNotIn("stack_targets", overview)
 
     def test_cron_expression_validation_and_next_timestamp(self):
         self.assertTrue(main.validate_cron_expression("*/5 * * * *"))
@@ -10334,6 +10339,8 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.assertGreater(next_ts, 1700000000.0)
 
     def test_cron_job_crud_and_toggle(self):
+        initial_jobs = main.list_cron_jobs(self.db_path)["jobs"]
+        initial_count = len(initial_jobs)
         job = main.create_or_update_cron_job(
             {
                 "name": "Hourly Directory Backup",
@@ -10386,14 +10393,15 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
 
         # List cron jobs
         listing = main.list_cron_jobs(self.db_path)
-        self.assertEqual(len(listing["jobs"]), 1)
-        self.assertEqual(listing["jobs"][0]["id"], jid)
+        self.assertEqual(len(listing["jobs"]), initial_count + 1)
+        job_ids = [j["id"] for j in listing["jobs"]]
+        self.assertIn(jid, job_ids)
         self.assertGreater(len(listing["supported_task_types"]), 0)
 
         # Delete job
         del_res = main.delete_cron_job(jid, actor="admin", db_path=self.db_path)
         self.assertTrue(del_res["deleted"])
-        self.assertEqual(len(main.list_cron_jobs(self.db_path)["jobs"]), 0)
+        self.assertEqual(len(main.list_cron_jobs(self.db_path)["jobs"]), initial_count)
 
         # Deleting non-existent job raises ValueError
         with self.assertRaises(ValueError):
@@ -10426,7 +10434,8 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
 
         # Check job run history
         listing = main.list_cron_jobs(self.db_path)
-        self.assertEqual(listing["jobs"][0]["last_status"], "success")
+        matching_job = [j for j in listing["jobs"] if j["id"] == jid][0]
+        self.assertEqual(matching_job["last_status"], "success")
         self.assertGreater(len(listing["recent_runs"]), 0)
         self.assertEqual(listing["recent_runs"][0]["trigger_source"], "manual")
 
@@ -10528,6 +10537,37 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         data = resp.json()
         self.assertIn("backup_dir", data)
         self.assertIn("total_archives", data)
+        self.assertNotIn("stack_targets", data)
+
+        # 2b. POST /api/backups/config
+        cfg_custom = Path(self.temp_dir.name) / "configured_archives"
+        conf_resp = asgi_post(
+            api.app,
+            "/api/backups/config",
+            json_body={"backup_dir": str(cfg_custom)},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(conf_resp.status_code, 200)
+        self.assertEqual(conf_resp.json()["status"], "ok")
+        self.assertEqual(conf_resp.json()["backup_dir"], str(cfg_custom.resolve()))
+        self.assertTrue(cfg_custom.is_dir())
+
+        # Restricted or root backup_dir rejected with 400
+        conf_bad = asgi_post(
+            api.app,
+            "/api/backups/config",
+            json_body={"backup_dir": "/proc"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(conf_bad.status_code, 400)
+
+        conf_root = asgi_post(
+            api.app,
+            "/api/backups/config",
+            json_body={"backup_dir": "/"},
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(conf_root.status_code, 400)
 
         # 3. POST /api/backups/run - invalid source directory returns 400
         bad_run = asgi_post(
@@ -10683,6 +10723,13 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn("jobs", resp.json())
         self.assertIn("supported_task_types", resp.json())
+        task_types = [
+            t["type"] if isinstance(t, dict) else t
+            for t in resp.json()["supported_task_types"]
+        ]
+        self.assertNotIn("backup.stack", task_types)
+        self.assertIn("backup.directory", task_types)
+        self.assertIn("notifications.summary", task_types)
 
         # 3. POST /api/cron/jobs - validation errors
         bad_name = asgi_post(
@@ -10791,20 +10838,18 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
             "cron-active-jobs-count",
             "backups-manager-card",
             "backup-create-form",
-            "backup-target-type",
-            "backup-stack-select-group",
-            "backup-stack-select",
             "backup-source-path",
             "backup-target-name",
             "backup-excludes",
             "backup-retain-count",
-            "backup-stop-containers",
             "backup-save-target-btn",
             "backup-run-now-btn",
             "backup-targets-table",
             "backup-targets-tbody",
             "backup-archives-card",
             "backup-dir-badge",
+            "backup-dir-input",
+            "backup-dir-save-btn",
             "backup-archives-table",
             "backup-archives-tbody",
             "cron-scheduler-card",
@@ -10813,14 +10858,10 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
             "cron-task-type",
             "cron-preset-select",
             "cron-expression-input",
-            "cron-config-stack-group",
-            "cron-config-stack-name",
             "cron-config-path-group",
             "cron-config-source-path",
             "cron-config-retain-group",
             "cron-config-retain-count",
-            "cron-config-stop-group",
-            "cron-config-stop-containers",
             "cron-config-prune-group",
             "cron-config-prune-volumes",
             "cron-notify-failure",
@@ -10945,20 +10986,19 @@ sandbox.renderBackups(backupsPayload);
 if (getEl('backups-total-archives').textContent !== '2') throw new Error('Bad total archives: ' + getEl('backups-total-archives').textContent);
 if (getEl('backups-total-size').textContent !== '14.2 MB') throw new Error('Bad total size: ' + getEl('backups-total-size').textContent);
 if (getEl('backups-stacks-count').textContent !== '1') throw new Error('Bad stacks count: ' + getEl('backups-stacks-count').textContent);
-if (!getEl('backup-targets-tbody').innerHTML.includes('plex')) throw new Error('Missing plex in targets tbody');
 if (!getEl('backup-targets-tbody').innerHTML.includes('AppData Directory')) throw new Error('Missing AppData Directory in targets tbody');
 if (!getEl('backup-archives-tbody').innerHTML.includes('plex_20261104_120000.tar.gz')) throw new Error('Missing archive filename in archives tbody');
 if (!getEl('backup-archives-tbody').innerHTML.includes('data-restore-archive')) throw new Error('Missing restore button in archives tbody');
 
 const cronPayload = {
   jobs: [
-    { id: 10, name: 'Nightly Backup', task_type: 'backup.stack', cron_expression: '0 2 * * *', enabled: true, task_config: { stack_name: 'plex' }, last_status: 'success', next_run_at: 1700000000 }
+    { id: 10, name: 'Nightly Backup', task_type: 'backup.directory', cron_expression: '0 2 * * *', enabled: true, task_config: { source_path: '/home/anthony/appdata' }, last_status: 'success', next_run_at: 1700000000 }
   ],
   recent_runs: [
-    { id: 101, job_id: 10, job_name: 'Nightly Backup', task_type: 'backup.stack', trigger_source: 'schedule', status: 'success', started_at: 1700000000, duration_ms: 1200, output: 'Created backup archive plex.tar.gz' }
+    { id: 101, job_id: 10, job_name: 'Nightly Backup', task_type: 'backup.directory', trigger_source: 'schedule', status: 'success', started_at: 1700000000, duration_ms: 1200, output: 'Created backup archive appdata.tar.gz' }
   ],
   supported_task_types: [
-    { type: 'backup.stack', label: 'Docker Stack Backup' }
+    { type: 'backup.directory', label: 'Custom Directory Backup' }
   ]
 };
 
@@ -10966,7 +11006,7 @@ sandbox.renderCronJobs(cronPayload);
 if (!getEl('cron-active-jobs-count').textContent.includes('1 Active')) throw new Error('Bad active cron jobs count: ' + getEl('cron-active-jobs-count').textContent);
 if (!getEl('cron-jobs-tbody').innerHTML.includes('Nightly Backup')) throw new Error('Missing Nightly Backup in jobs tbody');
 if (!getEl('cron-jobs-tbody').innerHTML.includes('0 2 * * *')) throw new Error('Missing cron expression in jobs tbody');
-if (!getEl('cron-runs-tbody').innerHTML.includes('Created backup archive plex.tar.gz')) throw new Error('Missing run output in runs tbody');
+if (!getEl('cron-runs-tbody').innerHTML.includes('Created backup archive appdata.tar.gz')) throw new Error('Missing run output in runs tbody');
 console.log('OK');
 """
         proc = subprocess.run(["node", "-e", node_script], cwd=str(root), capture_output=True, text=True, timeout=10)

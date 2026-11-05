@@ -1,31 +1,27 @@
-# Release v1.0.24: SSH Intrusion Detection, Docker Stack Backups & Unified Cron Scheduler
+# Release v1.0.25: Configurable Backup Storage, Pure Host Directory Backups & Notification Cron Consolidation
 
 ## Overview
-Vigil v1.0.24 delivers a major expansion to host observability and infrastructure resilience, introducing three flagship capabilities: real-time **SSH Intrusion Detection & IP Ban Management** with Fail2ban/UFW correlation, **Docker Stack Folder & Host Directory Backups** with checksummed archive retention and 1-click restores, and a **Unified Vigil Cron Scheduler** for automated recurrent maintenance, backup jobs, and system tasks.
+Vigil v1.0.25 streamlines system data protection and schedule management by introducing a **Configurable Backup Archive Storage Directory**, simplifying the backup architecture to **Pure Host Directory Backups**, and **Consolidating Notification Crons** directly into the unified Cron Scheduler.
 
 ## Highlights & Enhancements
 
-### 1. SSH Intrusion Detection, Active Sessions & IP Ban Manager
-- **Automated SSH Log & Intrusion Scanner**: Scans `/var/log/auth.log` and `journalctl` (`sshd`/`ssh`) for brute-force attacks, invalid usernames, and pre-auth disconnects, grouping top offending IPs, incident counts, targeted usernames, and timestamps (`GET /api/network/ssh-security`).
-- **Fail2ban & UFW Ban Correlation**: Correlates active Fail2ban sshd jails and UFW firewall deny/reject rules into a unified security table with 1-click Ban/Unban actions (`POST /api/network/ssh-security/ban`).
-- **Self-Lockout Safeguards & Audit Logging**: Prevents accidental administrator lockouts by rejecting loopback and active admin IP addresses, and records all ban/unban mutations to the tamper-evident audit log.
-- **Active Sessions & Login History**: Real-time table of active SSH/TTY terminal sessions (`who`/`psutil.users()`) displaying user, TTY, remote IP, PID, and login timestamp, alongside recent login history (`last`).
+### 1. Configurable Backup Archive Storage Directory
+- **Custom Archive Destination**: Users can now configure custom host filesystem storage locations (e.g., dedicated storage pools or external mount paths) for backup tarballs directly from the Backups & Cron settings (`POST /api/backups/config`).
+- **Persistent App Settings**: The configured directory path is persisted in SQLite `app_settings` under `backup_storage_dir` and resolves dynamically at runtime with fallback to `~/.vigil/backups`.
+- **Safety Validation Guards**: Enforces strict path security, rejecting dangerous destinations such as root (`/`), `/etc`, `/usr`, `/proc`, `/sys`, and virtual kernel filesystems.
+- **Modern Dashboard Controls**: Added `#backup-dir-input` and `#backup-dir-save-btn` inline controls with feedback indicators in the Backups & Cron view.
 
-### 2. Docker Stack Folder & Host Directory Backups
-- **Automated Stack & Directory Discovery**: Automatically discovers Docker Compose stack folders (locating `docker-compose.yml` / `compose.yaml`) and custom host directories with fast metadata inspection.
-- **Compressed Archive Creation**: Generates compressed `.tar.gz` snapshots with SHA-256 integrity verification, customizable exclusion patterns (e.g. `.git`, cache directories, temporary files), and automatic retention policies.
-- **Safe Execution & Container Pause Support**: Optional container shutdown or pause during backup creation to ensure transactional data consistency before automatic restart.
-- **One-Click Restore & Repository Management**: Dedicated backup repository browser with direct archive download, deletion, storage usage telemetry, and safe 1-click restore workflows.
+### 2. Streamlined Pure Directory Backups
+- **Focused Host Directory Operations**: Replaced stack-specific container discovery and intrusive container pause/stop logic with clean, high-performance host directory backups (e.g., `~/appdata` or `~/docker/plex`).
+- **Archive Integrity & Pruning**: Full support for `.tar.gz` archive creation, SHA-256 integrity checksumming, customizable exclusion glob patterns, and automated retention pruning.
+- **Cron Task Harmonization**: Replaced `backup.stack` cron task types with `backup.directory` across the job creation UI, schema, and scheduler engine.
 
-### 3. Unified Vigil Cron Scheduler
-- **Integrated Scheduling Engine**: Full-featured cron daemon running directly within the Vigil runtime supporting standard 5-part cron syntax expressions with human-readable interval evaluations and next-run calculations.
-- **Built-in Task Types**: First-class support for automated backups (`backup`), Docker container/image cleanup (`docker_prune`), Debian package cache refreshes (`apt_update`), and arbitrary shell command executions.
-- **Interactive Control & Run History**: Instant job enable/disable toggling (`POST /api/cron/jobs/{id}/toggle`), manual on-demand execution (`POST /api/cron/jobs/{id}/run`), and persistent execution history logging with exit codes, durations, and stdout/stderr output capture.
-- **Automated Alerting Integrations**: Optional notification triggers upon job failure or success dispatched via Vigil's Notification Center.
+### 3. Consolidated Notification Crons in Backups & Cron
+- **Unified Scheduling Architecture**: Centralized all periodic report schedules (`notifications.summary`) inside the Backups & Cron scheduler engine, eliminating duplicate schedule implementations.
+- **Direct Navigation Workflows**: Notification Center schedule management buttons now link directly to the Backups & Cron scheduler view, providing seamless cross-tab coordination.
 
 ## Reliability & Fixes
 
-### Quality, Security & Contract Verification
-- **Cross-Tier Contract Integrity**: Validated all 56 frontend API route contracts and 595 DOM element bindings across the dashboard with zero broken selectors or route mismatches.
-- **Comprehensive Automated Test Suite**: Expanded unit, integration, and UI execution tests in `test_main.py` with 221 passing tests (`221/221` passed, 0 failures), covering backup creation, exclusion filters, retention pruning, cron expression parsing, and SSH security actions.
-- **Strict Path Traversal Protection**: Implemented strict filesystem path resolution and safety validations preventing directory traversal or unauthorized directory access across backup creation and restoration endpoints.
+### Quality & Contract Verification
+- **Cross-Tier Contract Integrity**: Verified 57 frontend API route contracts and 589 DOM element bindings across the dashboard with 0 mismatches or broken selectors.
+- **Comprehensive Automated Test Suite**: 221 out of 221 tests passed cleanly (`221 passed, 0 failures`) in pytest, verifying backup configuration endpoints, directory path safety validation, cron scheduler execution, and frontend DOM bindings.
