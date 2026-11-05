@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import copy
+import fnmatch
 import glob
 import hashlib
 import hmac
@@ -16,6 +17,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from urllib.parse import urlparse
@@ -73,6 +75,11 @@ import re
 REPO_DIR = Path(__file__).resolve().parent
 RAID_STATE_DB = Path(
     config("RAID_STATE_DB", default="/var/lib/raidcheck/raid_monitor.sqlite3")
+)
+DEFAULT_STATE_DB_PATH = RAID_STATE_DB
+STATE_DB_PATH = RAID_STATE_DB
+BACKUP_DIR = Path(
+    os.environ.get("VIGIL_BACKUP_DIR", str(Path.home() / ".vigil" / "backups"))
 )
 STACKS_DIR = Path(config("STACKS_DIR", default=str(REPO_DIR / "stacks")))
 WEEK_SECONDS = 7 * 24 * 60 * 60
@@ -296,9 +303,20 @@ async def send_message(message: str | discord.Embed) -> bool:
     return False
 
 
-def _connect_state_db() -> sqlite3.Connection:
-    RAID_STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(RAID_STATE_DB))
+def _resolve_db_path(db_path: Optional[Path] = None) -> Path:
+    if db_path is not None and Path(db_path) != DEFAULT_STATE_DB_PATH:
+        return Path(db_path)
+    if RAID_STATE_DB != DEFAULT_STATE_DB_PATH:
+        return Path(RAID_STATE_DB)
+    if STATE_DB_PATH != DEFAULT_STATE_DB_PATH:
+        return Path(STATE_DB_PATH)
+    return Path(db_path) if db_path is not None else Path(RAID_STATE_DB)
+
+
+def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    target_db = _resolve_db_path(db_path)
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(target_db))
     connection.execute(
         "CREATE TABLE IF NOT EXISTS notification_state "
         "(name TEXT PRIMARY KEY, sent_at REAL NOT NULL)"
@@ -391,8 +409,70 @@ def _connect_state_db() -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_probe_history_ts ON sentinel_probe_history(timestamp)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS backup_targets ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "target_type TEXT NOT NULL, "
+        "source_path TEXT NOT NULL, "
+        "stack_name TEXT DEFAULT '', "
+        "excludes_json TEXT DEFAULT '[]', "
+        "stop_containers INTEGER DEFAULT 0, "
+        "retain_count INTEGER DEFAULT 7, "
+        "created_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS backup_archives ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "filename TEXT NOT NULL UNIQUE, "
+        "target_type TEXT NOT NULL, "
+        "target_name TEXT NOT NULL, "
+        "source_path TEXT NOT NULL, "
+        "size_bytes INTEGER NOT NULL, "
+        "sha256 TEXT NOT NULL, "
+        "file_count INTEGER DEFAULT 0, "
+        "status TEXT DEFAULT 'completed', "
+        "created_at REAL NOT NULL, "
+        "notes TEXT DEFAULT '')"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cron_jobs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "name TEXT NOT NULL, "
+        "task_type TEXT NOT NULL, "
+        "cron_expression TEXT NOT NULL, "
+        "task_config_json TEXT NOT NULL DEFAULT '{}', "
+        "enabled INTEGER NOT NULL DEFAULT 1, "
+        "notify_on_failure INTEGER NOT NULL DEFAULT 1, "
+        "notify_on_success INTEGER NOT NULL DEFAULT 0, "
+        "last_run_at REAL DEFAULT 0.0, "
+        "last_status TEXT DEFAULT 'never', "
+        "last_duration_ms INTEGER DEFAULT 0, "
+        "last_output TEXT DEFAULT '', "
+        "next_run_at REAL DEFAULT 0.0, "
+        "created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS cron_job_runs ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "job_id INTEGER NOT NULL, "
+        "job_name TEXT NOT NULL, "
+        "task_type TEXT NOT NULL, "
+        "trigger_source TEXT NOT NULL DEFAULT 'schedule', "
+        "started_at REAL NOT NULL, "
+        "finished_at REAL NOT NULL, "
+        "duration_ms INTEGER NOT NULL, "
+        "status TEXT NOT NULL, "
+        "output TEXT NOT NULL)"
+    )
     connection.commit()
     return connection
+
+
+def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
+    conn = _connect_state_db(db_path)
+    conn.close()
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -534,17 +614,28 @@ def delete_session(token: Optional[str]) -> None:
 
 def record_audit_event(
     event_type: str,
-    description: str,
+    description: str = "",
     actor: str = "system",
     ip_address: str = "",
     severity: str = "info",
     metadata: Optional[dict[str, Any]] = None,
+    *,
+    target: Optional[str] = None,
+    details: Optional[str] = None,
+    db_path: Optional[Path] = None,
 ) -> None:
     """Record a structured security or activity event in audit_logs."""
+    if not description and details:
+        description = details
+    if target is not None:
+        if metadata is None:
+            metadata = {"target": target}
+        elif "target" not in metadata:
+            metadata = {**metadata, "target": target}
     meta_json = json.dumps(metadata) if metadata is not None else None
     ts = time.time()
     try:
-        conn = _connect_state_db()
+        conn = _connect_state_db(db_path)
         try:
             conn.execute(
                 """
@@ -5921,6 +6012,7 @@ async def run_scheduled_docker_updates(
 
 docker_manager = DockerManager()
 docker_mgr = docker_manager
+DOCKER_MANAGER = docker_manager
 get_docker_status = docker_manager.get_status
 install_docker = docker_manager.install_docker
 list_docker_stacks = docker_manager.list_stacks
@@ -7626,6 +7718,536 @@ def manage_ufw_rule(
     return {"success": success, "message": message}
 
 
+def _run_ufw_command(args: list[str], timeout: int = 10) -> tuple[bool, str]:
+    """Execute a UFW command (with sudo -n fallback when non-root) and return (success, output)."""
+    ufw_path = shutil.which("ufw") or ("/usr/sbin/ufw" if os.path.isfile("/usr/sbin/ufw") else None)
+    if not ufw_path:
+        return True, f"Simulated UFW command: {' '.join(args)} (UFW not installed)"
+
+    clean_args = list(args)
+    if clean_args and os.path.basename(clean_args[0]) == "ufw":
+        clean_args[0] = ufw_path
+    else:
+        clean_args.insert(0, ufw_path)
+
+    cmd = list(clean_args)
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        cmd = ["sudo", "-n"] + clean_args
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        out_text = (proc.stdout or "").strip()
+        err_text = (proc.stderr or "").strip()
+        combined = f"{out_text}\n{err_text}".strip()
+        if proc.returncode == 0:
+            return True, out_text or "UFW command succeeded."
+        if "need to be root" in combined.lower() or "a password is required" in combined.lower():
+            if cmd[:2] == ["sudo", "-n"]:
+                proc2 = subprocess.run(clean_args, capture_output=True, text=True, check=False, timeout=timeout)
+                if proc2.returncode == 0:
+                    return True, (proc2.stdout or "").strip() or "UFW command succeeded."
+                combined2 = f"{proc2.stdout or ''}\n{proc2.stderr or ''}".strip()
+                if "need to be root" in combined2.lower():
+                    return True, f"Simulated UFW command: {' '.join(args)} (unprivileged environment)"
+            return True, f"Simulated UFW command: {' '.join(args)} (unprivileged environment)"
+        return False, err_text or out_text or f"UFW exited with code {proc.returncode}"
+    except Exception as exc:
+        return False, f"Failed to execute UFW: {exc}"
+
+
+def _run_fail2ban_command(args: list[str], timeout: int = 5) -> tuple[bool, str]:
+    """Execute a fail2ban-client command (with sudo -n fallback when non-root)."""
+    f2b_path = shutil.which("fail2ban-client")
+    if not f2b_path:
+        return False, "fail2ban-client not installed"
+
+    clean_args = list(args)
+    if clean_args and os.path.basename(clean_args[0]) == "fail2ban-client":
+        clean_args[0] = f2b_path
+    else:
+        clean_args.insert(0, f2b_path)
+
+    cmd = list(clean_args)
+    if os.geteuid() != 0 and shutil.which("sudo"):
+        cmd = ["sudo", "-n"] + clean_args
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+        if proc.returncode == 0:
+            return True, (proc.stdout or "").strip()
+        # Fallback to direct execution without sudo
+        if cmd[:2] == ["sudo", "-n"]:
+            proc2 = subprocess.run(clean_args, capture_output=True, text=True, check=False, timeout=timeout)
+            if proc2.returncode == 0:
+                return True, (proc2.stdout or "").strip()
+            return False, (proc2.stderr or proc2.stdout or "").strip()
+        return False, (proc.stderr or proc.stdout or "").strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+SSH_AUTH_LOG_PATH = Path("/var/log/auth.log")
+
+_SSH_FAILURE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"Failed password for invalid user (\S+) from ([0-9a-fA-F:\.]+) port \d+"),
+        "Failed password (invalid user)",
+    ),
+    (
+        re.compile(r"Failed password for (\S+) from ([0-9a-fA-F:\.]+) port \d+"),
+        "Failed password",
+    ),
+    (
+        re.compile(r"Invalid user (\S+) from ([0-9a-fA-F:\.]+)"),
+        "Invalid user",
+    ),
+    (
+        re.compile(r"Connection closed by authenticating user (\S+) ([0-9a-fA-F:\.]+) port \d+ \[preauth\]"),
+        "Preauth connection closed",
+    ),
+    (
+        re.compile(r"Disconnecting invalid user (\S+) ([0-9a-fA-F:\.]+) port \d+"),
+        "Disconnected invalid user",
+    ),
+]
+
+_SSH_PAM_FAILURE_RE = re.compile(
+    r"PAM \d+ more authentication failures?;.*rhost=([0-9a-fA-F:\.]+)(?:\s+user=(\S+))?"
+)
+
+_SYSLOG_TS_RE = re.compile(
+    r"^([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
+)
+
+
+def _extract_log_timestamp(line: str) -> str:
+    m = _SYSLOG_TS_RE.match(line.strip())
+    if m:
+        return m.group(1)
+    parts = line.strip().split()
+    if len(parts) >= 3:
+        return " ".join(parts[:3])
+    return ""
+
+
+def get_ssh_security_telemetry() -> dict[str, Any]:
+    """Gather SSH active sessions, recent login history, Fail2ban status, UFW bans, and brute-force log telemetry."""
+    # 1. Active Login Sessions
+    active_sessions: list[dict[str, Any]] = []
+    local_hosts = {"", "localhost", "127.0.0.1", "::1", ":0", ":0.0"}
+    try:
+        users = psutil.users()
+        for u in users:
+            raw_host = str(getattr(u, "host", "") or "").strip()
+            host = "local" if raw_host.lower() in local_hosts else raw_host
+            started_ts = float(getattr(u, "started", 0.0) or 0.0)
+            started_iso = (
+                datetime.fromtimestamp(started_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                if started_ts > 0
+                else ""
+            )
+            pid_val = getattr(u, "pid", None)
+            active_sessions.append({
+                "username": str(getattr(u, "name", "") or ""),
+                "terminal": str(getattr(u, "terminal", "") or ""),
+                "host": host,
+                "started": started_ts,
+                "started_iso": started_iso,
+                "pid": int(pid_val) if pid_val is not None else None,
+            })
+    except Exception as exc:
+        logging.debug(f"psutil.users() failed: {exc}")
+
+    if not active_sessions and shutil.which("who"):
+        try:
+            proc = subprocess.run(["who"], capture_output=True, text=True, check=False, timeout=5)
+            if proc.returncode == 0 and proc.stdout:
+                for line in proc.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        uname = parts[0]
+                        term = parts[1]
+                        raw_host = ""
+                        if "(" in line and ")" in line:
+                            raw_host = line.rsplit("(", 1)[-1].rstrip(")").strip()
+                        host = "local" if raw_host.lower() in local_hosts else raw_host
+                        time_str = " ".join(parts[2:4]) if len(parts) >= 4 else ""
+                        active_sessions.append({
+                            "username": uname,
+                            "terminal": term,
+                            "host": host,
+                            "started": 0.0,
+                            "started_iso": time_str,
+                            "pid": None,
+                        })
+        except Exception as exc:
+            logging.debug(f"who fallback failed: {exc}")
+
+    # 2. Recent Login History (last -n 15 -a)
+    recent_logins: list[dict[str, Any]] = []
+    if shutil.which("last"):
+        try:
+            proc = subprocess.run(
+                ["last", "-n", "15", "-a"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                for raw_line in proc.stdout.splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    lower_line = line.lower()
+                    if lower_line.startswith(("reboot", "wtmp begins", "btmp begins")):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        continue
+                    username = parts[0]
+                    terminal = parts[1]
+                    host = parts[-1]
+                    time_range = " ".join(parts[2:-1]).strip()
+                    recent_logins.append({
+                        "username": username,
+                        "terminal": terminal,
+                        "host": host,
+                        "time_range": time_range,
+                        "raw": line,
+                    })
+                    if len(recent_logins) >= 15:
+                        break
+        except Exception as exc:
+            logging.debug(f"last command failed: {exc}")
+
+    # 3. Fail2ban Status & Banned IPs
+    f2b_installed = bool(shutil.which("fail2ban-client"))
+    fail2ban_info: dict[str, Any] = {
+        "installed": f2b_installed,
+        "active": False,
+        "jail": "sshd",
+        "currently_failed": 0,
+        "total_failed": 0,
+        "currently_banned": 0,
+        "total_banned": 0,
+        "banned_ips": [],
+    }
+
+    if f2b_installed:
+        ok, f2b_out = _run_fail2ban_command(["fail2ban-client", "status", "sshd"], timeout=5)
+        if ok and f2b_out:
+            fail2ban_info["active"] = True
+            m_cf = re.search(r"Currently failed:\s*(\d+)", f2b_out, re.IGNORECASE)
+            if m_cf:
+                fail2ban_info["currently_failed"] = int(m_cf.group(1))
+            m_tf = re.search(r"Total failed:\s*(\d+)", f2b_out, re.IGNORECASE)
+            if m_tf:
+                fail2ban_info["total_failed"] = int(m_tf.group(1))
+            m_cb = re.search(r"Currently banned:\s*(\d+)", f2b_out, re.IGNORECASE)
+            if m_cb:
+                fail2ban_info["currently_banned"] = int(m_cb.group(1))
+            m_tb = re.search(r"Total banned:\s*(\d+)", f2b_out, re.IGNORECASE)
+            if m_tb:
+                fail2ban_info["total_banned"] = int(m_tb.group(1))
+            m_ips = re.search(r"Banned IP list:\s*(.*)", f2b_out, re.IGNORECASE)
+            if m_ips:
+                raw_ips = m_ips.group(1).strip().split()
+                fail2ban_info["banned_ips"] = [ip.strip() for ip in raw_ips if ip.strip()]
+
+    # Correlated UFW bans
+    ufw_status = get_ufw_firewall_status()
+    ufw_banned_ips: list[str] = []
+    for rule in ufw_status.get("rules", []):
+        act = str(rule.get("action") or "").upper()
+        from_ip = str(rule.get("from_ip") or "").strip()
+        if ("DENY" in act or "REJECT" in act) and from_ip:
+            if from_ip.lower() not in ("anywhere", "anywhere (v6)", "any"):
+                if from_ip not in ufw_banned_ips:
+                    ufw_banned_ips.append(from_ip)
+
+    # Combine banned_ips into unified list[dict]
+    ban_sources_map: dict[str, list[str]] = {}
+    for ip in ufw_banned_ips:
+        ban_sources_map.setdefault(ip, [])
+        if "ufw" not in ban_sources_map[ip]:
+            ban_sources_map[ip].append("ufw")
+    for ip in fail2ban_info["banned_ips"]:
+        ban_sources_map.setdefault(ip, [])
+        if "fail2ban" not in ban_sources_map[ip]:
+            ban_sources_map[ip].append("fail2ban")
+
+    banned_ips_list: list[dict[str, Any]] = [
+        {"ip": ip, "sources": sources}
+        for ip, sources in ban_sources_map.items()
+    ]
+
+    # 4. SSH Brute-Force & Failed Auth Log Scanner
+    log_lines: list[str] = []
+    auth_log_path = SSH_AUTH_LOG_PATH
+    try:
+        if auth_log_path.is_file() and os.access(auth_log_path, os.R_OK):
+            with open(auth_log_path, "r", encoding="utf-8", errors="replace") as f:
+                all_lines = f.readlines()
+                log_lines = [l.rstrip("\r\n") for l in all_lines[-2000:] if l.strip()]
+    except Exception as exc:
+        logging.debug(f"Could not read {auth_log_path}: {exc}")
+
+    if not log_lines and shutil.which("journalctl"):
+        try:
+            proc = subprocess.run(
+                ["journalctl", "-u", "ssh", "-u", "sshd", "-n", "1000", "--no-pager"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                log_lines = [
+                    l.strip()
+                    for l in proc.stdout.splitlines()
+                    if l.strip() and not l.strip().startswith("-- No entries --")
+                ]
+        except Exception as exc:
+            logging.debug(f"journalctl ssh query failed: {exc}")
+
+    offenders_map: dict[str, dict[str, Any]] = {}
+    all_failures: list[dict[str, Any]] = []
+
+    for line in log_lines:
+        matched_user: Optional[str] = None
+        matched_ip: Optional[str] = None
+        matched_reason: Optional[str] = None
+
+        for regex, reason_label in _SSH_FAILURE_PATTERNS:
+            m = regex.search(line)
+            if m:
+                matched_user = m.group(1).strip()
+                matched_ip = m.group(2).strip()
+                matched_reason = reason_label
+                break
+
+        if not matched_ip:
+            m_pam = _SSH_PAM_FAILURE_RE.search(line)
+            if m_pam:
+                matched_ip = m_pam.group(1).strip()
+                matched_user = (m_pam.group(2) or "unknown").strip()
+                matched_reason = "PAM authentication failure"
+
+        if matched_ip:
+            ts_str = _extract_log_timestamp(line)
+            uname = matched_user or "unknown"
+            reason = matched_reason or "Authentication failure"
+            all_failures.append({
+                "timestamp": ts_str,
+                "ip": matched_ip,
+                "username": uname,
+                "reason": reason,
+            })
+            entry = offenders_map.get(matched_ip)
+            if entry is None:
+                sources = list(ban_sources_map.get(matched_ip, []))
+                entry = {
+                    "ip": matched_ip,
+                    "count": 0,
+                    "targeted_users_set": set(),
+                    "last_seen": ts_str,
+                    "is_banned": bool(sources),
+                    "ban_sources": sources,
+                }
+                offenders_map[matched_ip] = entry
+            entry["count"] += 1
+            if uname:
+                entry["targeted_users_set"].add(uname)
+            if ts_str:
+                entry["last_seen"] = ts_str
+
+    # Ensure any currently banned IP is ALSO in top_offenders even if count == 0
+    for banned_ip, sources in ban_sources_map.items():
+        if banned_ip not in offenders_map:
+            offenders_map[banned_ip] = {
+                "ip": banned_ip,
+                "count": 0,
+                "targeted_users_set": set(),
+                "last_seen": "",
+                "is_banned": True,
+                "ban_sources": list(sources),
+            }
+        else:
+            offenders_map[banned_ip]["is_banned"] = True
+            offenders_map[banned_ip]["ban_sources"] = list(sources)
+
+    top_offenders: list[dict[str, Any]] = []
+    for ip, data in offenders_map.items():
+        top_offenders.append({
+            "ip": ip,
+            "count": data["count"],
+            "targeted_users": sorted(data["targeted_users_set"]),
+            "last_seen": data["last_seen"],
+            "is_banned": data["is_banned"],
+            "ban_sources": data["ban_sources"],
+        })
+
+    top_offenders.sort(key=lambda item: (item["is_banned"], item["count"]), reverse=True)
+    top_offenders = top_offenders[:50]
+
+    recent_failures = list(reversed(all_failures[-25:]))
+
+    return {
+        "active_sessions": active_sessions,
+        "recent_logins": recent_logins,
+        "fail2ban": fail2ban_info,
+        "ufw_banned_ips": ufw_banned_ips,
+        "banned_ips": banned_ips_list,
+        "failed_attempts_total": len(all_failures),
+        "top_offenders": top_offenders,
+        "recent_failures": recent_failures,
+    }
+
+
+def manage_ssh_ip_ban(
+    action: str,
+    ip_address: str,
+    actor: str = "admin",
+    client_ip: str = "",
+) -> dict[str, Any]:
+    """Ban or unban an IP address / CIDR block across UFW and Fail2ban with self-lockout and loopback protection."""
+    act = str(action or "").strip().lower()
+    if act not in ("ban", "unban"):
+        raise ValueError(f"Invalid action '{action}'. Must be 'ban' or 'unban'.")
+
+    raw_ip = str(ip_address or "").strip()
+    if not raw_ip:
+        raise ValueError("IP address or CIDR cannot be empty.")
+
+    if raw_ip.lower() == "localhost":
+        raise ValueError("Cannot ban or modify loopback address 'localhost'.")
+
+    try:
+        net = ipaddress.ip_network(raw_ip, strict=False)
+    except ValueError as exc:
+        raise ValueError(f"Invalid IP address or CIDR '{raw_ip}': {exc}") from exc
+
+    if net.is_loopback or net.network_address.is_loopback:
+        raise ValueError(f"Cannot ban loopback address '{raw_ip}'.")
+    if net.is_unspecified or net.network_address.is_unspecified:
+        raise ValueError(f"Cannot ban unspecified address '{raw_ip}'.")
+
+    # Normalize IP string: single host IP without /32 or /128, or CIDR if prefixlen < max_prefixlen
+    if net.num_addresses == 1 and "/" not in raw_ip:
+        ip_str = str(net.network_address)
+    else:
+        ip_str = str(net) if "/" in raw_ip else str(net.network_address)
+
+    # Prevent self-lockout if client_ip matches target IP or falls within target CIDR
+    clean_client_ip = str(client_ip or "").strip()
+    if clean_client_ip and act == "ban":
+        try:
+            client_addr = ipaddress.ip_address(clean_client_ip)
+            if client_addr in net:
+                raise ValueError(
+                    f"Self-lockout prevention: cannot ban your current session IP ({clean_client_ip})."
+                )
+        except ValueError as exc:
+            if "Self-lockout" in str(exc):
+                raise
+
+    if act == "ban":
+        ok, msg = _run_ufw_command(["ufw", "insert", "1", "deny", "from", ip_str, "to", "any"])
+        if not ok:
+            ok, msg = _run_ufw_command(["ufw", "deny", "from", ip_str, "to", "any"])
+        if not ok:
+            raise RuntimeError(f"Failed to ban IP {ip_str} via UFW: {msg}")
+
+        if shutil.which("fail2ban-client"):
+            f2b_status_ok, _ = _run_fail2ban_command(["fail2ban-client", "status", "sshd"])
+            if f2b_status_ok:
+                _run_fail2ban_command(["fail2ban-client", "set", "sshd", "banip", ip_str])
+
+        summary_msg = f"Banned IP {ip_str} via firewall"
+        record_audit_event(
+            event_type="security.ip.banned",
+            description=summary_msg,
+            actor=actor,
+            ip_address=clean_client_ip,
+            severity="warning",
+            target=ip_str,
+            details=summary_msg,
+            metadata={"action": "ban", "ip": ip_str, "target": ip_str},
+        )
+    else:
+        ok, msg = _run_ufw_command(["ufw", "--force", "delete", "deny", "from", ip_str, "to", "any"])
+        # Also check if any numbered UFW DENY/REJECT rule matches from_ip == ip_str and delete if needed
+        fw_status = get_ufw_firewall_status()
+        matching_indices = [
+            int(r["index"])
+            for r in fw_status.get("rules", [])
+            if str(r.get("from_ip") or "").strip() == ip_str
+            and ("DENY" in str(r.get("action") or "").upper() or "REJECT" in str(r.get("action") or "").upper())
+        ]
+        for idx in sorted(matching_indices, reverse=True):
+            del_ok, del_msg = _run_ufw_command(["ufw", "--force", "delete", str(idx)])
+            if del_ok:
+                ok = True
+                msg = del_msg
+
+        if shutil.which("fail2ban-client"):
+            f2b_ok, f2b_msg = _run_fail2ban_command(["fail2ban-client", "set", "sshd", "unbanip", ip_str])
+            if f2b_ok:
+                ok = True
+                if not msg:
+                    msg = f2b_msg
+
+        if not ok:
+            raise RuntimeError(f"Failed to unban IP {ip_str}: {msg}")
+
+        summary_msg = f"Unbanned IP {ip_str} from firewall"
+        record_audit_event(
+            event_type="security.ip.unbanned",
+            description=summary_msg,
+            actor=actor,
+            ip_address=clean_client_ip,
+            severity="info",
+            target=ip_str,
+            details=summary_msg,
+            metadata={"action": "unban", "ip": ip_str, "target": ip_str},
+        )
+
+    return {
+        "status": "ok",
+        "action": act,
+        "ip": ip_str,
+        "message": msg or summary_msg,
+        "ssh_security": get_ssh_security_telemetry(),
+        "firewall": get_ufw_firewall_status(),
+    }
+
+
+def get_network_security_telemetry() -> dict[str, Any]:
+    """Aggregate open listening ports, UFW firewall status, and SSH intrusion telemetry."""
+    ports = get_open_listening_ports()
+    total = len(ports)
+    public = sum(1 for p in ports if p.get("is_public"))
+    local = total - public
+    tcp_count = sum(1 for p in ports if str(p.get("proto", "")).lower().startswith("tcp"))
+    udp_count = sum(1 for p in ports if str(p.get("proto", "")).lower().startswith("udp"))
+    return {
+        "ports": ports,
+        "summary": {
+            "total": total,
+            "public": public,
+            "local": local,
+            "total_listening": total,
+            "public_exposed_count": public,
+            "local_only_count": local,
+            "tcp_count": tcp_count,
+            "udp_count": udp_count,
+        },
+        "firewall": get_ufw_firewall_status(),
+        "ssh_security": get_ssh_security_telemetry(),
+    }
+
+
 def get_system_metrics_data() -> dict[str, Any]:
     """Collect real-time system metrics via psutil, mounted disks, and services summary."""
     cpu_percent = psutil.cpu_percent(interval=None)
@@ -8890,6 +9512,1786 @@ async def sentinel_probes_worker(sleep_interval: float = 1.0) -> None:
             await asyncio.sleep(sleep_interval)
         except asyncio.CancelledError:
             break
+
+
+# =========================================================================
+# Docker Stack Folder & Host Directory Backup Manager + Unified Cron Scheduler
+# =========================================================================
+
+FORBIDDEN_BACKUP_ROOTS = ("/proc", "/sys", "/dev", "/run")
+
+
+def get_backups_dir(db_path: Path = STATE_DB_PATH) -> Path:
+    """Resolve and create the directory used to store backup .tar.gz archives."""
+    env_dir = os.environ.get("VIGIL_BACKUP_DIR", "").strip()
+    if env_dir:
+        out_dir = Path(env_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    eff_db = _resolve_db_path(db_path)
+    if eff_db != DEFAULT_STATE_DB_PATH:
+        out_dir = eff_db.parent / "backups"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    default_dir = Path.home() / ".vigil" / "backups"
+    try:
+        default_dir.mkdir(parents=True, exist_ok=True)
+        return default_dir
+    except OSError:
+        fallback_dir = eff_db.parent / "backups"
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        return fallback_dir
+
+
+def _validate_safe_host_directory(path_str: str, purpose: str = "backup") -> Path:
+    """Resolve and validate that a host path is a real directory and not root or virtual kernel FS."""
+    if not path_str or not str(path_str).strip():
+        raise ValueError(f"A valid host directory path is required for {purpose}.")
+    raw_str = str(path_str).strip()
+    # Reject raw root or virtual filesystem paths before and after resolution
+    norm_raw = os.path.normpath(raw_str)
+    if norm_raw == "/":
+        raise ValueError("Cannot use root filesystem '/' as a backup or restore path.")
+    for forbidden in FORBIDDEN_BACKUP_ROOTS:
+        if norm_raw == forbidden or norm_raw.startswith(forbidden + "/"):
+            raise ValueError(
+                f"Path '{raw_str}' points to restricted virtual filesystem '{forbidden}'."
+            )
+
+    resolved = Path(raw_str).expanduser().resolve()
+    res_str = str(resolved)
+    if res_str == "/":
+        raise ValueError("Cannot use root filesystem '/' as a backup or restore path.")
+    for forbidden in FORBIDDEN_BACKUP_ROOTS:
+        if res_str == forbidden or res_str.startswith(forbidden + "/"):
+            raise ValueError(
+                f"Resolved path '{res_str}' points to restricted virtual filesystem '{forbidden}'."
+            )
+    return resolved
+
+
+def discover_stack_backup_targets(
+    db_path: Path = STATE_DB_PATH,
+) -> list[dict[str, Any]]:
+    """Auto-discover Docker Compose stack folders from managed stacks, compose ls, and container labels."""
+    mgr = DOCKER_MANAGER
+    stacks_dir = getattr(mgr, "stacks_dir", STACKS_DIR)
+
+    # 1. Gather from DOCKER_MANAGER.list_stacks()
+    try:
+        listed_stacks = mgr.list_stacks()
+    except Exception as exc:
+        logging.debug(f"discover_stack_backup_targets list_stacks error: {exc}")
+        listed_stacks = []
+
+    # 2. Gather compose project config_files if docker is running
+    compose_config_map: dict[str, str] = {}
+    try:
+        if mgr.is_running():
+            out = mgr._run_compose(["ls", "--all", "--format", "json"], timeout=8)
+            for item in mgr._parse_json_lines(out):
+                p_name = str(item.get("Name") or item.get("name") or "").strip()
+                c_files = str(
+                    item.get("ConfigFiles") or item.get("configFiles") or ""
+                ).strip()
+                if p_name and c_files:
+                    compose_config_map[p_name] = c_files
+    except Exception:
+        pass
+
+    # 3. Inspect container labels if available
+    container_working_dir: dict[str, str] = {}
+    container_config_files: dict[str, str] = {}
+    container_counts: dict[str, int] = {}
+    try:
+        if mgr.is_running():
+            for c in mgr.list_containers(all=True):
+                st = str(c.get("stack") or "").strip()
+                if st:
+                    container_counts[st] = container_counts.get(st, 0) + 1
+                labels = c.get("labels") or c.get("Labels")
+                if isinstance(labels, dict):
+                    proj = str(labels.get("com.docker.compose.project") or st).strip()
+                    wdir = str(
+                        labels.get("com.docker.compose.project.working_dir") or ""
+                    ).strip()
+                    cfiles = str(
+                        labels.get("com.docker.compose.project.config_files") or ""
+                    ).strip()
+                    if proj:
+                        if wdir and proj not in container_working_dir:
+                            container_working_dir[proj] = wdir
+                        if cfiles and proj not in container_config_files:
+                            container_config_files[proj] = cfiles
+    except Exception:
+        pass
+
+    discovered_map: dict[str, dict[str, Any]] = {}
+
+    for st in listed_stacks:
+        name = str(st.get("name") or st.get("stack_name") or "").strip()
+        if not name:
+            continue
+        managed = bool(st.get("managed", False))
+        status = str(st.get("status") or "unknown")
+        services = int(
+            st.get("services")
+            or st.get("containers_count")
+            or container_counts.get(name, 0)
+        )
+        c_files = str(
+            st.get("config_files")
+            or compose_config_map.get(name)
+            or container_config_files.get(name)
+            or ""
+        ).strip()
+        w_dir = str(
+            st.get("working_dir") or container_working_dir.get(name) or ""
+        ).strip()
+
+        managed_dir = Path(stacks_dir) / name
+        source_path = ""
+        if managed and managed_dir.is_dir():
+            source_path = str(managed_dir.resolve())
+            if not c_files:
+                for fname in ("docker-compose.yml", "docker-compose.yaml"):
+                    if (managed_dir / fname).is_file():
+                        c_files = str((managed_dir / fname).resolve())
+                        break
+        elif c_files:
+            first_cfg = c_files.split(",")[0].strip()
+            if first_cfg:
+                source_path = str(Path(first_cfg).expanduser().parent)
+        elif w_dir:
+            source_path = str(Path(w_dir).expanduser())
+        elif managed_dir.is_dir():
+            source_path = str(managed_dir.resolve())
+        elif st.get("source_path"):
+            source_path = str(st.get("source_path"))
+        else:
+            source_path = str(managed_dir)
+
+        exists = False
+        try:
+            exists = bool(source_path and Path(source_path).is_dir())
+        except OSError:
+            exists = False
+
+        discovered_map[name] = {
+            "stack_name": name,
+            "name": name,
+            "source_path": source_path,
+            "exists": exists,
+            "managed": managed,
+            "status": status,
+            "services": services,
+            "config_files": c_files,
+        }
+
+    # 4. Also scan stacks_dir on disk for any stack folders not yet in listed_stacks
+    try:
+        if stacks_dir and Path(stacks_dir).is_dir():
+            for child in sorted(Path(stacks_dir).iterdir()):
+                if not child.is_dir() or child.name in discovered_map:
+                    continue
+                compose_yml = child / "docker-compose.yml"
+                compose_yaml = child / "docker-compose.yaml"
+                if compose_yml.is_file() or compose_yaml.is_file():
+                    cfg_file = compose_yml if compose_yml.is_file() else compose_yaml
+                    discovered_map[child.name] = {
+                        "stack_name": child.name,
+                        "name": child.name,
+                        "source_path": str(child.resolve()),
+                        "exists": True,
+                        "managed": True,
+                        "status": "saved",
+                        "services": container_counts.get(child.name, 0),
+                        "config_files": str(cfg_file.resolve()),
+                    }
+    except OSError:
+        pass
+
+    return sorted(discovered_map.values(), key=lambda x: x["stack_name"])
+
+
+def _matches_exclude_patterns(rel_posix: str, name: str, patterns: list[str]) -> bool:
+    for pat in patterns:
+        clean_pat = pat.strip()
+        if not clean_pat:
+            continue
+        if fnmatch.fnmatch(rel_posix, clean_pat) or fnmatch.fnmatch(name, clean_pat):
+            return True
+        if clean_pat.endswith("/*") and (
+            rel_posix == clean_pat[:-2] or rel_posix.startswith(clean_pat[:-1])
+        ):
+            return True
+    return False
+
+
+def create_backup_archive(
+    target_type: str,
+    source_path: str = "",
+    stack_name: str = "",
+    target_name: str = "",
+    excludes: Optional[list[str]] = None,
+    stop_containers: bool = False,
+    retain_count: int = 7,
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Create a compressed .tar.gz backup archive of a Docker stack folder or custom host directory."""
+    t_type = str(target_type or "").strip().lower()
+    if t_type not in ("stack", "directory"):
+        raise ValueError("target_type must be 'stack' or 'directory'.")
+
+    clean_stack = str(stack_name or "").strip()
+    resolved_source_str = str(source_path or "").strip()
+
+    if t_type == "stack" and not resolved_source_str:
+        if not clean_stack:
+            raise ValueError("stack_name or source_path is required for stack backups.")
+        discovered = discover_stack_backup_targets(db_path=db_path)
+        for item in discovered:
+            if item.get("stack_name") == clean_stack and item.get("source_path"):
+                resolved_source_str = str(item["source_path"])
+                break
+        if not resolved_source_str:
+            mgr_stacks_dir = getattr(DOCKER_MANAGER, "stacks_dir", STACKS_DIR)
+            resolved_source_str = str(Path(mgr_stacks_dir) / clean_stack)
+
+    src = _validate_safe_host_directory(resolved_source_str, purpose="backup")
+    if not src.exists() or not src.is_dir():
+        raise ValueError(f"Backup source directory does not exist: {src}")
+
+    raw_label = (target_name or clean_stack or src.name).strip()
+    clean_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_label).strip("-") or "backup"
+
+    backups_dir = get_backups_dir(db_path).resolve()
+    now_ts = time.time()
+    dt_utc = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    ts_str = dt_utc.strftime("%Y%m%d-%H%M%S")
+    filename = f"{t_type}-{clean_name}-{ts_str}.tar.gz"
+    archive_path = backups_dir / filename
+    counter = 1
+    while archive_path.exists():
+        filename = f"{t_type}-{clean_name}-{ts_str}-{counter}.tar.gz"
+        archive_path = backups_dir / filename
+        counter += 1
+
+    exclude_list = [str(p).strip() for p in (excludes or []) if str(p).strip()]
+    try:
+        retain_val = int(retain_count) if retain_count is not None else 7
+    except (ValueError, TypeError):
+        retain_val = 7
+
+    stopped_stack = False
+    stopped_container_ids: list[str] = []
+    if t_type == "stack" and stop_containers and clean_stack:
+        try:
+            if DOCKER_MANAGER.is_running():
+                try:
+                    DOCKER_MANAGER.execute_stack_action(clean_stack, "stop")
+                    stopped_stack = True
+                except Exception:
+                    for c in DOCKER_MANAGER.list_containers(all=False):
+                        if c.get("stack") == clean_stack and c.get("id"):
+                            try:
+                                DOCKER_MANAGER.execute_container_action(c["id"], "stop")
+                                stopped_container_ids.append(c["id"])
+                            except Exception:
+                                pass
+        except Exception as exc:
+            logging.warning(
+                f"Could not stop containers for stack '{clean_stack}' before backup: {exc}"
+            )
+
+    file_count = 0
+    try:
+        with tarfile.open(archive_path, "w:gz") as tar:
+            root_arcname = src.name or clean_name
+            tar.add(str(src), arcname=root_arcname, recursive=False)
+            for dirpath, dirnames, filenames in os.walk(str(src)):
+                curr_dir = Path(dirpath)
+                # Always skip backups_dir if nested inside src
+                try:
+                    if curr_dir.resolve() == backups_dir or backups_dir in curr_dir.resolve().parents:
+                        dirnames[:] = []
+                        continue
+                except OSError:
+                    pass
+
+                rel_dir = curr_dir.relative_to(src)
+                # Filter dirnames in-place
+                filtered_dirs: list[str] = []
+                for d in sorted(dirnames):
+                    d_path = curr_dir / d
+                    try:
+                        if d_path.resolve() == backups_dir:
+                            continue
+                    except OSError:
+                        pass
+                    d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
+                    if _matches_exclude_patterns(d_rel, d, exclude_list):
+                        continue
+                    filtered_dirs.append(d)
+                dirnames[:] = filtered_dirs
+
+                for d in dirnames:
+                    d_full = curr_dir / d
+                    d_rel = (rel_dir / d).as_posix() if rel_dir != Path(".") else d
+                    arcname = f"{root_arcname}/{d_rel}"
+                    tar.add(str(d_full), arcname=arcname, recursive=False)
+
+                for f in sorted(filenames):
+                    f_full = curr_dir / f
+                    try:
+                        if f_full.resolve() == archive_path.resolve():
+                            continue
+                    except OSError:
+                        pass
+                    f_rel = (rel_dir / f).as_posix() if rel_dir != Path(".") else f
+                    if _matches_exclude_patterns(f_rel, f, exclude_list):
+                        continue
+                    arcname = f"{root_arcname}/{f_rel}"
+                    try:
+                        tar.add(str(f_full), arcname=arcname, recursive=False)
+                        file_count += 1
+                    except OSError as exc:
+                        logging.warning(f"Skipping unreadable file in backup {f_full}: {exc}")
+    finally:
+        if stopped_stack:
+            try:
+                DOCKER_MANAGER.execute_stack_action(clean_stack, "start")
+            except Exception as exc:
+                logging.warning(
+                    f"Could not restart stack '{clean_stack}' after backup: {exc}"
+                )
+        elif stopped_container_ids:
+            for cid in stopped_container_ids:
+                try:
+                    DOCKER_MANAGER.execute_container_action(cid, "start")
+                except Exception:
+                    pass
+
+    size_bytes = int(archive_path.stat().st_size)
+    sha256_hash = hashlib.sha256()
+    with archive_path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            sha256_hash.update(chunk)
+    sha256_hex = sha256_hash.hexdigest()
+
+    conn = _connect_state_db(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            INSERT OR REPLACE INTO backup_archives
+            (filename, target_type, target_name, source_path, size_bytes, sha256, file_count, status, created_at, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                filename,
+                t_type,
+                clean_name,
+                str(src),
+                size_bytes,
+                sha256_hex,
+                file_count,
+                "completed",
+                now_ts,
+                "",
+            ),
+        )
+        archive_id = int(cursor.lastrowid or 0)
+
+        # Retention pruning for same (target_type, target_name)
+        if retain_val and retain_val > 0:
+            rows = conn.execute(
+                """
+                SELECT id, filename FROM backup_archives
+                WHERE target_type = ? AND target_name = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (t_type, clean_name),
+            ).fetchall()
+            if len(rows) > retain_val:
+                for old_id, old_fname in rows[retain_val:]:
+                    old_path = backups_dir / str(old_fname)
+                    try:
+                        if old_path.is_file():
+                            old_path.unlink()
+                    except OSError:
+                        pass
+                    conn.execute("DELETE FROM backup_archives WHERE id = ?", (old_id,))
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    record_audit_event(
+        "backup.archive.created",
+        f"Created {t_type} backup archive '{filename}' from '{src}' ({_format_bytes(size_bytes)})",
+        actor=actor,
+        severity="info",
+        metadata={
+            "filename": filename,
+            "target_type": t_type,
+            "target_name": clean_name,
+            "source_path": str(src),
+            "size_bytes": size_bytes,
+            "sha256": sha256_hex,
+            "file_count": file_count,
+        },
+        db_path=db_path,
+    )
+
+    return {
+        "id": archive_id,
+        "filename": filename,
+        "target_type": t_type,
+        "target_name": clean_name,
+        "source_path": str(src),
+        "size_bytes": size_bytes,
+        "size_human": _format_bytes(size_bytes),
+        "sha256": sha256_hex,
+        "file_count": file_count,
+        "status": "completed",
+        "created_at": now_ts,
+        "created_iso": dt_utc.isoformat(),
+        "exists_on_disk": True,
+    }
+
+
+def _validate_archive_filename(filename: str) -> str:
+    clean = str(filename or "").strip()
+    if (
+        not clean
+        or "/" in clean
+        or "\\" in clean
+        or ".." in clean
+        or os.path.basename(clean) != clean
+    ):
+        raise ValueError("Invalid archive filename.")
+    return clean
+
+
+def list_backup_archives(db_path: Path = STATE_DB_PATH) -> list[dict[str, Any]]:
+    """Return all recorded backup archives ordered by created_at DESC, id DESC."""
+    backups_dir = get_backups_dir(db_path)
+    conn = _connect_state_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, filename, target_type, target_name, source_path,
+                   size_bytes, sha256, file_count, status, created_at, notes
+            FROM backup_archives
+            ORDER BY created_at DESC, id DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    archives: list[dict[str, Any]] = []
+    for r in rows:
+        fname = str(r[1])
+        fpath = backups_dir / fname
+        exists_on_disk = fpath.is_file()
+        created_at = float(r[9] or 0.0)
+        created_iso = (
+            datetime.fromtimestamp(created_at, tz=timezone.utc).isoformat()
+            if created_at > 0
+            else ""
+        )
+        size_bytes = int(r[5] or 0)
+        archives.append(
+            {
+                "id": int(r[0]),
+                "filename": fname,
+                "target_type": str(r[2]),
+                "target_name": str(r[3]),
+                "source_path": str(r[4]),
+                "size_bytes": size_bytes,
+                "size_human": _format_bytes(size_bytes),
+                "sha256": str(r[6]),
+                "file_count": int(r[7] or 0),
+                "status": str(r[8] or "completed"),
+                "created_at": created_at,
+                "created_iso": created_iso,
+                "notes": str(r[10] or ""),
+                "exists_on_disk": exists_on_disk,
+            }
+        )
+    return archives
+
+
+def delete_backup_archive(
+    filename: str, actor: str = "admin", db_path: Path = STATE_DB_PATH
+) -> dict[str, Any]:
+    """Delete a backup archive file from disk and remove its record from SQLite."""
+    clean_fname = _validate_archive_filename(filename)
+    backups_dir = get_backups_dir(db_path)
+    archive_path = backups_dir / clean_fname
+
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, filename FROM backup_archives WHERE filename = ?",
+            (clean_fname,),
+        ).fetchone()
+        file_existed = archive_path.is_file()
+        if not row and not file_existed:
+            raise FileNotFoundError(f"Backup archive '{clean_fname}' not found.")
+        if file_existed:
+            archive_path.unlink()
+        if row:
+            conn.execute(
+                "DELETE FROM backup_archives WHERE filename = ?", (clean_fname,)
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    record_audit_event(
+        "backup.archive.deleted",
+        f"Deleted backup archive '{clean_fname}'",
+        actor=actor,
+        severity="warning",
+        metadata={"filename": clean_fname},
+        db_path=db_path,
+    )
+    return {"deleted": True, "filename": clean_fname}
+
+
+def restore_backup_archive(
+    filename: str,
+    destination_path: str = "",
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Safely extract a .tar.gz backup archive into destination_path (or original source_path parent)."""
+    clean_fname = _validate_archive_filename(filename)
+    backups_dir = get_backups_dir(db_path)
+    archive_path = (backups_dir / clean_fname).resolve()
+    if not archive_path.is_file():
+        raise FileNotFoundError(f"Backup archive '{clean_fname}' does not exist on disk.")
+
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT target_type, target_name, source_path FROM backup_archives WHERE filename = ?",
+            (clean_fname,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    dest_str = str(destination_path or "").strip()
+    if dest_str:
+        dest = _validate_safe_host_directory(dest_str, purpose="restore")
+    elif row and row[2]:
+        orig_parent = str(Path(str(row[2])).expanduser().resolve().parent)
+        dest = _validate_safe_host_directory(orig_parent, purpose="restore")
+    else:
+        raise ValueError("destination_path is required when archive metadata has no source_path.")
+
+    dest.mkdir(parents=True, exist_ok=True)
+    dest_resolved = dest.resolve()
+
+    restored_files = 0
+    with tarfile.open(archive_path, "r:gz") as tar:
+        members = tar.getmembers()
+        for member in members:
+            member_name = member.name
+            if not member_name:
+                continue
+            if os.path.isabs(member_name) or member_name.startswith("/") or member_name.startswith("\\"):
+                raise ValueError(
+                    f"Unsafe absolute path '{member_name}' detected in archive."
+                )
+            norm_parts = Path(member_name).parts
+            if ".." in norm_parts:
+                raise ValueError(
+                    f"Path traversal segment '..' detected in archive member '{member_name}'."
+                )
+            target_member_path = (dest_resolved / member_name).resolve()
+            if (
+                target_member_path != dest_resolved
+                and dest_resolved not in target_member_path.parents
+            ):
+                raise ValueError(
+                    f"Archive member '{member_name}' resolves outside destination directory."
+                )
+            if member.issym() or member.islnk():
+                link_target = Path(member.linkname)
+                if link_target.is_absolute() or ".." in link_target.parts:
+                    raise ValueError(
+                        f"Unsafe link target '{member.linkname}' in archive member '{member_name}'."
+                    )
+
+        for member in members:
+            tar.extract(member, path=str(dest_resolved))
+            if member.isfile():
+                restored_files += 1
+
+    record_audit_event(
+        "backup.archive.restored",
+        f"Restored backup archive '{clean_fname}' to '{dest_resolved}' ({restored_files} files)",
+        actor=actor,
+        severity="warning",
+        metadata={
+            "filename": clean_fname,
+            "destination_path": str(dest_resolved),
+            "restored_files": restored_files,
+        },
+        db_path=db_path,
+    )
+    return {
+        "restored": True,
+        "filename": clean_fname,
+        "destination_path": str(dest_resolved),
+        "restored_files": restored_files,
+    }
+
+
+def list_backup_targets(db_path: Path = STATE_DB_PATH) -> list[dict[str, Any]]:
+    """List saved backup targets from backup_targets table."""
+    conn = _connect_state_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, name, target_type, source_path, stack_name,
+                   excludes_json, stop_containers, retain_count, created_at
+            FROM backup_targets
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    targets: list[dict[str, Any]] = []
+    for r in rows:
+        try:
+            excludes = json.loads(r[5] or "[]")
+            if not isinstance(excludes, list):
+                excludes = []
+        except Exception:
+            excludes = []
+        src_path = str(r[3] or "")
+        exists = False
+        try:
+            exists = bool(src_path and Path(src_path).is_dir())
+        except OSError:
+            exists = False
+        targets.append(
+            {
+                "id": int(r[0]),
+                "name": str(r[1]),
+                "target_type": str(r[2]),
+                "source_path": src_path,
+                "stack_name": str(r[4] or ""),
+                "excludes": excludes,
+                "stop_containers": bool(r[6]),
+                "retain_count": int(r[7] or 7),
+                "created_at": float(r[8] or 0.0),
+                "exists": exists,
+            }
+        )
+    return targets
+
+
+def save_backup_target(
+    target_data: Optional[dict[str, Any]] = None,
+    *,
+    target_id: Optional[int] = None,
+    name: str = "",
+    target_type: str = "directory",
+    source_path: str = "",
+    stack_name: str = "",
+    excludes: Optional[list[str]] = None,
+    stop_containers: bool = False,
+    retain_count: int = 7,
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Create or update a saved backup target in backup_targets."""
+    if isinstance(target_data, dict):
+        target_id = target_data.get("id", target_id)
+        name = str(target_data.get("name") or target_data.get("target_name") or name)
+        target_type = str(target_data.get("target_type") or target_type or "directory")
+        source_path = str(target_data.get("source_path") or source_path)
+        stack_name = str(target_data.get("stack_name") or stack_name)
+        raw_ex = target_data.get("excludes", excludes)
+        if isinstance(raw_ex, str):
+            excludes = [p.strip() for p in raw_ex.split(",") if p.strip()]
+        elif isinstance(raw_ex, list):
+            excludes = [str(p).strip() for p in raw_ex if str(p).strip()]
+        stop_containers = bool(target_data.get("stop_containers", stop_containers))
+        try:
+            retain_count = int(target_data.get("retain_count", retain_count) or 7)
+        except (ValueError, TypeError):
+            retain_count = 7
+
+    t_type = str(target_type or "directory").strip().lower()
+    if t_type not in ("stack", "directory"):
+        raise ValueError("target_type must be 'stack' or 'directory'.")
+
+    clean_stack = str(stack_name or "").strip()
+    clean_source = str(source_path or "").strip()
+    if t_type == "stack" and not clean_source and clean_stack:
+        for item in discover_stack_backup_targets(db_path=db_path):
+            if item.get("stack_name") == clean_stack and item.get("source_path"):
+                clean_source = str(item["source_path"])
+                break
+        if not clean_source:
+            mgr_stacks_dir = getattr(DOCKER_MANAGER, "stacks_dir", STACKS_DIR)
+            clean_source = str(Path(mgr_stacks_dir) / clean_stack)
+
+    if not clean_source:
+        raise ValueError("source_path is required for saving a backup target.")
+
+    # Validate path is not root or virtual kernel FS
+    norm_raw = os.path.normpath(clean_source)
+    if norm_raw == "/" or any(
+        norm_raw == f or norm_raw.startswith(f + "/") for f in FORBIDDEN_BACKUP_ROOTS
+    ):
+        raise ValueError(f"Invalid or restricted backup target path: '{clean_source}'")
+
+    clean_name = str(name or clean_stack or Path(clean_source).name).strip()
+    if not clean_name:
+        raise ValueError("Target name cannot be empty.")
+
+    exclude_list = [str(p).strip() for p in (excludes or []) if str(p).strip()]
+    excludes_json = json.dumps(exclude_list)
+    retain_val = max(1, int(retain_count or 7))
+    now_ts = time.time()
+
+    conn = _connect_state_db(db_path)
+    try:
+        if target_id is not None:
+            conn.execute(
+                """
+                UPDATE backup_targets
+                SET name = ?, target_type = ?, source_path = ?, stack_name = ?,
+                    excludes_json = ?, stop_containers = ?, retain_count = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_name,
+                    t_type,
+                    clean_source,
+                    clean_stack,
+                    excludes_json,
+                    1 if stop_containers else 0,
+                    retain_val,
+                    int(target_id),
+                ),
+            )
+            saved_id = int(target_id)
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO backup_targets
+                (name, target_type, source_path, stack_name, excludes_json, stop_containers, retain_count, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_name,
+                    t_type,
+                    clean_source,
+                    clean_stack,
+                    excludes_json,
+                    1 if stop_containers else 0,
+                    retain_val,
+                    now_ts,
+                ),
+            )
+            saved_id = int(cur.lastrowid or 0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    record_audit_event(
+        "backup.target.saved",
+        f"Saved {t_type} backup target '{clean_name}' ({clean_source})",
+        actor=actor,
+        severity="info",
+        metadata={"id": saved_id, "name": clean_name, "source_path": clean_source},
+        db_path=db_path,
+    )
+
+    return {
+        "id": saved_id,
+        "name": clean_name,
+        "target_type": t_type,
+        "source_path": clean_source,
+        "stack_name": clean_stack,
+        "excludes": exclude_list,
+        "stop_containers": bool(stop_containers),
+        "retain_count": retain_val,
+        "created_at": now_ts,
+        "exists": Path(clean_source).is_dir(),
+    }
+
+
+def delete_backup_target(
+    target_id: int, actor: str = "admin", db_path: Path = STATE_DB_PATH
+) -> dict[str, Any]:
+    """Delete a saved backup target by ID."""
+    tid = int(target_id)
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, name FROM backup_targets WHERE id = ?", (tid,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Backup target {tid} not found.")
+        t_name = str(row[1])
+        conn.execute("DELETE FROM backup_targets WHERE id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    record_audit_event(
+        "backup.target.deleted",
+        f"Deleted saved backup target '{t_name}' (ID {tid})",
+        actor=actor,
+        severity="info",
+        metadata={"id": tid, "name": t_name},
+        db_path=db_path,
+    )
+    return {"deleted": True, "id": tid, "name": t_name}
+
+
+def get_backups_overview(db_path: Path = STATE_DB_PATH) -> dict[str, Any]:
+    """Return full overview of backup directory, discovered stack folders, saved targets, and archives."""
+    archives = list_backup_archives(db_path=db_path)
+    total_size = sum(int(a.get("size_bytes") or 0) for a in archives)
+    return {
+        "backup_dir": str(get_backups_dir(db_path)),
+        "total_archives": len(archives),
+        "total_size_bytes": total_size,
+        "total_size_human": _format_bytes(total_size),
+        "stack_targets": discover_stack_backup_targets(db_path=db_path),
+        "saved_targets": list_backup_targets(db_path=db_path),
+        "archives": archives,
+    }
+
+
+SUPPORTED_CRON_TASK_TYPES: dict[str, str] = {
+    "backup.stack": "Back up a specific Docker Compose stack folder (or 'all' discovered stacks)",
+    "backup.directory": "Back up a custom host directory with optional glob exclusions and retention",
+    "notifications.summary": "Dispatch Vigil system health & telemetry digest across enabled notification channels",
+    "docker.prune": "Prune unused Docker images and optionally unused volumes",
+    "packages.refresh": "Refresh APT package repository cache and update counts",
+    "storage.smart_check": "Run S.M.A.R.T. & RAID health check across all disks/arrays and alert if degraded",
+}
+
+_CRON_MONTH_MAP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+_CRON_DOW_MAP = {
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
+}
+
+
+def _parse_cron_atom(
+    atom: str, min_val: int, max_val: int, is_dow: bool = False, is_month: bool = False
+) -> int:
+    clean = atom.strip().lower()
+    if is_month and clean in _CRON_MONTH_MAP:
+        return _CRON_MONTH_MAP[clean]
+    if is_dow and clean in _CRON_DOW_MAP:
+        return _CRON_DOW_MAP[clean]
+    val = int(clean)
+    if is_dow and val == 7:
+        val = 0
+    if val < min_val or val > max_val:
+        raise ValueError(f"Cron value {val} out of range [{min_val}, {max_val}]")
+    return val
+
+
+def _matches_cron_field(
+    field_expr: str,
+    value: int,
+    min_val: int,
+    max_val: int,
+    *,
+    is_dow: bool = False,
+    is_month: bool = False,
+) -> bool:
+    """Evaluate whether a single 5-field cron token matches `value`."""
+    expr = str(field_expr or "").strip().lower()
+    if not expr:
+        raise ValueError("Empty cron field")
+
+    if is_dow and value == 7:
+        value = 0
+
+    for part in expr.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"Invalid empty list segment in cron field '{field_expr}'")
+
+        step = 1
+        if "/" in part:
+            base, step_str = part.split("/", 1)
+            step = int(step_str.strip())
+            if step <= 0:
+                raise ValueError("Cron step must be positive")
+        else:
+            base = part
+
+        if base == "*":
+            start, end = min_val, max_val
+        elif "-" in base:
+            s_str, e_str = base.split("-", 1)
+            start = _parse_cron_atom(
+                s_str, min_val, max_val, is_dow=is_dow, is_month=is_month
+            )
+            end = _parse_cron_atom(
+                e_str, min_val, max_val, is_dow=is_dow, is_month=is_month
+            )
+            if is_dow and end == 0 and int(e_str.strip() if e_str.strip().isdigit() else -1) == 7:
+                end = 6
+            if start > end:
+                raise ValueError(f"Invalid cron range '{base}'")
+        else:
+            single = _parse_cron_atom(
+                base, min_val, max_val, is_dow=is_dow, is_month=is_month
+            )
+            if "/" in part:
+                start, end = single, max_val
+            else:
+                if value == single:
+                    return True
+                continue
+
+        if start <= value <= end and ((value - start) % step == 0):
+            return True
+
+    return False
+
+
+def _cron_matches_datetime(cron_expr: str, dt: datetime) -> bool:
+    fields = str(cron_expr or "").strip().split()
+    if len(fields) != 5:
+        raise ValueError("Cron expression must have exactly 5 fields (min hr dom mon dow).")
+    min_f, hr_f, dom_f, mon_f, dow_f = fields
+
+    cron_dow = (dt.weekday() + 1) % 7  # Python Monday=0..Sunday=6 -> Cron Sunday=0..Saturday=6
+    if not _matches_cron_field(min_f, dt.minute, 0, 59):
+        return False
+    if not _matches_cron_field(hr_f, dt.hour, 0, 23):
+        return False
+    if not _matches_cron_field(mon_f, dt.month, 1, 12, is_month=True):
+        return False
+
+    dom_wild = dom_f.strip() == "*"
+    dow_wild = dow_f.strip() == "*"
+    dom_match = _matches_cron_field(dom_f, dt.day, 1, 31)
+    dow_match = _matches_cron_field(dow_f, cron_dow, 0, 6, is_dow=True)
+
+    if not dom_wild and not dow_wild:
+        return dom_match or dow_match
+    return dom_match and dow_match
+
+
+def get_next_cron_run_timestamp(
+    cron_expr: str, now_ts: Optional[float] = None
+) -> float:
+    """Compute the next UTC timestamp matching the 5-field cron expression after now_ts."""
+    fields = str(cron_expr or "").strip().split()
+    if len(fields) != 5:
+        raise ValueError("Cron expression must have exactly 5 fields (min hr dom mon dow).")
+
+    # Validate syntax of all 5 fields up front
+    _matches_cron_field(fields[0], 0, 0, 59)
+    _matches_cron_field(fields[1], 0, 0, 23)
+    _matches_cron_field(fields[2], 1, 1, 31)
+    _matches_cron_field(fields[3], 1, 1, 12, is_month=True)
+    _matches_cron_field(fields[4], 0, 0, 6, is_dow=True)
+
+    base_ts = float(now_ts if now_ts is not None else time.time())
+    # Start searching from the next whole minute
+    start_min_ts = (int(base_ts) // 60 + 1) * 60
+    candidate = datetime.fromtimestamp(start_min_ts, tz=timezone.utc)
+
+    # Search up to 366 days ahead (527,040 minutes) incrementally with hour/day skips
+    max_Check = 366 * 24 * 60
+    steps = 0
+    while steps < max_Check:
+        if not _matches_cron_field(fields[3], candidate.month, 1, 12, is_month=True):
+            # Advance to 1st of next month
+            if candidate.month == 12:
+                candidate = candidate.replace(
+                    year=candidate.year + 1, month=1, day=1, hour=0, minute=0
+                )
+            else:
+                candidate = candidate.replace(
+                    month=candidate.month + 1, day=1, hour=0, minute=0
+                )
+            steps += 60
+            continue
+
+        cron_dow = (candidate.weekday() + 1) % 7
+        dom_wild = fields[2].strip() == "*"
+        dow_wild = fields[4].strip() == "*"
+        dom_match = _matches_cron_field(fields[2], candidate.day, 1, 31)
+        dow_match = _matches_cron_field(fields[4], cron_dow, 0, 6, is_dow=True)
+        day_ok = (dom_match or dow_match) if (not dom_wild and not dow_wild) else (dom_match and dow_match)
+        if not day_ok:
+            candidate = (candidate + timedelta(days=1)).replace(hour=0, minute=0)
+            steps += 60
+            continue
+
+        if not _matches_cron_field(fields[1], candidate.hour, 0, 23):
+            candidate = (candidate + timedelta(hours=1)).replace(minute=0)
+            steps += 15
+            continue
+
+        if not _matches_cron_field(fields[0], candidate.minute, 0, 59):
+            candidate += timedelta(minutes=1)
+            steps += 1
+            continue
+
+        return float(candidate.timestamp())
+
+    raise ValueError(f"Could not find next run time for cron expression '{cron_expr}'.")
+
+
+def validate_cron_expression(cron_expr: str) -> bool:
+    """Return True if cron_expr is a valid 5-field cron expression, else False."""
+    try:
+        fields = str(cron_expr or "").strip().split()
+        if len(fields) != 5:
+            return False
+        nxt = get_next_cron_run_timestamp(cron_expr, time.time())
+        return nxt > 0
+    except Exception:
+        return False
+
+
+def _format_cron_job_row(row: tuple[Any, ...]) -> dict[str, Any]:
+    try:
+        task_cfg = json.loads(row[4] or "{}")
+        if not isinstance(task_cfg, dict):
+            task_cfg = {}
+    except Exception:
+        task_cfg = {}
+    last_run_at = float(row[8] or 0.0)
+    next_run_at = float(row[12] or 0.0)
+    return {
+        "id": int(row[0]),
+        "name": str(row[1]),
+        "task_type": str(row[2]),
+        "cron_expression": str(row[3]),
+        "task_config_json": str(row[4] or "{}"),
+        "task_config": task_cfg,
+        "enabled": bool(row[5]),
+        "notify_on_failure": bool(row[6]),
+        "notify_on_success": bool(row[7]),
+        "last_run_at": last_run_at,
+        "last_run_iso": (
+            datetime.fromtimestamp(last_run_at, tz=timezone.utc).isoformat()
+            if last_run_at > 0
+            else ""
+        ),
+        "last_status": str(row[9] or "never"),
+        "last_duration_ms": int(row[10] or 0),
+        "last_output": str(row[11] or ""),
+        "next_run_at": next_run_at,
+        "next_run_iso": (
+            datetime.fromtimestamp(next_run_at, tz=timezone.utc).isoformat()
+            if next_run_at > 0
+            else ""
+        ),
+        "created_at": float(row[13] or 0.0),
+        "updated_at": float(row[14] or 0.0),
+    }
+
+
+def list_cron_jobs(db_path: Path = STATE_DB_PATH) -> dict[str, Any]:
+    """List all configured cron jobs, recent execution runs, and supported task types."""
+    conn = _connect_state_db(db_path)
+    try:
+        job_rows = conn.execute(
+            """
+            SELECT id, name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success,
+                   last_run_at, last_status, last_duration_ms, last_output,
+                   next_run_at, created_at, updated_at
+            FROM cron_jobs
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        run_rows = conn.execute(
+            """
+            SELECT id, job_id, job_name, task_type, trigger_source,
+                   started_at, finished_at, duration_ms, status, output
+            FROM cron_job_runs
+            ORDER BY started_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    jobs = [_format_cron_job_row(r) for r in job_rows]
+    recent_runs: list[dict[str, Any]] = []
+    for r in run_rows:
+        s_at = float(r[5] or 0.0)
+        f_at = float(r[6] or 0.0)
+        recent_runs.append(
+            {
+                "id": int(r[0]),
+                "job_id": int(r[1]),
+                "job_name": str(r[2]),
+                "task_type": str(r[3]),
+                "trigger_source": str(r[4] or "schedule"),
+                "started_at": s_at,
+                "started_iso": (
+                    datetime.fromtimestamp(s_at, tz=timezone.utc).isoformat()
+                    if s_at > 0
+                    else ""
+                ),
+                "finished_at": f_at,
+                "finished_iso": (
+                    datetime.fromtimestamp(f_at, tz=timezone.utc).isoformat()
+                    if f_at > 0
+                    else ""
+                ),
+                "duration_ms": int(r[7] or 0),
+                "status": str(r[8]),
+                "output": str(r[9] or ""),
+            }
+        )
+
+    return {
+        "jobs": jobs,
+        "recent_runs": recent_runs,
+        "supported_task_types": [
+            {"type": k, "description": v} for k, v in SUPPORTED_CRON_TASK_TYPES.items()
+        ],
+    }
+
+
+def create_or_update_cron_job(
+    job_data: dict[str, Any],
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Validate and insert or update a job in cron_jobs."""
+    if not isinstance(job_data, dict):
+        raise ValueError("job_data must be a dictionary.")
+
+    job_id = job_data.get("id")
+    clean_name = str(job_data.get("name") or "").strip()
+    if not clean_name:
+        raise ValueError("Job name is required.")
+
+    task_type = str(job_data.get("task_type") or "").strip()
+    if task_type not in SUPPORTED_CRON_TASK_TYPES:
+        raise ValueError(
+            f"Unsupported task_type '{task_type}'. Must be one of {list(SUPPORTED_CRON_TASK_TYPES.keys())}."
+        )
+
+    cron_expr = " ".join(str(job_data.get("cron_expression") or "").strip().split())
+    if not validate_cron_expression(cron_expr):
+        raise ValueError(
+            f"Invalid 5-field cron expression '{cron_expr}'. Expected format: 'min hr dom mon dow'."
+        )
+
+    raw_cfg = job_data.get("task_config")
+    if raw_cfg is None and "task_config_json" in job_data:
+        try:
+            raw_cfg = json.loads(str(job_data["task_config_json"]))
+        except Exception as exc:
+            raise ValueError(f"Invalid task_config_json: {exc}") from exc
+    if raw_cfg is None:
+        raw_cfg = {}
+    if not isinstance(raw_cfg, dict):
+        raise ValueError("task_config must be a JSON object.")
+
+    task_config = copy.deepcopy(raw_cfg)
+    # Task-specific validation
+    if task_type == "backup.stack":
+        st_name = str(task_config.get("stack_name") or "all").strip() or "all"
+        task_config["stack_name"] = st_name
+        task_config["retain_count"] = max(1, int(task_config.get("retain_count", 7) or 7))
+        task_config["stop_containers"] = bool(task_config.get("stop_containers", False))
+    elif task_type == "backup.directory":
+        src_path = str(task_config.get("source_path") or "").strip()
+        if not src_path:
+            raise ValueError("source_path is required in task_config for backup.directory.")
+        _validate_safe_host_directory(src_path, purpose="backup.directory cron job")
+        task_config["source_path"] = src_path
+        task_config["target_name"] = str(task_config.get("target_name") or "").strip()
+        ex = task_config.get("excludes", [])
+        if isinstance(ex, str):
+            ex = [p.strip() for p in ex.split(",") if p.strip()]
+        task_config["excludes"] = list(ex) if isinstance(ex, list) else []
+        task_config["retain_count"] = max(1, int(task_config.get("retain_count", 7) or 7))
+    elif task_type == "docker.prune":
+        task_config["prune_images"] = bool(task_config.get("prune_images", True))
+        task_config["prune_volumes"] = bool(task_config.get("prune_volumes", False))
+
+    enabled = bool(job_data.get("enabled", True))
+    notify_on_failure = bool(job_data.get("notify_on_failure", True))
+    notify_on_success = bool(job_data.get("notify_on_success", False))
+
+    now_ts = time.time()
+    next_run_at = get_next_cron_run_timestamp(cron_expr, now_ts)
+    task_config_json = json.dumps(task_config)
+
+    conn = _connect_state_db(db_path)
+    try:
+        is_update = False
+        if job_id is not None:
+            existing = conn.execute(
+                "SELECT id FROM cron_jobs WHERE id = ?", (int(job_id),)
+            ).fetchone()
+            if existing:
+                is_update = True
+
+        if is_update:
+            jid = int(job_id)
+            conn.execute(
+                """
+                UPDATE cron_jobs
+                SET name = ?, task_type = ?, cron_expression = ?, task_config_json = ?,
+                    enabled = ?, notify_on_failure = ?, notify_on_success = ?,
+                    next_run_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    clean_name,
+                    task_type,
+                    cron_expr,
+                    task_config_json,
+                    1 if enabled else 0,
+                    1 if notify_on_failure else 0,
+                    1 if notify_on_success else 0,
+                    next_run_at,
+                    now_ts,
+                    jid,
+                ),
+            )
+            audit_event = "cron.job.updated"
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO cron_jobs
+                (name, task_type, cron_expression, task_config_json,
+                 enabled, notify_on_failure, notify_on_success,
+                 last_run_at, last_status, last_duration_ms, last_output,
+                 next_run_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0.0, 'never', 0, '', ?, ?, ?)
+                """,
+                (
+                    clean_name,
+                    task_type,
+                    cron_expr,
+                    task_config_json,
+                    1 if enabled else 0,
+                    1 if notify_on_failure else 0,
+                    1 if notify_on_success else 0,
+                    next_run_at,
+                    now_ts,
+                    now_ts,
+                ),
+            )
+            jid = int(cur.lastrowid or 0)
+            audit_event = "cron.job.created"
+
+        conn.commit()
+        row = conn.execute(
+            """
+            SELECT id, name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success,
+                   last_run_at, last_status, last_duration_ms, last_output,
+                   next_run_at, created_at, updated_at
+            FROM cron_jobs WHERE id = ?
+            """,
+            (jid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    saved_job = _format_cron_job_row(row)
+    record_audit_event(
+        audit_event,
+        f"{'Updated' if audit_event.endswith('updated') else 'Created'} cron job '{clean_name}' ({task_type} @ {cron_expr})",
+        actor=actor,
+        severity="info",
+        metadata={"id": jid, "name": clean_name, "task_type": task_type, "cron_expression": cron_expr},
+        db_path=db_path,
+    )
+    return saved_job
+
+
+def toggle_cron_job(
+    job_id: int,
+    enabled: Optional[bool] = None,
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Enable or disable a cron job."""
+    jid = int(job_id)
+    now_ts = time.time()
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, name, cron_expression, enabled, next_run_at FROM cron_jobs WHERE id = ?",
+            (jid,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Cron job {jid} not found.")
+        new_enabled = (not bool(row[3])) if enabled is None else bool(enabled)
+        next_run = (
+            get_next_cron_run_timestamp(str(row[2]), now_ts)
+            if new_enabled
+            else float(row[4] or 0.0)
+        )
+        conn.execute(
+            "UPDATE cron_jobs SET enabled = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
+            (1 if new_enabled else 0, next_run, now_ts, jid),
+        )
+        conn.commit()
+        updated_row = conn.execute(
+            """
+            SELECT id, name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success,
+                   last_run_at, last_status, last_duration_ms, last_output,
+                   next_run_at, created_at, updated_at
+            FROM cron_jobs WHERE id = ?
+            """,
+            (jid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    job_dict = _format_cron_job_row(updated_row)
+    record_audit_event(
+        "cron.job.toggled",
+        f"{'Enabled' if new_enabled else 'Disabled'} cron job '{job_dict['name']}'",
+        actor=actor,
+        severity="info",
+        metadata={"id": jid, "enabled": new_enabled},
+        db_path=db_path,
+    )
+    return job_dict
+
+
+def delete_cron_job(
+    job_id: int, actor: str = "admin", db_path: Path = STATE_DB_PATH
+) -> dict[str, Any]:
+    """Delete a cron job by ID."""
+    jid = int(job_id)
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT id, name FROM cron_jobs WHERE id = ?", (jid,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Cron job {jid} not found.")
+        j_name = str(row[1])
+        conn.execute("DELETE FROM cron_jobs WHERE id = ?", (jid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    record_audit_event(
+        "cron.job.deleted",
+        f"Deleted cron job '{j_name}' (ID {jid})",
+        actor=actor,
+        severity="warning",
+        metadata={"id": jid, "name": j_name},
+        db_path=db_path,
+    )
+    return {"deleted": True, "id": jid, "name": j_name}
+
+
+def _dispatch_async_coro_sync(coro: Any) -> Any:
+    """Run an async coroutine safely from either sync or running event loop context."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result(timeout=30)
+    return asyncio.run(coro)
+
+
+def _execute_cron_task(
+    task_type: str,
+    task_config: dict[str, Any],
+    actor: str = "cron",
+    db_path: Path = STATE_DB_PATH,
+) -> str:
+    """Execute the underlying system task for a cron job and return a human-readable output string."""
+    if task_type == "backup.stack":
+        stack_name = str(task_config.get("stack_name") or "all").strip() or "all"
+        retain_count = int(task_config.get("retain_count", 7) or 7)
+        stop_containers = bool(task_config.get("stop_containers", False))
+        excludes = task_config.get("excludes") or []
+        if stack_name.lower() == "all":
+            targets = [
+                t
+                for t in discover_stack_backup_targets(db_path=db_path)
+                if t.get("exists")
+            ]
+            if not targets:
+                return "No existing Docker stack directories found to back up."
+            created_files = []
+            for t in targets:
+                arch = create_backup_archive(
+                    target_type="stack",
+                    source_path=str(t["source_path"]),
+                    stack_name=str(t["stack_name"]),
+                    target_name=str(t["stack_name"]),
+                    excludes=excludes,
+                    stop_containers=stop_containers,
+                    retain_count=retain_count,
+                    actor=actor,
+                    db_path=db_path,
+                )
+                created_files.append(arch["filename"])
+            return f"Backed up {len(created_files)} stack(s): {', '.join(created_files)}"
+        else:
+            arch = create_backup_archive(
+                target_type="stack",
+                source_path=str(task_config.get("source_path") or ""),
+                stack_name=stack_name,
+                target_name=str(task_config.get("target_name") or stack_name),
+                excludes=excludes,
+                stop_containers=stop_containers,
+                retain_count=retain_count,
+                actor=actor,
+                db_path=db_path,
+            )
+            return f"Created stack backup '{arch['filename']}' ({arch['size_human']}, {arch['file_count']} files)"
+
+    if task_type == "backup.directory":
+        src_path = str(task_config.get("source_path") or "").strip()
+        target_name = str(task_config.get("target_name") or "").strip()
+        excludes = task_config.get("excludes") or []
+        if isinstance(excludes, str):
+            excludes = [p.strip() for p in excludes.split(",") if p.strip()]
+        retain_count = int(task_config.get("retain_count", 7) or 7)
+        arch = create_backup_archive(
+            target_type="directory",
+            source_path=src_path,
+            target_name=target_name,
+            excludes=excludes,
+            retain_count=retain_count,
+            actor=actor,
+            db_path=db_path,
+        )
+        return f"Created directory backup '{arch['filename']}' ({arch['size_human']}, {arch['file_count']} files)"
+
+    if task_type == "notifications.summary":
+        config_dict = get_notification_center_config()
+        topics = config_dict.get("topics", {})
+        title, desc, embed_data = build_periodic_report_data(topics)
+        mgr = NotificationManager(config_dict)
+        results = _dispatch_async_coro_sync(mgr.send_all(title, desc, embed_data))
+        record_notification("scheduled_report", time.time(), weekly=True)
+        ok_channels = [ch for ch, (ok, _) in results.items() if ok]
+        if ok_channels:
+            return f"System health digest sent via {', '.join(ok_channels)}."
+        return f"System health digest generated ({title})."
+
+    if task_type == "docker.prune":
+        prune_images = bool(task_config.get("prune_images", True))
+        prune_volumes = bool(task_config.get("prune_volumes", False))
+        parts = []
+        if prune_images:
+            img_res = DOCKER_MANAGER.prune_images()
+            parts.append(f"Images pruned: {str(img_res.get('output') or 'done').strip() or 'done'}")
+        if prune_volumes:
+            vol_res = DOCKER_MANAGER.prune_volumes()
+            parts.append(f"Volumes pruned: {str(vol_res.get('output') or 'done').strip() or 'done'}")
+        return "; ".join(parts) if parts else "No prune options selected."
+
+    if task_type == "packages.refresh":
+        ref_res = package_manager.refresh_repositories()
+        if not ref_res.get("success", True):
+            raise RuntimeError(
+                str(ref_res.get("error") or "APT repository refresh failed.")
+            )
+        upd_res = package_manager.get_available_updates(force=True)
+        total_upd = int(upd_res.get("total_updates") or 0)
+        sec_upd = int(upd_res.get("security_updates") or 0)
+        return f"APT cache refreshed: {total_upd} upgrade(s) available ({sec_upd} security)."
+
+    if task_type == "storage.smart_check":
+        smart_list = get_all_disks_smart_metrics(force_refresh=True)
+        failed_disks = [
+            d.get("device", "unknown")
+            for d in smart_list
+            if not d.get("passed", True) or d.get("status") == "failed"
+        ]
+        try:
+            raid_status, _ = check_raid_status()
+        except Exception:
+            raid_status = "unknown"
+        degraded = raid_status in ("degraded", "failed", "error") or bool(failed_disks)
+        summary_msg = (
+            f"Checked {len(smart_list)} disk(s), RAID status='{raid_status}', "
+            f"failed_smart={len(failed_disks)}."
+        )
+        if degraded:
+            try:
+                mgr = NotificationManager(get_notification_center_config())
+                _dispatch_async_coro_sync(
+                    mgr.send_all(
+                        "Vigil Storage Health Warning",
+                        summary_msg,
+                        {"title": "Vigil Storage Health Warning", "description": summary_msg},
+                    )
+                )
+            except Exception:
+                pass
+        return summary_msg
+
+    raise ValueError(f"Unsupported cron task_type '{task_type}'.")
+
+
+def run_cron_job_now(
+    job_id: int,
+    trigger_source: str = "manual",
+    actor: str = "admin",
+    db_path: Path = STATE_DB_PATH,
+) -> dict[str, Any]:
+    """Execute a configured cron job immediately and record its run in cron_jobs and cron_job_runs."""
+    jid = int(job_id)
+    conn = _connect_state_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT id, name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success,
+                   last_run_at, last_status, last_duration_ms, last_output,
+                   next_run_at, created_at, updated_at
+            FROM cron_jobs WHERE id = ?
+            """,
+            (jid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise ValueError(f"Cron job {jid} not found.")
+
+    job = _format_cron_job_row(row)
+    started_at = time.time()
+    status = "success"
+    try:
+        output = _execute_cron_task(
+            job["task_type"],
+            job["task_config"],
+            actor=actor,
+            db_path=db_path,
+        )
+    except Exception as exc:
+        status = "failed"
+        output = f"Error: {exc}"
+
+    finished_at = time.time()
+    duration_ms = max(1, int(round((finished_at - started_at) * 1000)))
+    try:
+        next_run_at = get_next_cron_run_timestamp(job["cron_expression"], finished_at)
+    except Exception:
+        next_run_at = float(job.get("next_run_at") or 0.0)
+
+    conn = _connect_state_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE cron_jobs
+            SET last_run_at = ?, last_status = ?, last_duration_ms = ?,
+                last_output = ?, next_run_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                started_at,
+                status,
+                duration_ms,
+                output,
+                next_run_at,
+                finished_at,
+                jid,
+            ),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO cron_job_runs
+            (job_id, job_name, task_type, trigger_source, started_at, finished_at, duration_ms, status, output)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                jid,
+                job["name"],
+                job["task_type"],
+                trigger_source,
+                started_at,
+                finished_at,
+                duration_ms,
+                status,
+                output,
+            ),
+        )
+        run_id = int(cur.lastrowid or 0)
+        # Retain last 100 runs
+        conn.execute(
+            """
+            DELETE FROM cron_job_runs
+            WHERE id NOT IN (
+                SELECT id FROM cron_job_runs ORDER BY started_at DESC, id DESC LIMIT 100
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Optional notification dispatch on failure / success
+    if (status == "failed" and job.get("notify_on_failure")) or (
+        status == "success" and job.get("notify_on_success")
+    ):
+        try:
+            mgr = NotificationManager(get_notification_center_config())
+            notif_title = f"Vigil Cron Job {status.upper()}: {job['name']}"
+            _dispatch_async_coro_sync(
+                mgr.send_all(
+                    notif_title,
+                    f"Task `{job['task_type']}` ({trigger_source}) finished with status **{status}**: {output}",
+                )
+            )
+        except Exception as exc:
+            logging.debug(f"Cron job notification dispatch error: {exc}")
+
+    record_audit_event(
+        "cron.job.executed",
+        f"Executed cron job '{job['name']}' ({job['task_type']}) [{status}]: {output}",
+        actor=actor,
+        severity="warning" if status == "failed" else "info",
+        metadata={
+            "job_id": jid,
+            "run_id": run_id,
+            "task_type": job["task_type"],
+            "trigger_source": trigger_source,
+            "status": status,
+            "duration_ms": duration_ms,
+        },
+        db_path=db_path,
+    )
+
+    return {
+        "id": run_id,
+        "run_id": run_id,
+        "job_id": jid,
+        "job_name": job["name"],
+        "task_type": job["task_type"],
+        "trigger_source": trigger_source,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_ms": duration_ms,
+        "status": status,
+        "output": output,
+        "next_run_at": next_run_at,
+    }
+
+
+def evaluate_due_cron_jobs(
+    now_ts: Optional[float] = None, db_path: Path = STATE_DB_PATH
+) -> list[dict[str, Any]]:
+    """Evaluate all enabled cron jobs and execute any that are due."""
+    current_ts = float(now_ts if now_ts is not None else time.time())
+    current_dt = datetime.fromtimestamp(current_ts, tz=timezone.utc)
+    current_minute_bucket = int(current_ts) // 60
+
+    conn = _connect_state_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, name, task_type, cron_expression, task_config_json,
+                   enabled, notify_on_failure, notify_on_success,
+                   last_run_at, last_status, last_duration_ms, last_output,
+                   next_run_at, created_at, updated_at
+            FROM cron_jobs
+            WHERE enabled = 1
+            ORDER BY id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    executed_runs: list[dict[str, Any]] = []
+    for r in rows:
+        job = _format_cron_job_row(r)
+        jid = job["id"]
+        next_run_at = float(job.get("next_run_at") or 0.0)
+        last_run_at = float(job.get("last_run_at") or 0.0)
+        last_minute_bucket = int(last_run_at) // 60 if last_run_at > 0 else -1
+
+        is_due = False
+        if next_run_at > 0 and current_ts >= next_run_at:
+            is_due = True
+        else:
+            try:
+                if (
+                    _cron_matches_datetime(job["cron_expression"], current_dt)
+                    and last_minute_bucket != current_minute_bucket
+                ):
+                    is_due = True
+            except Exception:
+                pass
+
+        if is_due:
+            res = run_cron_job_now(
+                jid, trigger_source="schedule", actor="scheduler", db_path=db_path
+            )
+            # Ensure next_run_at is strictly in the future relative to current_ts
+            try:
+                future_next = get_next_cron_run_timestamp(
+                    job["cron_expression"], max(current_ts, time.time())
+                )
+                c2 = _connect_state_db(db_path)
+                try:
+                    c2.execute(
+                        "UPDATE cron_jobs SET next_run_at = ? WHERE id = ?",
+                        (future_next, jid),
+                    )
+                    c2.commit()
+                finally:
+                    c2.close()
+                res["next_run_at"] = future_next
+            except Exception:
+                pass
+            executed_runs.append(res)
+
+    return executed_runs
 
 
 @client.event

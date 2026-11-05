@@ -264,6 +264,24 @@
             </svg>
             <span>Users &amp; Groups</span>
           </button>
+          <button
+            id="nav-tab-backups"
+            class="nav-tab sidebar-nav-item"
+            type="button"
+            role="tab"
+            aria-selected="false"
+            aria-controls="view-backups"
+            data-view="backups"
+            title="Backups &amp; Cron Scheduler"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 8v13H3V8"></path>
+              <path d="M1 3h22v5H1z"></path>
+              <path d="M10 12h4"></path>
+            </svg>
+            <span>Backups &amp; Cron</span>
+            <span id="nav-badge-backups" class="nav-tab-badge hidden">0</span>
+          </button>
         </div>
 
         <!-- Section: Alerts & Auditing -->
@@ -1726,7 +1744,7 @@
             <div class="section-header">
               <div>
                 <h2 id="security-heading" class="section-title">Network &amp; Security</h2>
-                <p class="section-subtitle">Open Listening Ports, Exposure Risk &amp; Firewall Management</p>
+                <p class="section-subtitle">Open Listening Ports, Exposure Risk, SSH Intrusion Detection &amp; Firewall Management</p>
               </div>
               <div class="module-toolbar">
                 <span class="module-status-dot" title="Live stream active"></span>
@@ -1742,7 +1760,7 @@
             </div>
 
             <!-- Summary Status Ribbon -->
-            <div class="overview-status-ribbon security-status-ribbon" role="region" aria-label="Network Security Summary">
+            <div id="sec-summary-ribbon" class="overview-status-ribbon security-status-ribbon" role="region" aria-label="Network Security Summary">
               <div class="status-ribbon-item">
                 <div class="status-ribbon-badge-group">
                   <span class="status-ribbon-label">Total Listening Ports</span>
@@ -1765,6 +1783,19 @@
                 <div class="status-ribbon-badge-group">
                   <span class="status-ribbon-label">Firewall State</span>
                   <span id="sec-firewall-status" class="status-badge status-unknown">UNKNOWN</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Active Sessions</span>
+                  <span id="sec-active-sessions-count" class="pill-counter">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Failed SSH / Banned</span>
+                  <span id="sec-failed-ssh-count" class="count-number count-warn">0</span>
+                  <span id="sec-banned-ips-count" class="status-badge status-danger" title="Banned IPs">0 Banned</span>
                 </div>
               </div>
             </div>
@@ -1848,6 +1879,115 @@
                       </tr>
                     </tbody>
                   </table>
+                </div>
+              </article>
+
+              <!-- Card 3: SSH Intrusion Detection & IP Ban Manager -->
+              <article class="card security-card" id="sec-ssh-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">SSH Intrusion &amp; IP Ban Manager</h3>
+                    <p class="card-subtitle">Brute-force detection, offending hosts, and instant UFW / Fail2ban IP blocking</p>
+                  </div>
+                  <div class="sec-card-actions">
+                    <span id="sec-fail2ban-badge" class="status-badge status-unknown">FAIL2BAN: CHECKING</span>
+                  </div>
+                </div>
+
+                <!-- Quick Manual IP Ban Bar -->
+                <div class="sec-manual-ban-bar">
+                  <div class="sec-manual-ban-input-wrap">
+                    <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
+                    </svg>
+                    <input
+                      id="sec-ban-ip-input"
+                      type="text"
+                      class="search-input sec-ban-input"
+                      placeholder="e.g., 203.0.113.50 or 198.51.100.0/24"
+                      aria-label="IP address or CIDR to ban"
+                    />
+                  </div>
+                  <button id="sec-ban-ip-btn" type="button" class="btn-danger-outline btn-sm sec-ban-submit-btn">
+                    Ban IP
+                  </button>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="sec-ssh-offenders-table">
+                    <thead>
+                      <tr>
+                        <th>Source IP</th>
+                        <th>Failed Attempts</th>
+                        <th>Targeted Users</th>
+                        <th>Last Seen</th>
+                        <th>Status</th>
+                        <th style="text-align: right;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="sec-ssh-offenders-tbody">
+                      <tr>
+                        <td colspan="6" class="empty-state">Scanning SSH authentication logs &amp; ban lists...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <!-- Card 4: Active Login Sessions & Recent Logins -->
+              <article class="card security-card" id="sec-sessions-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Active SSH / TTY Login Sessions</h3>
+                    <p class="card-subtitle">Currently connected interactive terminal sessions and recent auth events</p>
+                  </div>
+                  <div class="sec-card-actions">
+                    <span id="sec-sessions-badge" class="status-badge status-info">0 Active</span>
+                  </div>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="sec-sessions-table">
+                    <thead>
+                      <tr>
+                        <th>User</th>
+                        <th>Terminal (TTY)</th>
+                        <th>Source Host / IP</th>
+                        <th>PID</th>
+                        <th>Login Time</th>
+                      </tr>
+                    </thead>
+                    <tbody id="sec-sessions-tbody">
+                      <tr>
+                        <td colspan="5" class="empty-state">Checking active login sessions...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <div class="sec-recent-auth-section">
+                  <div class="sec-subsection-header">
+                    <h4 class="sec-subsection-title">Recent Failed Auth Events &amp; Login History</h4>
+                  </div>
+                  <div class="table-container sec-recent-auth-table-wrap">
+                    <table class="data-table" id="sec-recent-auth-table">
+                      <thead>
+                        <tr>
+                          <th>Time / Range</th>
+                          <th>Event</th>
+                          <th>User</th>
+                          <th>Source Host / IP</th>
+                          <th>Details</th>
+                        </tr>
+                      </thead>
+                      <tbody id="sec-recent-auth-tbody">
+                        <tr>
+                          <td colspan="5" class="empty-state">Loading recent authentication events...</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </article>
             </div>
@@ -2452,6 +2592,376 @@
             </div>
           </section>
         </div>
+
+        <!-- View Panel: Backups & Cron Scheduler (#view-backups) -->
+        <section id="view-backups" class="view-panel dashboard-view hidden" role="tabpanel" aria-labelledby="nav-tab-backups" aria-label="Backups and Cron Scheduler">
+          <div class="section-block">
+            <div class="section-header">
+              <div>
+                <h2 id="backups-heading" class="section-title">Backups &amp; Cron Scheduler</h2>
+                <p class="section-subtitle">Docker Compose Stack Folder Backups, Host Directory Archives &amp; Unified Vigil Cron Automation</p>
+              </div>
+              <div class="module-toolbar">
+                <span id="backups-last-updated" class="module-last-updated">--</span>
+                <button id="backups-refresh-btn" class="btn-module-refresh" type="button" aria-label="Refresh Backups and Cron" title="Refresh Backups &amp; Cron">
+                  <svg class="refresh-icon" viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="23 4 23 10 17 10"></polyline>
+                    <polyline points="1 20 1 14 7 14"></polyline>
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                  </svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- Top Summary Ribbon (#backups-summary-ribbon) -->
+            <div id="backups-summary-ribbon" class="overview-status-ribbon backups-status-ribbon" role="region" aria-label="Backups and Cron Summary">
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Total Archives</span>
+                  <span id="backups-total-archives" class="pill-counter">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Storage Used</span>
+                  <span id="backups-total-size" class="status-badge status-info">0 B</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Discovered Stack Folders</span>
+                  <span id="backups-stacks-count" class="count-number count-ok">0</span>
+                </div>
+              </div>
+              <div class="status-ribbon-item">
+                <div class="status-ribbon-badge-group">
+                  <span class="status-ribbon-label">Scheduled Cron Jobs</span>
+                  <span id="cron-active-jobs-count" class="status-badge status-ok">0 Active</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="backups-content-grid">
+              <!-- Section 1: Docker Stack & Host Directory Backup Manager (#backups-manager-card) -->
+              <article class="card backups-card" id="backups-manager-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Docker Stack &amp; Host Directory Backup Manager</h3>
+                    <p class="card-subtitle">Create compressed .tar.gz snapshots of Docker Compose stack folders or custom host directories</p>
+                  </div>
+                </div>
+
+                <!-- Quick Directory / Stack Backup & Target Creator Form (#backup-create-form) -->
+                <form id="backup-create-form" class="backups-form-panel" onsubmit="return false;">
+                  <div class="backups-form-grid">
+                    <div class="form-group">
+                      <label for="backup-target-type">Target Type</label>
+                      <select id="backup-target-type" class="module-interval-select full-width">
+                        <option value="stack">Docker Stack Folder</option>
+                        <option value="directory">Custom Host Directory</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group" id="backup-stack-select-group">
+                      <label for="backup-stack-select">Docker Compose Stack</label>
+                      <select id="backup-stack-select" class="module-interval-select full-width">
+                        <option value="">-- Select a discovered stack --</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label for="backup-source-path">Host Source Path</label>
+                      <input
+                        id="backup-source-path"
+                        type="text"
+                        class="mono-input"
+                        placeholder="/home/anthony/docker/plex or /home/anthony/appdata"
+                      />
+                    </div>
+
+                    <div class="form-group">
+                      <label for="backup-target-name">Backup Name / Label</label>
+                      <input
+                        id="backup-target-name"
+                        type="text"
+                        placeholder="e.g. plex or appdata"
+                      />
+                    </div>
+
+                    <div class="form-group">
+                      <label for="backup-excludes">Exclude Globs (comma-separated)</label>
+                      <input
+                        id="backup-excludes"
+                        type="text"
+                        class="mono-input"
+                        placeholder="*.log, cache/*, node_modules/*"
+                      />
+                    </div>
+
+                    <div class="form-group">
+                      <label for="backup-retain-count">Retention Count (Max Archives)</label>
+                      <input
+                        id="backup-retain-count"
+                        type="number"
+                        min="1"
+                        max="365"
+                        value="7"
+                      />
+                    </div>
+                  </div>
+
+                  <div class="backups-form-footer">
+                    <label class="checkbox-label" for="backup-stop-containers">
+                      <input type="checkbox" id="backup-stop-containers" />
+                      <span>Stop stack containers briefly during backup for consistent database state</span>
+                    </label>
+                    <div class="backups-form-actions">
+                      <button id="backup-save-target-btn" type="button" class="btn-secondary btn-sm">
+                        Save Target
+                      </button>
+                      <button id="backup-run-now-btn" type="button" class="btn-primary btn-sm">
+                        Run Backup Now
+                      </button>
+                    </div>
+                  </div>
+                </form>
+
+                <!-- Discovered Stack Folders & Saved Targets Table -->
+                <div class="backups-subsection">
+                  <div class="sec-subsection-header">
+                    <h4 class="sec-subsection-title">Discovered Stack Folders &amp; Saved Targets</h4>
+                  </div>
+                  <div class="table-container">
+                    <table class="data-table" id="backup-targets-table">
+                      <thead>
+                        <tr>
+                          <th>Type</th>
+                          <th>Name / Stack</th>
+                          <th>Host Directory Path</th>
+                          <th>Details / Options</th>
+                          <th style="text-align: right;">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody id="backup-targets-tbody">
+                        <tr>
+                          <td colspan="5" class="empty-state">Loading discovered Docker stack folders and saved targets...</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </article>
+
+              <!-- Section 2: Backup Archives Browser (#backup-archives-card) -->
+              <article class="card backups-card" id="backup-archives-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Backup Archives Browser</h3>
+                    <p class="card-subtitle">Download, verify SHA-256 checksums, restore, or prune completed backup archives</p>
+                  </div>
+                  <div class="sec-card-actions">
+                    <span id="backup-dir-badge" class="status-badge status-info mono-text" title="Host Backup Storage Directory">~/.vigil/backups</span>
+                  </div>
+                </div>
+
+                <div class="table-container">
+                  <table class="data-table" id="backup-archives-table">
+                    <thead>
+                      <tr>
+                        <th>Archive Filename</th>
+                        <th>Type / Target</th>
+                        <th>Source Path</th>
+                        <th>Size &amp; Files</th>
+                        <th>Created</th>
+                        <th>SHA-256</th>
+                        <th style="text-align: right;">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="backup-archives-tbody">
+                      <tr>
+                        <td colspan="7" class="empty-state">Loading backup archives...</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </article>
+
+              <!-- Section 3: Unified Vigil Cron Scheduler (#cron-scheduler-card) -->
+              <article class="card backups-card" id="cron-scheduler-card">
+                <div class="card-header">
+                  <div>
+                    <h3 class="card-title">Unified Vigil Cron Scheduler</h3>
+                    <p class="card-subtitle">Schedule automated stack/directory backups, health digests, Docker pruning, S.M.A.R.T. checks, and APT refreshes</p>
+                  </div>
+                </div>
+
+                <!-- Create / Edit Cron Job Form (#cron-job-form) -->
+                <form id="cron-job-form" class="backups-form-panel" onsubmit="return false;">
+                  <div class="backups-form-grid">
+                    <div class="form-group">
+                      <label for="cron-job-name">Job Name</label>
+                      <input
+                        id="cron-job-name"
+                        type="text"
+                        placeholder="e.g. Nightly Plex Backup or Weekly Docker Prune"
+                        required
+                      />
+                    </div>
+
+                    <div class="form-group">
+                      <label for="cron-task-type">Task Type</label>
+                      <select id="cron-task-type" class="module-interval-select full-width">
+                        <option value="backup.stack">Docker Stack Backup</option>
+                        <option value="backup.directory">Host Directory Backup</option>
+                        <option value="notifications.summary">System Health Digest Notification</option>
+                        <option value="docker.prune">Docker Resource Prune</option>
+                        <option value="packages.refresh">APT Package Cache Refresh</option>
+                        <option value="storage.smart_check">Storage S.M.A.R.T. &amp; RAID Health Check</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label for="cron-preset-select">Schedule Preset</label>
+                      <select id="cron-preset-select" class="module-interval-select full-width">
+                        <option value="custom">Custom Cron Expression</option>
+                        <option value="0 * * * *">Every Hour (0 * * * *)</option>
+                        <option value="0 2 * * *" selected>Daily at 02:00 (0 2 * * *)</option>
+                        <option value="0 4 * * *">Daily at 04:00 (0 4 * * *)</option>
+                        <option value="0 3 * * 0">Weekly Sunday 03:00 (0 3 * * 0)</option>
+                        <option value="0 1 1 * *">Monthly 1st 01:00 (0 1 1 * *)</option>
+                      </select>
+                    </div>
+
+                    <div class="form-group">
+                      <label for="cron-expression-input">Cron Expression (min hr dom mon dow)</label>
+                      <input
+                        id="cron-expression-input"
+                        type="text"
+                        class="mono-input"
+                        value="0 2 * * *"
+                        placeholder="0 2 * * *"
+                        required
+                      />
+                    </div>
+
+                    <!-- Dynamic Task Configuration Fields -->
+                    <div class="form-group" id="cron-config-stack-group">
+                      <label for="cron-config-stack-name">Target Stack Name (or 'all')</label>
+                      <input
+                        id="cron-config-stack-name"
+                        type="text"
+                        class="mono-input"
+                        value="all"
+                        placeholder="all or stack name (e.g. plex)"
+                      />
+                    </div>
+
+                    <div class="form-group hidden" id="cron-config-path-group">
+                      <label for="cron-config-source-path">Directory Source Path</label>
+                      <input
+                        id="cron-config-source-path"
+                        type="text"
+                        class="mono-input"
+                        placeholder="/home/anthony/appdata"
+                      />
+                    </div>
+
+                    <div class="form-group" id="cron-config-retain-group">
+                      <label for="cron-config-retain-count">Retention Count</label>
+                      <input
+                        id="cron-config-retain-count"
+                        type="number"
+                        min="1"
+                        max="365"
+                        value="7"
+                      />
+                    </div>
+                  </div>
+
+                  <div class="backups-form-footer">
+                    <div class="cron-checkbox-row">
+                      <label class="checkbox-label" id="cron-config-stop-group" for="cron-config-stop-containers">
+                        <input type="checkbox" id="cron-config-stop-containers" />
+                        <span>Stop stack containers during backup</span>
+                      </label>
+                      <label class="checkbox-label hidden" id="cron-config-prune-group" for="cron-config-prune-volumes">
+                        <input type="checkbox" id="cron-config-prune-volumes" />
+                        <span>Prune unused volumes</span>
+                      </label>
+                      <label class="checkbox-label" for="cron-notify-failure">
+                        <input type="checkbox" id="cron-notify-failure" checked />
+                        <span>Notify on Failure</span>
+                      </label>
+                      <label class="checkbox-label" for="cron-notify-success">
+                        <input type="checkbox" id="cron-notify-success" />
+                        <span>Notify on Success</span>
+                      </label>
+                    </div>
+                    <div class="backups-form-actions">
+                      <button id="cron-save-job-btn" type="submit" class="btn-primary btn-sm">
+                        Save Scheduled Job
+                      </button>
+                    </div>
+                  </div>
+                </form>
+
+                <!-- Configured Cron Jobs Table -->
+                <div class="backups-subsection">
+                  <div class="sec-subsection-header">
+                    <h4 class="sec-subsection-title">Configured Scheduled Jobs</h4>
+                  </div>
+                  <div class="table-container">
+                    <table class="data-table" id="cron-jobs-table">
+                      <thead>
+                        <tr>
+                          <th>Job Name</th>
+                          <th>Task Type &amp; Target</th>
+                          <th>Schedule (Cron)</th>
+                          <th>Next Run</th>
+                          <th>Last Run &amp; Status</th>
+                          <th>Enabled</th>
+                          <th style="text-align: right;">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody id="cron-jobs-tbody">
+                        <tr>
+                          <td colspan="7" class="empty-state">Loading scheduled cron jobs...</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <!-- Recent Cron Execution Log Table -->
+                <div class="backups-subsection">
+                  <div class="sec-subsection-header">
+                    <h4 class="sec-subsection-title">Recent Cron Execution Log</h4>
+                  </div>
+                  <div class="table-container">
+                    <table class="data-table" id="cron-runs-table">
+                      <thead>
+                        <tr>
+                          <th>Job</th>
+                          <th>Task Type</th>
+                          <th>Trigger</th>
+                          <th>Started</th>
+                          <th>Duration</th>
+                          <th>Status</th>
+                          <th>Output</th>
+                        </tr>
+                      </thead>
+                      <tbody id="cron-runs-tbody">
+                        <tr>
+                          <td colspan="7" class="empty-state">No recent cron job executions recorded.</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
+        </section>
       </div>
     </main>
   </div>
