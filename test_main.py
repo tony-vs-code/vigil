@@ -12478,5 +12478,235 @@ console.log("ALL_NODE_TERMINAL_VM_CHECKS_PASSED");
         self.assertIn("ALL_NODE_TERMINAL_VM_CHECKS_PASSED", res.stdout)
 
 
+class DockerActionsDropdownFrontendTests(unittest.TestCase):
+    """Validation tests for the streamlined Actions column with Primary Quick Actions + '⋯' Dropdown."""
+
+    def test_actions_dropdown_css_and_js_contracts(self):
+        root = Path(__file__).parent
+        css_path = root / "static" / "styles.css"
+        js_path = root / "static" / "app.js"
+
+        self.assertTrue(css_path.exists(), "static/styles.css does not exist")
+        self.assertTrue(js_path.exists(), "static/app.js does not exist")
+
+        css = css_path.read_text(encoding="utf-8")
+        js = js_path.read_text(encoding="utf-8")
+
+        # Required CSS selectors
+        required_css = [
+            ".actions-dropdown",
+            ".btn-action-more",
+            ".actions-dropdown-menu",
+            ".actions-dropdown-menu.show",
+            ".actions-dropdown-item",
+            ".actions-dropdown-item:hover",
+            ".actions-dropdown-item.danger",
+            ".actions-dropdown-item.danger:hover",
+            ".actions-dropdown-divider",
+        ]
+        for sel in required_css:
+            self.assertIn(sel, css, f"Missing CSS selector '{sel}' in static/styles.css")
+
+        # Required JS contracts
+        required_js = [
+            "function closeAllActionsDropdowns(",
+            "function initActionsDropdowns(",
+            "function renderDockerStacks(",
+            "function renderDockerContainers(",
+            ".actions-dropdown-menu.show",
+            "btn-action-more",
+            "actions-dropdown-item",
+            "actions-dropdown-divider",
+        ]
+        for item in required_js:
+            self.assertIn(item, js, f"Missing JS element or function '{item}' in static/app.js")
+
+    def test_actions_dropdown_rendering_and_behavior_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+
+// Minimal DOM simulation for Node VM test
+const listeners = {{}};
+global.document = {{
+  listeners: {{}},
+  addEventListener(event, fn) {{
+    if (!this.listeners[event]) this.listeners[event] = [];
+    this.listeners[event].push(fn);
+  }},
+  querySelectorAll(sel) {{
+    if (sel === '.actions-dropdown-menu.show') {{
+      return global.openMenus || [];
+    }}
+    return [];
+  }},
+  getElementById(id) {{
+    if (!global.elements) global.elements = {{}};
+    if (!global.elements[id]) {{
+      global.elements[id] = {{
+        id: id,
+        innerHTML: '',
+        children: [],
+        value: '',
+        querySelectorAll(s) {{ return []; }}
+      }};
+    }}
+    return global.elements[id];
+  }}
+}};
+global.window = {{
+  addEventListener() {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+
+// Load script in a function wrapper with mocked environment
+const vm = require('vm');
+const ctx = vm.createContext({{
+  document: global.document,
+  window: global.window,
+  localStorage: {{ getItem() {{ return null; }}, setItem() {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+// Test 1: Stacks rendering for running vs stopped
+const mockStacks = [
+  {{ name: "web-stack", status: "running", running_count: 2, containers_count: 2, managed: true }},
+  {{ name: "db-stack", status: "stopped", running_count: 0, containers_count: 1, managed: true }},
+  {{ name: "ext-stack", status: "running", running_count: 1, containers_count: 1, managed: false }}
+];
+
+ctx.cachedDockerStacks = mockStacks;
+ctx.renderDockerStacks(mockStacks);
+const stacksHtml = ctx.document.getElementById("docker-stacks-tbody").innerHTML;
+
+// Verify Running stack buttons
+if (!stacksHtml.includes('data-stack-action="restart" data-stack="web-stack">Restart</button>')) {{
+  throw new Error("Missing visible Restart button for running stack");
+}}
+if (!stacksHtml.includes('data-stack-action="edit" data-stack="web-stack">Edit</button>')) {{
+  throw new Error("Missing visible Edit button for running stack");
+}}
+if (!stacksHtml.includes('data-stack-action="stop" data-stack="web-stack">Stop</button>')) {{
+  throw new Error("Missing dropdown Stop button for running stack");
+}}
+if (!stacksHtml.includes('data-stack-action="pull" data-stack="web-stack">Pull</button>')) {{
+  throw new Error("Missing dropdown Pull button for running stack");
+}}
+if (!stacksHtml.includes('data-stack-action="down" data-stack="web-stack">Down</button>')) {{
+  throw new Error("Missing dropdown Down button for running stack");
+}}
+if (!stacksHtml.includes('data-stack-action="delete" data-stack="web-stack">Delete</button>')) {{
+  throw new Error("Missing dropdown Delete button for running stack");
+}}
+
+// Verify Stopped stack buttons
+if (!stacksHtml.includes('data-stack-action="start" data-stack="db-stack">Start</button>')) {{
+  throw new Error("Missing visible Start button for stopped stack");
+}}
+if (!stacksHtml.includes('data-stack-action="edit" data-stack="db-stack">Edit</button>')) {{
+  throw new Error("Missing visible Edit button for stopped stack");
+}}
+if (!stacksHtml.includes('data-stack-action="pull" data-stack="db-stack">Pull</button>')) {{
+  throw new Error("Missing dropdown Pull button for stopped stack");
+}}
+if (!stacksHtml.includes('data-stack-action="down" data-stack="db-stack">Down</button>')) {{
+  throw new Error("Missing dropdown Down button for stopped stack");
+}}
+if (!stacksHtml.includes('data-stack-action="delete" data-stack="db-stack">Delete</button>')) {{
+  throw new Error("Missing dropdown Delete button for stopped stack");
+}}
+
+// Verify External stack read-only protection
+if (!stacksHtml.includes("Read-Only (External)")) {{
+  throw new Error("Missing external stack read-only label");
+}}
+
+// Test 2: Containers rendering for running, stopped, paused
+const mockContainers = [
+  {{ id: "c_run1", name: "app-server", state: "running", status: "Up 2 hours", ports: "80:80", stack: "web-stack" }},
+  {{ id: "c_stop1", name: "batch-worker", state: "exited", status: "Exited (0)", ports: "", stack: "" }},
+  {{ id: "c_pause1", name: "cache-redis", state: "paused", status: "Up (Paused)", ports: "6379:6379", stack: "" }}
+];
+
+ctx.renderDockerContainers(null, mockContainers);
+const containersHtml = ctx.document.getElementById("docker-containers-tbody").innerHTML;
+
+// Verify Running container buttons
+if (!containersHtml.includes('data-c-action="restart" data-cid="c_run1">Restart</button>')) {{
+  throw new Error("Missing visible Restart button for running container");
+}}
+if (!containersHtml.includes('data-c-action="logs" data-cid="c_run1"')) {{
+  throw new Error("Missing visible Logs button for running container");
+}}
+if (!containersHtml.includes('data-terminal-container-id="c_run1"')) {{
+  throw new Error("Missing visible Terminal button for running container");
+}}
+if (!containersHtml.includes('data-c-action="stop" data-cid="c_run1">Stop</button>')) {{
+  throw new Error("Missing dropdown Stop button for running container");
+}}
+if (!containersHtml.includes('data-c-action="pause" data-cid="c_run1">Pause</button>')) {{
+  throw new Error("Missing dropdown Pause button for running container");
+}}
+if (!containersHtml.includes('data-c-action="remove" data-cid="c_run1"')) {{
+  throw new Error("Missing dropdown Remove button for running container");
+}}
+
+// Verify Stopped container buttons
+if (!containersHtml.includes('data-c-action="start" data-cid="c_stop1">Start</button>')) {{
+  throw new Error("Missing visible Start button for stopped container");
+}}
+if (!containersHtml.includes('data-c-action="logs" data-cid="c_stop1"')) {{
+  throw new Error("Missing visible Logs button for stopped container");
+}}
+// Terminal is in dropdown for stopped container
+if (!containersHtml.includes('actions-dropdown-item btn-terminal" data-c-action="terminal" data-terminal-container-id="c_stop1"')) {{
+  throw new Error("Missing dropdown Terminal button for stopped container");
+}}
+
+// Verify Paused container buttons
+if (!containersHtml.includes('data-c-action="unpause" data-cid="c_pause1">Unpause</button>')) {{
+  throw new Error("Missing visible Unpause button for paused container");
+}}
+if (!containersHtml.includes('data-c-action="stop" data-cid="c_pause1">Stop</button>')) {{
+  throw new Error("Missing dropdown Stop button for paused container");
+}}
+
+// Test 3: Dropdown close helpers
+let closed = false;
+global.openMenus = [{{
+  classList: {{
+    remove(cls) {{
+      if (cls === 'show') closed = true;
+    }}
+  }}
+}}];
+
+ctx.closeAllActionsDropdowns();
+if (!closed) {{
+  throw new Error("closeAllActionsDropdowns failed to remove 'show' class");
+}}
+
+console.log("ALL_NODE_ACTIONS_DROPDOWN_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_ACTIONS_DROPDOWN_VM_CHECKS_PASSED", res.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

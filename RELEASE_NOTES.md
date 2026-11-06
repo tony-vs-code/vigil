@@ -1,26 +1,25 @@
-# Release v1.0.30: Docker Web Terminal Encoding & Glyph Rendering Fixes
+# Release v1.0.31: Streamlined Docker Actions & Quick Dropdown Menus
 
 ## Overview
-Vigil v1.0.30 addresses terminal character encoding and ANSI control sequence rendering defects in the In-Browser Docker Container Web Terminal. By setting standardized modern terminal environment variables on the backend, implementing stateful multi-byte UTF-8 stream decoding on the frontend, gracefully filtering unsupported control characters and C1 codes, and implementing DEC private mode support (cursor visibility, alternate screen buffers, bracketed paste), interactive sessions now render clean, crisp typography, Box Drawing characters, and emojis with zero visual corruption or replacement glyphs (`[?]`).
+Vigil v1.0.31 streamlines the Actions columns for Docker Containers and Docker Stacks across the dashboard. By introducing prominent Primary Quick Actions (`Restart`/`Start`, `Logs`, `Terminal`, `Edit`) paired with an elegant, responsive "⋯" More dropdown for secondary and destructive operations (`Stop`, `Pause`, `Pull`, `Down`, `Remove`, `Delete`), container and stack management is significantly cleaner, prevents horizontal table bloating, and eliminates accidental destructive clicks.
 
 ## Highlights & Enhancements
 
-### 1. Robust Multi-Byte UTF-8 Streaming Decoder
-- **Stateful Text Decoding**: Integrated a persistent `TextDecoder("utf-8", { stream: true })` instance across WebSocket binary message frames. Multi-byte sequences split across TCP or WebSocket frame boundaries are now properly assembled without emitting replacement characters (`` / `[?]`).
-- **Control Character & C1 Code Sanitization**: Safely strips non-printable control characters, DEL (`0x7f`), and C1 control codes (`0x80-0x9f`) that could otherwise corrupt terminal buffer layouts.
+### 1. Streamlined Docker Containers Actions
+- **Primary Quick Actions**: High-frequency workflows remain 1-click accessible. Running containers show prominent `Restart`, `Logs`, and `Terminal` buttons; stopped containers provide instant `Start` and `Logs`; paused containers feature an immediate `Unpause` action.
+- **"⋯" More Dropdown Menu**: Secondary lifecycle actions (`Stop`, `Pause`, `Terminal` for stopped containers, and `Remove`) are consolidated inside a sleek popover dropdown menu.
+- **Accidental Deletion Protection**: Destructive operations like container removal (`Remove`) feature distinctive red danger styling (`actions-dropdown-item danger`) with confirmation dialogs.
 
-### 2. Standardized Terminal & UTF-8 Locale Environment
-- **Default Docker Exec Environment**: Configured `TERM=xterm-256color`, `COLORTERM=truecolor`, and `LANG=C.UTF-8` as default execution environment variables in Docker daemon exec sessions.
-- **Enhanced Locale Negotiation**: Ensures guest interactive programs (e.g. `htop`, `mc`, `zsh`, `tmux`) immediately detect UTF-8 and 24-bit TrueColor capability rather than degrading to ASCII or ISO-8859 fallback mode.
+### 2. Streamlined Docker Compose Stacks Actions
+- **Primary Quick Actions**: Active stacks feature direct `Restart` and `Edit` buttons, while stopped stacks display immediate `Start` and `Edit` actions. External/unmanaged compose stacks retain their protective `Read-Only (External)` safety badge.
+- **Unified Stack Dropdown**: Lifecycle and teardown operations (`Stop`, `Pull`, `Down`, `Delete`) are consolidated within the stack's "⋯" More dropdown menu.
+- **Contextual Destruction Styling**: Teardown (`Down`) and stack file deletion (`Delete`) operations are cleanly separated by a divider and styled with danger hover highlights.
 
-### 3. Extended DEC Private Mode Sequences & Buffer Controls
-- **Cursor Visibility Controls**: Added support for DEC private mode cursor show/hide sequences (`?25h` and `?25l`), dynamically synchronizing cursor rendering in the terminal DOM.
-- **Alternate Screen Buffer Handling**: Added alternate screen buffer transitions (`?1049h` / `?1049l`), allowing full-screen interactive programs like `nano` and `vi` to open in isolated buffers and cleanly restore the primary terminal screen upon exit.
-- **Bracketed Paste & Cursor Mode Compatibility**: Gracefully recognizes and ignores bracketed paste (`?2004h/l`) and application cursor key (`?1h/l`) mode toggles without leaking escape sequences to screen text.
-
-### 4. Monospace Typography & Grid Alignment Refinements
-- **Font Stack & Metric Consistency**: Updated `static/styles.css` with a dedicated modern monospace font stack (`ui-monospace`, `SFMono-Regular`, `Menlo`, `Monaco`, `Consolas`, `monospace`), explicit character line-height, and subpixel antialiasing to guarantee strict column alignment across all platforms.
+### 3. Accessible UX & Dismissal Lifecycle
+- **Click-Outside & Keyboard Dismissal**: Opening any dropdown registers automatic click-outside backdrop dismissal and Escape key listeners, closing all active action popovers instantly.
+- **Multi-Menu Mutual Exclusion**: Activating any dropdown automatically closes any other open dropdown menus across the dashboard.
+- **Dynamic Positioning & Elevated Contrast**: High-contrast, dark-mode elevated card styling (`box-shadow`, subtle borders, and hover micro-transitions) ensures consistent readability across compact viewport widths.
 
 ## Reliability & Fixes
-- **Cross-Tier Validation Gate**: 100% compliance across all 58 frontend API routes and 623 DOM element contracts with 0 errors.
-- **Comprehensive Test Suite**: All 243 unit, integration, and frontend Node VM tests passed successfully.
+- **Comprehensive Test Suite**: All 245 unit, integration, and frontend Node VM tests passed with 100% success.
+- **Node VM & DOM Contract Verification**: Verified complete HTML generation, DOM event contracts, and CSS selector validity across container states (`running`, `stopped`, `paused`) and stack configurations (`running`, `stopped`, `external`).
