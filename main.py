@@ -71,6 +71,10 @@ except ImportError:
     ZoneInfo = None  # type: ignore
 from typing import Any, Optional, Tuple, Union
 import re
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 REPO_DIR = Path(__file__).resolve().parent
 RAID_STATE_DB = Path(
@@ -359,8 +363,16 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
         "compose_yaml TEXT NOT NULL, "
         "status TEXT NOT NULL, "
         "created_at REAL NOT NULL, "
-        "updated_at REAL NOT NULL)"
+        "updated_at REAL NOT NULL, "
+        "env_content TEXT DEFAULT '')"
     )
+    docker_stacks_cols = {
+        row[1] for row in connection.execute("PRAGMA table_info(docker_stacks)")
+    }
+    if "env_content" not in docker_stacks_cols:
+        connection.execute(
+            "ALTER TABLE docker_stacks ADD COLUMN env_content TEXT DEFAULT ''"
+        )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS audit_logs ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -4228,6 +4240,254 @@ async def run_raid_check(force: bool = False) -> None:
                 logging.exception("Could not save RAID notification history to SQLite.")
 
 
+HOMELAB_APP_TEMPLATES: list[dict[str, Any]] = [
+    {
+        "id": "pihole",
+        "name": "Pi-hole",
+        "category": "Networking",
+        "description": "Network-wide ad blocking via local DNS sinkhole.",
+        "icon": "shield",
+        "default_ports": ["53:53/tcp", "53:53/udp", "80:80"],
+        "compose_yaml": """services:
+  pihole:
+    container_name: pihole
+    image: pihole/pihole:latest
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "80:80/tcp"
+    environment:
+      TZ: "UTC"
+      WEBPASSWORD: "${PIHOLE_PASSWORD:-changeme}"
+    volumes:
+      - ./etc-pihole:/etc/pihole
+      - ./etc-dnsmasq.d:/etc/dnsmasq.d
+    restart: unless-stopped
+""",
+        "env_content": "PIHOLE_PASSWORD=changeme\n",
+    },
+    {
+        "id": "uptime-kuma",
+        "name": "Uptime Kuma",
+        "category": "Monitoring",
+        "description": "Self-hosted uptime monitoring service with status pages and alerts.",
+        "icon": "activity",
+        "default_ports": ["3001:3001"],
+        "compose_yaml": """services:
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: uptime-kuma
+    volumes:
+      - uptime-kuma-data:/app/data
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+
+volumes:
+  uptime-kuma-data:
+""",
+        "env_content": "",
+    },
+    {
+        "id": "nginx-proxy-manager",
+        "name": "Nginx Proxy Manager",
+        "category": "Networking",
+        "description": "Expose web services easily and securely with automated SSL certificates.",
+        "icon": "globe",
+        "default_ports": ["80:80", "81:81", "443:443"],
+        "compose_yaml": """services:
+  app:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "81:81"
+      - "443:443"
+    volumes:
+      - ./npm-data:/data
+      - ./npm-letsencrypt:/etc/letsencrypt
+""",
+        "env_content": "",
+    },
+    {
+        "id": "vaultwarden",
+        "name": "Vaultwarden",
+        "category": "Security",
+        "description": "Lightweight Bitwarden-compatible password and secrets manager.",
+        "icon": "lock",
+        "default_ports": ["8080:80"],
+        "compose_yaml": """services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    environment:
+      SIGNUPS_ALLOWED: "${SIGNUPS_ALLOWED:-true}"
+    volumes:
+      - ./vw-data:/data
+    ports:
+      - "8080:80"
+""",
+        "env_content": "SIGNUPS_ALLOWED=true\n",
+    },
+    {
+        "id": "jellyfin",
+        "name": "Jellyfin",
+        "category": "Media",
+        "description": "The Free Software Media System for movies, TV shows, and music streaming.",
+        "icon": "film",
+        "default_ports": ["8096:8096"],
+        "compose_yaml": """services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    container_name: jellyfin
+    restart: unless-stopped
+    ports:
+      - "8096:8096"
+    volumes:
+      - ./jellyfin-config:/config
+      - ./jellyfin-cache:/cache
+      - ./media:/media
+""",
+        "env_content": "",
+    },
+    {
+        "id": "home-assistant",
+        "name": "Home Assistant",
+        "category": "Automation",
+        "description": "Open source home automation putting local control and privacy first.",
+        "icon": "home",
+        "default_ports": ["8123:8123"],
+        "compose_yaml": """services:
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    volumes:
+      - ./ha-config:/config
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+    ports:
+      - "8123:8123"
+""",
+        "env_content": "",
+    },
+    {
+        "id": "portainer-ce",
+        "name": "Portainer CE",
+        "category": "Management",
+        "description": "Definitive web-based container management GUI for Docker.",
+        "icon": "server",
+        "default_ports": ["9000:9000", "9443:9443"],
+        "compose_yaml": """services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+
+volumes:
+  portainer_data:
+""",
+        "env_content": "",
+    },
+    {
+        "id": "dozzle",
+        "name": "Dozzle",
+        "category": "Monitoring",
+        "description": "Real-time lightweight web log viewer and stats monitor for Docker containers.",
+        "icon": "terminal",
+        "default_ports": ["8888:8080"],
+        "compose_yaml": """services:
+  dozzle:
+    container_name: dozzle
+    image: amir20/dozzle:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8888:8080"
+    restart: unless-stopped
+""",
+        "env_content": "",
+    },
+    {
+        "id": "redis",
+        "name": "Redis",
+        "category": "Database",
+        "description": "High-performance in-memory key-value data store, cache, and broker.",
+        "icon": "database",
+        "default_ports": ["6379:6379"],
+        "compose_yaml": """services:
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+""",
+        "env_content": "",
+    },
+    {
+        "id": "postgresql",
+        "name": "PostgreSQL",
+        "category": "Database",
+        "description": "Powerful open source object-relational database with env configuration.",
+        "icon": "database",
+        "default_ports": ["5432:5432"],
+        "compose_yaml": """services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-homelab}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+""",
+        "env_content": "POSTGRES_USER=postgres\nPOSTGRES_PASSWORD=postgres\nPOSTGRES_DB=homelab\n",
+    },
+    {
+        "id": "glances",
+        "name": "Glances",
+        "category": "Monitoring",
+        "description": "Cross-platform system and container monitoring tool with web UI.",
+        "icon": "activity",
+        "default_ports": ["61208:61208"],
+        "compose_yaml": """services:
+  glances:
+    image: nicolargo/glances:latest
+    container_name: glances
+    restart: unless-stopped
+    pid: host
+    environment:
+      GLANCES_OPT: "-w"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "61208:61208"
+""",
+        "env_content": "",
+    },
+]
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """HTTPConnection over a local Unix domain socket."""
 
@@ -4958,7 +5218,7 @@ class DockerManager:
             connection = _connect_state_db()
             try:
                 rows = connection.execute(
-                    "SELECT name, compose_yaml, status, created_at, updated_at "
+                    "SELECT name, compose_yaml, status, created_at, updated_at, env_content "
                     "FROM docker_stacks ORDER BY name ASC"
                 ).fetchall()
                 for r in rows:
@@ -4968,8 +5228,15 @@ class DockerManager:
                         "status": r[2],
                         "created_at": float(r[3]),
                         "updated_at": float(r[4]),
+                        "env_content": r[5] if len(r) > 5 and r[5] is not None else "",
                         "managed": True,
                     }
+                    env_file = self.stacks_dir / r[0] / ".env"
+                    if not managed_stacks[r[0]]["env_content"] and env_file.is_file():
+                        try:
+                            managed_stacks[r[0]]["env_content"] = env_file.read_text(encoding="utf-8")
+                        except OSError:
+                            pass
             finally:
                 connection.close()
         except (OSError, sqlite3.Error):
@@ -5021,6 +5288,7 @@ class DockerManager:
                 "running_count": run_cnt,
                 "created_at": m_info["created_at"],
                 "updated_at": m_info["updated_at"],
+                "env_content": m_info.get("env_content", ""),
             }
 
         for name, p_info in compose_projects.items():
@@ -5037,6 +5305,7 @@ class DockerManager:
                     "running_count": run_cnt,
                     "created_at": 0.0,
                     "updated_at": 0.0,
+                    "env_content": "",
                 }
 
         return sorted(list(combined.values()), key=lambda s: s["name"])
@@ -5084,6 +5353,172 @@ class DockerManager:
 
         return False
 
+    def get_templates(self) -> list[dict[str, Any]]:
+        """Returns the curated list of self-hosted homelab app templates."""
+        return copy.deepcopy(HOMELAB_APP_TEMPLATES)
+
+    def validate_compose_yaml(self, compose_yaml: str) -> dict[str, Any]:
+        """Validates Docker Compose YAML structure, service definitions, ports, and volumes."""
+        if not compose_yaml or not str(compose_yaml).strip():
+            return {
+                "valid": False,
+                "errors": ["Compose YAML content cannot be empty."],
+            }
+
+        try:
+            if yaml is not None:
+                parsed = yaml.safe_load(compose_yaml)
+            else:
+                return {
+                    "valid": False,
+                    "errors": ["YAML parser engine unavailable."],
+                }
+        except yaml.YAMLError as exc:
+            return {
+                "valid": False,
+                "errors": [f"Invalid YAML syntax: {exc}"],
+            }
+        except Exception as exc:
+            return {
+                "valid": False,
+                "errors": [f"Failed to parse Compose YAML: {exc}"],
+            }
+
+        if not isinstance(parsed, dict):
+            return {
+                "valid": False,
+                "errors": ["Compose file must be a YAML mapping/dictionary."],
+            }
+
+        if "services" not in parsed:
+            return {
+                "valid": False,
+                "errors": ["Missing root 'services' dictionary."],
+            }
+
+        services_dict = parsed.get("services")
+        if not isinstance(services_dict, dict):
+            return {
+                "valid": False,
+                "errors": ["'services' must be a mapping/dictionary of service names."],
+            }
+
+        service_names: list[str] = []
+        image_tags: list[str] = []
+        ports: list[str] = []
+        volumes: list[str] = []
+        warnings: list[str] = []
+        service_details: list[dict[str, Any]] = []
+
+        if len(services_dict) == 0:
+            warnings.append("No services defined under 'services'.")
+
+        top_volumes = parsed.get("volumes")
+        if isinstance(top_volumes, dict):
+            for v_name in top_volumes.keys():
+                v_str = str(v_name).strip()
+                if v_str and v_str not in volumes:
+                    volumes.append(v_str)
+
+        for svc_name, svc_conf in services_dict.items():
+            s_name = str(svc_name).strip()
+            service_names.append(s_name)
+
+            svc_img = None
+            svc_ports: list[str] = []
+            svc_vols: list[str] = []
+
+            if not isinstance(svc_conf, dict):
+                warnings.append(
+                    f"Service '{s_name}' is not configured as a mapping/dictionary."
+                )
+                service_details.append(
+                    {
+                        "name": s_name,
+                        "image": None,
+                        "ports": [],
+                        "volumes": [],
+                    }
+                )
+                continue
+
+            # Image
+            if "image" in svc_conf and svc_conf["image"]:
+                svc_img = str(svc_conf["image"]).strip()
+                if svc_img not in image_tags:
+                    image_tags.append(svc_img)
+            elif "build" in svc_conf:
+                svc_img = "[build context]"
+            else:
+                warnings.append(f"Service '{s_name}' does not specify an image or build.")
+
+            # Ports
+            raw_ports = svc_conf.get("ports", [])
+            if isinstance(raw_ports, list):
+                for p in raw_ports:
+                    if isinstance(p, (str, int)):
+                        p_str = str(p).strip()
+                        if p_str and p_str not in ports:
+                            ports.append(p_str)
+                        svc_ports.append(p_str)
+                    elif isinstance(p, dict):
+                        target = p.get("target")
+                        pub = p.get("published", target)
+                        proto = p.get("protocol", "tcp")
+                        p_repr = f"{pub}:{target}/{proto}" if pub and target else str(p)
+                        if p_repr not in ports:
+                            ports.append(p_repr)
+                        svc_ports.append(p_repr)
+            elif isinstance(raw_ports, (str, int)):
+                p_str = str(raw_ports).strip()
+                if p_str and p_str not in ports:
+                    ports.append(p_str)
+                svc_ports.append(p_str)
+
+            # Volumes
+            raw_vols = svc_conf.get("volumes", [])
+            if isinstance(raw_vols, list):
+                for v in raw_vols:
+                    if isinstance(v, str):
+                        v_str = v.strip()
+                        svc_vols.append(v_str)
+                        v_name = v_str.split(":")[0].strip()
+                        if (
+                            v_name
+                            and v_name not in volumes
+                            and not v_name.startswith((".", "/", "~"))
+                        ):
+                            volumes.append(v_name)
+                    elif isinstance(v, dict):
+                        src = str(v.get("source") or "").strip()
+                        svc_vols.append(src if src else str(v))
+                        if (
+                            src
+                            and src not in volumes
+                            and not src.startswith((".", "/", "~"))
+                        ):
+                            volumes.append(src)
+
+            service_details.append(
+                {
+                    "name": s_name,
+                    "image": svc_img,
+                    "ports": svc_ports,
+                    "volumes": svc_vols,
+                }
+            )
+
+        return {
+            "valid": True,
+            "services": service_names,
+            "ports": ports,
+            "volumes": volumes,
+            "warnings": warnings,
+            "image_tags": image_tags,
+            "images": image_tags,
+            "service_details": service_details,
+        }
+
     def get_stack(self, name: str) -> Optional[dict[str, Any]]:
         clean_name = name.strip()
         managed_row = None
@@ -5091,7 +5526,7 @@ class DockerManager:
             connection = _connect_state_db()
             try:
                 managed_row = connection.execute(
-                    "SELECT name, compose_yaml, status, created_at, updated_at "
+                    "SELECT name, compose_yaml, status, created_at, updated_at, env_content "
                     "FROM docker_stacks WHERE name = ?",
                     (clean_name,),
                 ).fetchone()
@@ -5101,6 +5536,7 @@ class DockerManager:
             pass
 
         stack_file = self.stacks_dir / clean_name / "docker-compose.yml"
+        env_file = self.stacks_dir / clean_name / ".env"
         all_containers = self.list_containers(all=True) if self.is_running() else []
         constituent = [c for c in all_containers if c.get("stack") == clean_name]
 
@@ -5109,6 +5545,14 @@ class DockerManager:
             if not compose_yaml and stack_file.is_file():
                 try:
                     compose_yaml = stack_file.read_text(encoding="utf-8")
+                except OSError:
+                    pass
+            env_content = ""
+            if len(managed_row) > 5 and managed_row[5] is not None:
+                env_content = str(managed_row[5])
+            if not env_content and env_file.is_file():
+                try:
+                    env_content = env_file.read_text(encoding="utf-8")
                 except OSError:
                     pass
             status = managed_row[2]
@@ -5121,6 +5565,7 @@ class DockerManager:
             return {
                 "name": clean_name,
                 "compose_yaml": compose_yaml,
+                "env_content": env_content,
                 "status": status,
                 "managed": True,
                 "created_at": float(managed_row[3]),
@@ -5139,6 +5584,7 @@ class DockerManager:
                             item.get("ConfigFiles") or item.get("configFiles") or ""
                         )
                         compose_yaml = ""
+                        env_content = ""
                         if config_files:
                             first_file = Path(config_files.split(",")[0].strip())
                             if first_file.is_file():
@@ -5146,9 +5592,21 @@ class DockerManager:
                                     compose_yaml = first_file.read_text(encoding="utf-8")
                                 except OSError:
                                     pass
+                                ext_env = first_file.parent / ".env"
+                                if ext_env.is_file():
+                                    try:
+                                        env_content = ext_env.read_text(encoding="utf-8")
+                                    except OSError:
+                                        pass
+                        if not env_content and env_file.is_file():
+                            try:
+                                env_content = env_file.read_text(encoding="utf-8")
+                            except OSError:
+                                pass
                         return {
                             "name": clean_name,
                             "compose_yaml": compose_yaml,
+                            "env_content": env_content,
                             "status": item.get("Status") or "running",
                             "managed": False,
                             "created_at": 0.0,
@@ -5164,6 +5622,7 @@ class DockerManager:
         self,
         name: str,
         compose_yaml: str,
+        env_content: Optional[str] = None,
         deploy: bool = True,
     ) -> dict[str, Any]:
         clean_name = name.strip()
@@ -5185,6 +5644,20 @@ class DockerManager:
         stack_file = stack_dir / "docker-compose.yml"
         stack_file.write_text(compose_yaml, encoding="utf-8")
 
+        env_file = stack_dir / ".env"
+        saved_env = ""
+        if env_content is not None:
+            saved_env = str(env_content)
+            try:
+                env_file.write_text(saved_env, encoding="utf-8")
+            except OSError:
+                pass
+        elif env_file.is_file():
+            try:
+                saved_env = env_file.read_text(encoding="utf-8")
+            except OSError:
+                pass
+
         status = "saved"
         if deploy:
             if not self.is_running():
@@ -5198,14 +5671,17 @@ class DockerManager:
         connection = _connect_state_db()
         try:
             row = connection.execute(
-                "SELECT created_at FROM docker_stacks WHERE name = ?", (clean_name,)
+                "SELECT created_at, env_content FROM docker_stacks WHERE name = ?", (clean_name,)
             ).fetchone()
             created_at = float(row[0]) if row else now
+            if env_content is None and row and len(row) > 1 and row[1]:
+                saved_env = str(row[1])
+
             connection.execute(
                 "INSERT OR REPLACE INTO docker_stacks "
-                "(name, compose_yaml, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (clean_name, compose_yaml, status, created_at, now),
+                "(name, compose_yaml, status, created_at, updated_at, env_content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (clean_name, compose_yaml, status, created_at, now, saved_env),
             )
             connection.commit()
         finally:
@@ -5219,6 +5695,7 @@ class DockerManager:
             else {
                 "name": clean_name,
                 "compose_yaml": compose_yaml,
+                "env_content": saved_env,
                 "status": status,
                 "managed": True,
                 "created_at": created_at,
@@ -6378,6 +6855,8 @@ install_docker = docker_manager.install_docker
 list_docker_stacks = docker_manager.list_stacks
 get_docker_stack = docker_manager.get_stack
 save_docker_stack = docker_manager.save_stack
+get_docker_templates = docker_manager.get_templates
+validate_compose_yaml = docker_manager.validate_compose_yaml
 execute_docker_stack_action = docker_manager.execute_stack_action
 delete_docker_stack = docker_manager.delete_stack
 list_docker_containers = docker_manager.list_containers

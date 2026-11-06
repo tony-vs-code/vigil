@@ -57,6 +57,9 @@ let cachedDockerContainers = [];
 let cachedDockerStacks = [];
 let cachedDockerVolumes = [];
 let cachedDockerUpdates = null;
+let cachedAppTemplates = [];
+let currentAppCatalogCategory = "All";
+let activeStackEditorTab = "compose";
 let cachedStorageDisks = null;
 
 const MEMORY_HISTORY_LIMIT = 30;
@@ -6935,17 +6938,135 @@ async function handleDeleteStack(stackName) {
 }
 
 /**
+ * Switch Stack Editor tabs: 'compose' or 'env'.
+ */
+function switchStackEditorTab(tabName) {
+  activeStackEditorTab = tabName;
+  const tabBtnCompose = document.getElementById("tab-btn-compose");
+  const tabBtnEnv = document.getElementById("tab-btn-env");
+  const panelCompose = document.getElementById("editor-tab-panel-compose");
+  const panelEnv = document.getElementById("editor-tab-panel-env");
+
+  if (tabName === "env") {
+    tabBtnCompose?.classList.remove("active");
+    tabBtnEnv?.classList.add("active");
+    panelCompose?.classList.add("hidden");
+    panelEnv?.classList.remove("hidden");
+  } else {
+    tabBtnCompose?.classList.add("active");
+    tabBtnEnv?.classList.remove("active");
+    panelCompose?.classList.remove("hidden");
+    panelEnv?.classList.add("hidden");
+  }
+}
+
+/**
+ * Validate Docker Compose YAML structure and ports via POST /api/docker/stacks/validate.
+ */
+async function validateStackYaml(overrideYaml = null) {
+  const yamlInput = document.getElementById("stack-yaml-input");
+  const statusBox = document.getElementById("stack-validation-status");
+  if (!statusBox) return;
+
+  const yamlContent = overrideYaml !== null ? overrideYaml : (yamlInput?.value || "");
+  if (!yamlContent.trim()) {
+    statusBox.className = "validation-status-box";
+    statusBox.innerHTML = `
+      <div class="validation-header-row">
+        <span class="validation-badge-invalid">✕ Empty YAML</span>
+        <span class="validation-label">Compose YAML content cannot be empty.</span>
+      </div>`;
+    statusBox.classList.remove("hidden");
+    return;
+  }
+
+  statusBox.className = "validation-status-box";
+  statusBox.innerHTML = `<span class="validation-label">Validating YAML...</span>`;
+  statusBox.classList.remove("hidden");
+
+  try {
+    const resp = await apiFetch("/api/docker/stacks/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ compose_yaml: yamlContent }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.valid) {
+      const services = data.services || [];
+      const ports = data.ports || [];
+      const warnings = data.warnings || [];
+
+      let html = `
+        <div class="validation-header-row">
+          <span class="validation-badge-valid">✓ Valid Compose YAML</span>
+          <span class="validation-label">${services.length} service${services.length === 1 ? "" : "s"} detected</span>
+        </div>
+      `;
+
+      if (services.length > 0 || ports.length > 0) {
+        html += `<div class="validation-details-row">`;
+        if (services.length > 0) {
+          html +=
+            `<span class="validation-label">Services:</span> ` +
+            services.map((s) => `<span class="service-pill">${escapeHtml(s)}</span>`).join(" ");
+        }
+        if (ports.length > 0) {
+          html +=
+            `<span class="validation-label" style="margin-left:8px;">Ports:</span> ` +
+            ports.map((p) => `<span class="port-pill">${escapeHtml(p)}</span>`).join(" ");
+        }
+        html += `</div>`;
+      }
+
+      if (warnings.length > 0) {
+        html += `
+          <ul class="validation-error-list" style="color: var(--state-degraded); margin-top: 6px;">
+            ${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("")}
+          </ul>`;
+      }
+
+      statusBox.innerHTML = html;
+      statusBox.classList.remove("hidden");
+    } else {
+      const errors = data.errors || [data.detail || "Validation failed."];
+      statusBox.innerHTML = `
+        <div class="validation-header-row">
+          <span class="validation-badge-invalid">✕ Invalid Compose YAML</span>
+        </div>
+        <ul class="validation-error-list">
+          ${errors.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}
+        </ul>
+      `;
+      statusBox.classList.remove("hidden");
+    }
+  } catch (err) {
+    statusBox.innerHTML = `
+      <div class="validation-header-row">
+        <span class="validation-badge-invalid">✕ Validation Error</span>
+        <span class="validation-label">${escapeHtml(err.message)}</span>
+      </div>`;
+    statusBox.classList.remove("hidden");
+  }
+}
+
+/**
  * Open Stack Editor modal for creating or updating a stack.
  */
-async function openStackEditor(stackName = null) {
+async function openStackEditor(stackName = null, prefill = null) {
   const modal = document.getElementById("stack-editor-modal");
   const title = document.getElementById("stack-editor-title");
   const nameInput = document.getElementById("stack-name-input");
   const yamlInput = document.getElementById("stack-yaml-input");
+  const envInput = document.getElementById("stack-env-input");
   const saveText = document.getElementById("save-stack-text");
   const feedback = document.getElementById("stack-editor-feedback");
+  const statusBox = document.getElementById("stack-validation-status");
 
   if (feedback) feedback.classList.add("hidden");
+  if (statusBox) statusBox.classList.add("hidden");
+
+  switchStackEditorTab("compose");
 
   if (stackName) {
     if (title) title.textContent = `Edit Compose Stack: ${stackName}`;
@@ -6955,18 +7076,40 @@ async function openStackEditor(stackName = null) {
     }
     if (saveText) saveText.textContent = "Update Stack";
     if (yamlInput) yamlInput.value = "Loading compose file...";
+    if (envInput) envInput.value = "";
 
     try {
       const resp = await apiFetch(`/api/docker/stacks/${encodeURIComponent(stackName)}`);
       if (resp.ok) {
         const data = await resp.json();
         if (yamlInput) yamlInput.value = data.stack?.compose_yaml || "";
+        if (envInput) envInput.value = data.stack?.env_content || "";
+        if (data.stack?.compose_yaml) {
+          validateStackYaml(data.stack.compose_yaml);
+        }
       } else {
         if (yamlInput) yamlInput.value = "";
+        if (envInput) envInput.value = "";
       }
     } catch {
       if (yamlInput) yamlInput.value = "";
+      if (envInput) envInput.value = "";
     }
+  } else if (prefill) {
+    if (title) title.textContent = "Deploy New Compose Stack";
+    if (nameInput) {
+      nameInput.value = prefill.name || "";
+      nameInput.disabled = false;
+    }
+    if (saveText) saveText.textContent = "Deploy Stack";
+    if (yamlInput) yamlInput.value = prefill.compose_yaml || "";
+    if (envInput) envInput.value = prefill.env_content || "";
+    if (prefill.compose_yaml) {
+      validateStackYaml(prefill.compose_yaml);
+    }
+    setTimeout(() => {
+      yamlInput?.focus();
+    }, 50);
   } else {
     if (title) title.textContent = "Deploy New Compose Stack";
     if (nameInput) {
@@ -6975,6 +7118,7 @@ async function openStackEditor(stackName = null) {
     }
     if (saveText) saveText.textContent = "Deploy Stack";
     if (yamlInput) yamlInput.value = "";
+    if (envInput) envInput.value = "";
   }
 
   modal?.classList.remove("hidden");
@@ -6994,21 +7138,25 @@ function insertExampleYaml() {
       - "8088:80"
     restart: unless-stopped
 `;
+  validateStackYaml(yamlInput.value);
 }
 
 /**
- * Save & optionally deploy stack via POST /api/docker/stacks.
+ * Save & optionally deploy stack via POST or PUT /api/docker/stacks.
  */
 async function handleSaveStack() {
   const nameInput = document.getElementById("stack-name-input");
   const yamlInput = document.getElementById("stack-yaml-input");
+  const envInput = document.getElementById("stack-env-input");
   const deployToggle = document.getElementById("stack-deploy-toggle");
   const feedback = document.getElementById("stack-editor-feedback");
   const saveBtn = document.getElementById("save-stack-btn");
 
   const name = (nameInput?.value || "").trim();
   const compose_yaml = (yamlInput?.value || "").trim();
+  const env_content = envInput?.value || "";
   const deploy = !!deployToggle?.checked;
+  const isEdit = !!nameInput?.disabled;
 
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     if (feedback) {
@@ -7031,11 +7179,20 @@ async function handleSaveStack() {
   if (saveBtn) saveBtn.disabled = true;
 
   try {
-    const resp = await apiFetch("/api/docker/stacks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, compose_yaml, deploy }),
-    });
+    let resp;
+    if (isEdit) {
+      resp = await apiFetch(`/api/docker/stacks/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, compose_yaml, env_content, deploy }),
+      });
+    } else {
+      resp = await apiFetch("/api/docker/stacks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, compose_yaml, env_content, deploy }),
+      });
+    }
 
     const data = await resp.json().catch(() => ({}));
     if (resp.ok) {
@@ -7069,6 +7226,232 @@ async function handleSaveStack() {
   } finally {
     if (saveBtn) saveBtn.disabled = false;
   }
+}
+
+/**
+ * Get display icon for homelab app catalog items.
+ */
+function getAppCatalogIcon(icon) {
+  const iconMap = {
+    shield: "🛡️",
+    activity: "📈",
+    globe: "🌐",
+    lock: "🔒",
+    film: "🎬",
+    home: "🏠",
+    server: "🖥️",
+    terminal: "💻",
+    database: "🗄️",
+  };
+  return iconMap[icon] || "🚀";
+}
+
+/**
+ * Fetch homelab application templates from backend catalog.
+ */
+async function fetchAppTemplates() {
+  try {
+    const resp = await apiFetch("/api/docker/templates");
+    if (resp.ok) {
+      const data = await resp.json();
+      cachedAppTemplates = data.templates || [];
+      renderAppCatalog();
+    }
+  } catch (err) {
+    console.warn("Failed to fetch Docker app templates:", err);
+  }
+}
+
+/**
+ * Open the Homelab 1-Click App Catalog modal dialog.
+ */
+function openAppCatalog() {
+  const modal = document.getElementById("app-catalog-modal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  if (!cachedAppTemplates || cachedAppTemplates.length === 0) {
+    fetchAppTemplates();
+  } else {
+    renderAppCatalog();
+  }
+  const searchInput = document.getElementById("catalog-search-input");
+  if (searchInput) {
+    searchInput.focus();
+  }
+}
+
+/**
+ * Close the Homelab 1-Click App Catalog modal dialog.
+ */
+function closeAppCatalog() {
+  const modal = document.getElementById("app-catalog-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+/**
+ * Render Homelab App Catalog cards with search and category filtering.
+ */
+function renderAppCatalog() {
+  const grid = document.getElementById("app-catalog-grid");
+  if (!grid) return;
+
+  const searchInput = document.getElementById("catalog-search-input");
+  const query = (searchInput?.value || "").trim().toLowerCase();
+
+  const filtered = (cachedAppTemplates || []).filter((t) => {
+    if (currentAppCatalogCategory && currentAppCatalogCategory !== "All") {
+      if ((t.category || "").toLowerCase() !== currentAppCatalogCategory.toLowerCase()) {
+        return false;
+      }
+    }
+    if (query) {
+      const matchName = (t.name || "").toLowerCase().includes(query);
+      const matchCategory = (t.category || "").toLowerCase().includes(query);
+      const matchDesc = (t.description || "").toLowerCase().includes(query);
+      const matchPorts = (t.default_ports || []).some((p) => String(p).toLowerCase().includes(query));
+      const matchYaml = (t.compose_yaml || "").toLowerCase().includes(query);
+      if (!matchName && !matchCategory && !matchDesc && !matchPorts && !matchYaml) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    grid.innerHTML = `
+      <div style="grid-column: 1 / -1; text-align: center; padding: 40px 20px; color: var(--text-secondary);">
+        <p style="font-size: 1.1rem; margin-bottom: 6px;">No applications found matching filters.</p>
+        <span style="font-size: 0.82rem; color: var(--text-muted);">Try clearing your search or switching categories.</span>
+      </div>`;
+    return;
+  }
+
+  grid.innerHTML = filtered
+    .map((t) => {
+      const icon = getAppCatalogIcon(t.icon);
+      const ports = t.default_ports || [];
+      const portsHtml =
+        ports.length > 0
+          ? `<div class="catalog-ports-row">${ports.map((p) => `<span class="catalog-port-tag">${escapeHtml(p)}</span>`).join("")}</div>`
+          : "";
+
+      return `
+      <div class="catalog-card" data-template-id="${escapeHtml(t.id)}">
+        <div>
+          <div class="catalog-card-header">
+            <div class="catalog-icon-box" aria-hidden="true">${icon}</div>
+            <div class="catalog-meta">
+              <div class="catalog-title-row">
+                <span class="catalog-app-name" title="${escapeHtml(t.name)}">${escapeHtml(t.name)}</span>
+                <span class="catalog-category-badge">${escapeHtml(t.category || "General")}</span>
+              </div>
+            </div>
+          </div>
+          <p class="catalog-desc" title="${escapeHtml(t.description || "")}">${escapeHtml(t.description || "")}</p>
+          ${portsHtml}
+        </div>
+        <div class="catalog-card-actions">
+          <button type="button" class="btn-catalog-deploy" data-template-action="deploy" data-template-id="${escapeHtml(t.id)}">
+            <span>🚀</span> 1-Click Launch
+          </button>
+          <button type="button" class="btn-catalog-customize" data-template-action="customize" data-template-id="${escapeHtml(t.id)}">
+            Customize
+          </button>
+        </div>
+      </div>
+    `;
+    })
+    .join("");
+
+  grid.querySelectorAll("button[data-template-action]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const action = btn.getAttribute("data-template-action");
+      const templateId = btn.getAttribute("data-template-id");
+      const template = (cachedAppTemplates || []).find((t) => t.id === templateId);
+      if (!template) return;
+
+      if (action === "deploy") {
+        handle1ClickLaunch(template);
+      } else if (action === "customize") {
+        handleCustomizeTemplate(template);
+      }
+    });
+  });
+}
+
+/**
+ * Handle 1-click launch deployment of an application template.
+ */
+async function handle1ClickLaunch(template) {
+  let stackName = template.id || template.name.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  const existingNames = new Set((cachedDockerStacks || []).map((s) => s.name));
+  if (existingNames.has(stackName)) {
+    let suffix = 2;
+    while (existingNames.has(`${stackName}-${suffix}`)) {
+      suffix++;
+    }
+    stackName = `${stackName}-${suffix}`;
+  }
+
+  const confirmed = confirm(
+    `Launch "${template.name}" as stack "${stackName}"?\n\nThis will deploy and start the Compose stack immediately.`
+  );
+  if (!confirmed) return;
+
+  try {
+    const resp = await apiFetch("/api/docker/stacks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: stackName,
+        compose_yaml: template.compose_yaml,
+        env_content: template.env_content || "",
+        deploy: true,
+      }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok) {
+      closeAppCatalog();
+      lastStacksRenderKey = "";
+      fetchDockerStacks();
+      fetchDockerStatus();
+    } else {
+      let errMsg = data.detail || "Failed to launch app stack.";
+      if (typeof errMsg === "object") {
+        try {
+          errMsg = JSON.stringify(errMsg, null, 2);
+        } catch {
+          errMsg = String(errMsg);
+        }
+      }
+      alert(`Launch error: ${errMsg}`);
+    }
+  } catch (err) {
+    alert(`Failed to launch template: ${err.message}`);
+  }
+}
+
+/**
+ * Handle Customize & Deploy by opening the Stack Editor with template parameters prefilled.
+ */
+function handleCustomizeTemplate(template) {
+  let stackName = template.id || template.name.toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  const existingNames = new Set((cachedDockerStacks || []).map((s) => s.name));
+  if (existingNames.has(stackName)) {
+    let suffix = 2;
+    while (existingNames.has(`${stackName}-${suffix}`)) {
+      suffix++;
+    }
+    stackName = `${stackName}-${suffix}`;
+  }
+
+  closeAppCatalog();
+  openStackEditor(null, {
+    name: stackName,
+    compose_yaml: template.compose_yaml,
+    env_content: template.env_content || "",
+  });
 }
 
 /**
@@ -12588,6 +12971,39 @@ function initDashboard() {
       requestDockerRefresh();
     });
 
+  // App Catalog
+  document
+    .getElementById("btn-app-catalog")
+    ?.addEventListener("click", openAppCatalog);
+
+  document
+    .getElementById("close-app-catalog-btn")
+    ?.addEventListener("click", closeAppCatalog);
+
+  const appCatalogModal = document.getElementById("app-catalog-modal");
+  appCatalogModal?.addEventListener("click", (e) => {
+    if (e.target === appCatalogModal) {
+      closeAppCatalog();
+    }
+  });
+
+  document
+    .getElementById("catalog-search-input")
+    ?.addEventListener("input", renderAppCatalog);
+
+  document
+    .querySelectorAll("#catalog-category-filters .category-filter-btn")
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document
+          .querySelectorAll("#catalog-category-filters .category-filter-btn")
+          .forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentAppCatalogCategory = btn.getAttribute("data-category") || "All";
+        renderAppCatalog();
+      });
+    });
+
   // Stacks
   document
     .getElementById("btn-new-stack")
@@ -12601,6 +13017,13 @@ function initDashboard() {
     .getElementById("cancel-stack-editor-btn")
     ?.addEventListener("click", closeStackEditor);
 
+  const stackEditorModal = document.getElementById("stack-editor-modal");
+  stackEditorModal?.addEventListener("click", (e) => {
+    if (e.target === stackEditorModal) {
+      closeStackEditor();
+    }
+  });
+
   document
     .getElementById("save-stack-btn")
     ?.addEventListener("click", handleSaveStack);
@@ -12608,6 +13031,18 @@ function initDashboard() {
   document
     .getElementById("stack-template-btn")
     ?.addEventListener("click", insertExampleYaml);
+
+  document
+    .getElementById("stack-validate-btn")
+    ?.addEventListener("click", () => validateStackYaml());
+
+  document
+    .getElementById("tab-btn-compose")
+    ?.addEventListener("click", () => switchStackEditorTab("compose"));
+
+  document
+    .getElementById("tab-btn-env")
+    ?.addEventListener("click", () => switchStackEditorTab("env"));
 
   // Containers Filters & Search
   const searchInput =
@@ -12846,6 +13281,7 @@ function initDashboard() {
       closeContainerTerminal();
       closeUpdateModal();
       closeSettingsModal();
+      closeAppCatalog();
       closeStackEditor();
       closeContainerLogs();
       closeVolumeDetails();

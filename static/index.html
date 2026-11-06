@@ -1199,6 +1199,7 @@
                 <span class="subview-subtitle">Deploy and orchestrate multi-container services</span>
               </div>
               <div class="subview-actions">
+                <button id="btn-app-catalog" type="button" class="btn-secondary" title="Browse Homelab App Catalog"><span class="btn-icon">🚀</span> App Catalog</button>
                 <button id="btn-new-stack" type="button" class="btn-primary">
                   <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <line x1="12" y1="5" x2="12" y2="19"></line>
@@ -3287,6 +3288,45 @@
     </div>
   </div>
 
+  <!-- App Catalog Modal (#app-catalog-modal) -->
+  <div id="app-catalog-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="app-catalog-title">
+    <div class="modal-card app-catalog-modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="app-catalog-title" class="modal-title">Homelab 1-Click App Catalog</h2>
+          <p id="app-catalog-subtitle" class="modal-subtitle">Browse curated self-hosted applications and launch them with preconfigured Compose stacks</p>
+        </div>
+        <button id="close-app-catalog-btn" type="button" class="btn-icon-close" aria-label="Close app catalog modal">&times;</button>
+      </div>
+
+      <div class="catalog-toolbar">
+        <div class="catalog-search-box">
+          <input
+            id="catalog-search-input"
+            type="text"
+            class="search-input"
+            placeholder="Search apps, ports, images..."
+            autocomplete="off"
+          />
+        </div>
+        <div class="catalog-category-filters" id="catalog-category-filters">
+          <button type="button" class="category-filter-btn active" data-category="All">All</button>
+          <button type="button" class="category-filter-btn" data-category="Monitoring">Monitoring</button>
+          <button type="button" class="category-filter-btn" data-category="Networking">Networking</button>
+          <button type="button" class="category-filter-btn" data-category="Security">Security</button>
+          <button type="button" class="category-filter-btn" data-category="Media">Media</button>
+          <button type="button" class="category-filter-btn" data-category="Database">Database</button>
+          <button type="button" class="category-filter-btn" data-category="Automation">Automation</button>
+          <button type="button" class="category-filter-btn" data-category="Management">Management</button>
+        </div>
+      </div>
+
+      <div class="app-catalog-grid-container">
+        <div class="app-catalog-grid" id="app-catalog-grid"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Stack Editor Modal (#stack-editor-modal) -->
   <div id="stack-editor-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="stack-editor-title">
     <div class="modal-card stack-modal-card">
@@ -3314,20 +3354,46 @@
           <small class="form-hint">Alphanumeric, dashes, and underscores only.</small>
         </div>
 
-        <div class="form-group">
-          <div class="label-with-action">
-            <label for="stack-yaml-input">docker-compose.yml</label>
-            <button id="stack-template-btn" type="button" class="btn-text-action">Insert Example</button>
+        <div class="editor-tabs-nav" id="stack-editor-tabs-nav">
+          <button type="button" class="editor-tab-btn active" id="tab-btn-compose" data-editor-tab="compose">docker-compose.yml</button>
+          <button type="button" class="editor-tab-btn" id="tab-btn-env" data-editor-tab="env">.env Variables</button>
+        </div>
+
+        <div id="editor-tab-panel-compose" class="editor-tab-panel">
+          <div class="form-group">
+            <div class="label-with-action">
+              <label for="stack-yaml-input">docker-compose.yml</label>
+              <div class="stack-editor-actions-inline">
+                <button id="stack-validate-btn" type="button" class="btn-text-action">Validate YAML</button>
+                <button id="stack-template-btn" type="button" class="btn-text-action">Insert Example</button>
+              </div>
+            </div>
+            <textarea
+              id="stack-yaml-input"
+              name="compose_yaml"
+              rows="14"
+              class="mono-textarea"
+              placeholder="services:&#10;  app:&#10;    image: nginx:alpine&#10;    ports:&#10;      - '8088:80'&#10;    restart: unless-stopped"
+              required
+              spellcheck="false"
+            ></textarea>
+            <div id="stack-validation-status" class="validation-status-box hidden"></div>
           </div>
-          <textarea
-            id="stack-yaml-input"
-            name="compose_yaml"
-            rows="14"
-            class="mono-textarea"
-            placeholder="services:&#10;  app:&#10;    image: nginx:alpine&#10;    ports:&#10;      - '8088:80'&#10;    restart: unless-stopped"
-            required
-            spellcheck="false"
-          ></textarea>
+        </div>
+
+        <div id="editor-tab-panel-env" class="editor-tab-panel hidden">
+          <div class="form-group">
+            <label for="stack-env-input">.env Variables</label>
+            <textarea
+              id="stack-env-input"
+              name="env_content"
+              rows="14"
+              class="mono-textarea"
+              placeholder="KEY=VALUE&#10;PORT=8080"
+              spellcheck="false"
+            ></textarea>
+            <small class="form-hint">These environment variables will be saved as <code>.env</code> in the stack directory and used during Compose deployments.</small>
+          </div>
         </div>
 
         <div class="form-group toggle-group">
