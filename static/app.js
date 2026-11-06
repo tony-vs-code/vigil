@@ -31,9 +31,14 @@ let logsTimerId = null;
 let activeTerminalContainerId = null;
 let activeTerminalContainerName = "";
 let terminalWs = null;
+let terminalUtf8Decoder = new TextDecoder("utf-8", { stream: true });
 let terminalLines = [[]];
 let terminalCursorRow = 0;
 let terminalCursorCol = 0;
+let terminalCursorVisible = true;
+let terminalSavedLines = null;
+let terminalSavedCursorRow = 0;
+let terminalSavedCursorCol = 0;
 let terminalCurrentStyle = {
   fg: null,
   bg: null,
@@ -7320,6 +7325,7 @@ function scrollLogsToBottom() {
 function openContainerTerminal(containerId, containerName, shell = "/bin/sh", user = "") {
   activeTerminalContainerId = containerId;
   activeTerminalContainerName = containerName || containerId;
+  terminalUtf8Decoder = new TextDecoder("utf-8", { stream: true });
 
   const modal = document.getElementById("container-terminal-modal");
   const title = document.getElementById("container-terminal-title");
@@ -7352,6 +7358,7 @@ function closeContainerTerminal() {
     } catch (_) {}
     terminalWs = null;
   }
+  terminalUtf8Decoder = new TextDecoder("utf-8", { stream: true });
   activeTerminalContainerId = null;
   activeTerminalContainerName = "";
 
@@ -7376,6 +7383,7 @@ function connectContainerTerminal(containerId, containerName, shell = "/bin/sh",
     terminalWs = null;
   }
 
+  terminalUtf8Decoder = new TextDecoder("utf-8", { stream: true });
   setTerminalStatus("connecting", "Connecting...");
 
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -7410,7 +7418,7 @@ function connectContainerTerminal(containerId, containerName, shell = "/bin/sh",
     if (typeof event.data === "string") {
       text = event.data;
     } else if (event.data instanceof ArrayBuffer) {
-      text = new TextDecoder("utf-8").decode(new Uint8Array(event.data));
+      text = terminalUtf8Decoder.decode(new Uint8Array(event.data), { stream: true });
     }
     feedTerminalText(text);
   };
@@ -7431,6 +7439,8 @@ function connectContainerTerminal(containerId, containerName, shell = "/bin/sh",
     setTerminalStatus("error", "Terminal error");
   };
 }
+
+const connectTerminalWebSocket = connectContainerTerminal;
 
 function setTerminalStatus(state, message) {
   const badge = document.getElementById("container-terminal-status");
@@ -7455,11 +7465,16 @@ function resetTerminalBuffer() {
   terminalLines = [[]];
   terminalCursorRow = 0;
   terminalCursorCol = 0;
+  terminalCursorVisible = true;
+  terminalSavedLines = null;
+  terminalSavedCursorRow = 0;
+  terminalSavedCursorCol = 0;
   resetTerminalStyle();
   terminalParserState = "NORMAL";
   terminalCsiParams = "";
   terminalOscParams = "";
   terminalPendingBuffer = "";
+  terminalUtf8Decoder = new TextDecoder("utf-8", { stream: true });
   scheduleTerminalRender();
 }
 
@@ -7531,7 +7546,8 @@ function get256ColorClass(num, isBg) {
 }
 
 function handleCsiCommand(cmd, params) {
-  const cleanParams = params.replace(/^\?/, "");
+  const isDecPrivate = params.startsWith("?");
+  const cleanParams = params.replace(/^[?><=:]+/, "");
   const args = cleanParams.length > 0 ? cleanParams.split(";").map((x) => parseInt(x, 10)) : [];
 
   switch (cmd) {
@@ -7593,6 +7609,36 @@ function handleCsiCommand(cmd, params) {
       }
       break;
     }
+    case "h":
+    case "l": {
+      const isSet = (cmd === "h");
+      if (isDecPrivate) {
+        for (const mode of args) {
+          if (mode === 25) {
+            terminalCursorVisible = isSet;
+          } else if (mode === 1049 || mode === 47) {
+            if (isSet) {
+              terminalSavedLines = terminalLines.map((row) => [...row]);
+              terminalSavedCursorRow = terminalCursorRow;
+              terminalSavedCursorCol = terminalCursorCol;
+              terminalLines = [[]];
+              terminalCursorRow = 0;
+              terminalCursorCol = 0;
+            } else {
+              if (terminalSavedLines) {
+                terminalLines = terminalSavedLines;
+                terminalCursorRow = terminalSavedCursorRow;
+                terminalCursorCol = terminalSavedCursorCol;
+                terminalSavedLines = null;
+              }
+            }
+          }
+          // DEC private sequences ?2004 (bracketed paste), ?1 (cursor keys),
+          // ?7 (autowrap) are cleanly recognized and swallowed without side effects
+        }
+      }
+      break;
+    }
     case "H":
     case "f": {
       const r = args[0] ? args[0] - 1 : 0;
@@ -7621,6 +7667,17 @@ function handleCsiCommand(cmd, params) {
     case "D": {
       const count = args[0] || 1;
       terminalCursorCol = Math.max(0, terminalCursorCol - count);
+      break;
+    }
+    case "G": {
+      const c = (args[0] && args[0] > 0) ? args[0] - 1 : 0;
+      terminalCursorCol = Math.max(0, c);
+      break;
+    }
+    case "d": {
+      const r = (args[0] && args[0] > 0) ? args[0] - 1 : 0;
+      terminalCursorRow = Math.max(0, r);
+      ensureTerminalRow(terminalCursorRow);
       break;
     }
     case "K": {
@@ -7654,6 +7711,17 @@ function handleCsiCommand(cmd, params) {
       }
       break;
     }
+    case "s": {
+      terminalSavedCursorRow = terminalCursorRow;
+      terminalSavedCursorCol = terminalCursorCol;
+      break;
+    }
+    case "u": {
+      terminalCursorRow = terminalSavedCursorRow || 0;
+      terminalCursorCol = terminalSavedCursorCol || 0;
+      ensureTerminalRow(terminalCursorRow);
+      break;
+    }
     default:
       break;
   }
@@ -7670,6 +7738,15 @@ function feedTerminalText(text) {
 
   while (i < len) {
     const ch = text[i];
+
+    if (ch === "\x1b" && terminalParserState !== "NORMAL") {
+      terminalParserState = "ESCAPE";
+      seqStartIndex = i;
+      terminalCsiParams = "";
+      terminalOscParams = "";
+      i++;
+      continue;
+    }
 
     if (terminalParserState === "ESCAPE") {
       if (ch === "[") {
@@ -7691,6 +7768,21 @@ function feedTerminalText(text) {
         } else {
           break;
         }
+      } else if (ch === "7") {
+        terminalSavedCursorRow = terminalCursorRow;
+        terminalSavedCursorCol = terminalCursorCol;
+        terminalParserState = "NORMAL";
+        seqStartIndex = -1;
+        i++;
+        continue;
+      } else if (ch === "8") {
+        terminalCursorRow = terminalSavedCursorRow || 0;
+        terminalCursorCol = terminalSavedCursorCol || 0;
+        ensureTerminalRow(terminalCursorRow);
+        terminalParserState = "NORMAL";
+        seqStartIndex = -1;
+        i++;
+        continue;
       } else {
         terminalParserState = "NORMAL";
         seqStartIndex = -1;
@@ -7718,7 +7810,15 @@ function feedTerminalText(text) {
         i++;
         continue;
       }
-      handleCsiCommand(ch, terminalCsiParams);
+      if (ch >= "@" && ch <= "~") {
+        handleCsiCommand(ch, terminalCsiParams);
+        terminalParserState = "NORMAL";
+        terminalCsiParams = "";
+        seqStartIndex = -1;
+        i++;
+        continue;
+      }
+
       terminalParserState = "NORMAL";
       terminalCsiParams = "";
       seqStartIndex = -1;
@@ -7783,6 +7883,13 @@ function feedTerminalText(text) {
       continue;
     }
 
+    // Control Character Sanitization: drop non-printable < 32, DEL (0x7f), C1 codes (0x80 to 0x9f), and U+FFFD
+    const code = ch.charCodeAt(0);
+    if (code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f) || code === 0xfffd) {
+      i++;
+      continue;
+    }
+
     ensureTerminalRow(terminalCursorRow);
     const row = terminalLines[terminalCursorRow];
     while (row.length < terminalCursorCol) {
@@ -7804,9 +7911,9 @@ function feedTerminalText(text) {
 
   if (terminalParserState !== "NORMAL" && seqStartIndex >= 0) {
     terminalPendingBuffer = text.slice(seqStartIndex);
+    terminalParserState = "NORMAL";
     if (terminalPendingBuffer.length > 256) {
       terminalPendingBuffer = "";
-      terminalParserState = "NORMAL";
     }
   }
 
@@ -7871,7 +7978,11 @@ function renderTerminalToDOM() {
 
       if (isCursorRow && c === terminalCursorCol) {
         flushSpan();
-        rowHtml += `<span class="terminal-cursor">${safeChar === " " ? "&nbsp;" : safeChar}</span>`;
+        if (terminalCursorVisible) {
+          rowHtml += `<span class="terminal-cursor">${safeChar === " " ? "&nbsp;" : safeChar}</span>`;
+        } else {
+          rowHtml += safeChar === " " ? "&nbsp;" : safeChar;
+        }
         continue;
       }
 
@@ -7896,7 +8007,9 @@ function renderTerminalToDOM() {
     flushSpan();
 
     if (isCursorRow && terminalCursorCol >= maxCols) {
-      rowHtml += `<span class="terminal-cursor">&nbsp;</span>`;
+      if (terminalCursorVisible) {
+        rowHtml += `<span class="terminal-cursor">&nbsp;</span>`;
+      }
     }
 
     htmlPieces.push(`<div class="terminal-row">${rowHtml || "&nbsp;"}</div>`);

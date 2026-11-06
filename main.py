@@ -26,7 +26,7 @@ import discord
 import logging
 from logging.handlers import RotatingFileHandler
 import sqlite3
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 try:
     from decouple import config as _decouple_config
@@ -69,7 +69,7 @@ try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None  # type: ignore
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 import re
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -4827,6 +4827,7 @@ class DockerManager:
         cmd: Optional[list[str]] = None,
         user: str = "",
         tty: bool = True,
+        env: Optional[Union[list[str], dict[str, str]]] = None,
     ) -> dict[str, Any]:
         """Create an exec instance inside a container via Docker Engine API."""
         cid = container_id.strip()
@@ -4834,6 +4835,24 @@ class DockerManager:
             raise ValueError("Container ID cannot be empty.")
         if not self.is_running():
             raise RuntimeError("Docker daemon is not running.")
+        default_env = {
+            "TERM": "xterm-256color",
+            "COLORTERM": "truecolor",
+            "LANG": "C.UTF-8",
+        }
+        if env:
+            if isinstance(env, dict):
+                for k, v in env.items():
+                    default_env[str(k)] = str(v)
+            elif isinstance(env, (list, tuple)):
+                for item in env:
+                    if isinstance(item, str) and "=" in item:
+                        k, v = item.split("=", 1)
+                        default_env[k] = v
+                    elif isinstance(item, str):
+                        default_env[item] = ""
+        env_list = [f"{k}={v}" for k, v in default_env.items()]
+
         payload = {
             "AttachStdin": True,
             "AttachStdout": True,
@@ -4841,6 +4860,7 @@ class DockerManager:
             "Tty": bool(tty),
             "Cmd": cmd or ["/bin/sh"],
             "User": user or "",
+            "Env": env_list,
         }
         body = json.dumps(payload).encode("utf-8")
         status, data = self._socket_request(

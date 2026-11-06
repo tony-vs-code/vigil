@@ -1,33 +1,26 @@
-# Release v1.0.29: In-Browser Docker Container Web Terminal
+# Release v1.0.30: Docker Web Terminal Encoding & Glyph Rendering Fixes
 
 ## Overview
-Vigil v1.0.29 introduces an interactive, in-browser Docker Container Web Terminal, allowing system administrators to open zero-latency interactive shell sessions directly into running containers without SSH or external CLI tools. Powered by a raw duplex WebSocket streaming engine to the Docker daemon socket, an integrated ANSI rendering engine, dynamic PTY window resizing, zero-trust token authentication, and tamper-evident audit logging, this release delivers robust container management and terminal control right from the dashboard.
+Vigil v1.0.30 addresses terminal character encoding and ANSI control sequence rendering defects in the In-Browser Docker Container Web Terminal. By setting standardized modern terminal environment variables on the backend, implementing stateful multi-byte UTF-8 stream decoding on the frontend, gracefully filtering unsupported control characters and C1 codes, and implementing DEC private mode support (cursor visibility, alternate screen buffers, bracketed paste), interactive sessions now render clean, crisp typography, Box Drawing characters, and emojis with zero visual corruption or replacement glyphs (`[?]`).
 
 ## Highlights & Enhancements
 
-### 1. In-Browser Docker Container Web Terminal
-- **1-Click Shell Access**: Launch interactive terminal sessions directly into any running Docker container from the Docker dashboard table using a dedicated **Terminal** action button.
-- **Adaptive Shell Selection**: Intelligently attempts `/bin/bash` with graceful fallback to `/bin/sh` for lightweight, alpine, or minimal container images.
-- **Dedicated Modal UI**: Clean, distraction-free modal terminal dialog equipped with container metadata badge, connection status indicator, shell selector, clear screen, and disconnect actions.
+### 1. Robust Multi-Byte UTF-8 Streaming Decoder
+- **Stateful Text Decoding**: Integrated a persistent `TextDecoder("utf-8", { stream: true })` instance across WebSocket binary message frames. Multi-byte sequences split across TCP or WebSocket frame boundaries are now properly assembled without emitting replacement characters (`` / `[?]`).
+- **Control Character & C1 Code Sanitization**: Safely strips non-printable control characters, DEL (`0x7f`), and C1 control codes (`0x80-0x9f`) that could otherwise corrupt terminal buffer layouts.
 
-### 2. Real-Time WebSocket PTY Streaming Engine
-- **Raw Duplex Streaming**: Fast, bidirectional streaming over `/api/docker/containers/{id}/terminal` bridging the web client directly to the Docker daemon UNIX socket exec stream.
-- **Non-blocking Concurrency**: Built with Python `asyncio` and `websockets` for high-performance duplex forwarding between WebSocket frames and raw socket channels.
+### 2. Standardized Terminal & UTF-8 Locale Environment
+- **Default Docker Exec Environment**: Configured `TERM=xterm-256color`, `COLORTERM=truecolor`, and `LANG=C.UTF-8` as default execution environment variables in Docker daemon exec sessions.
+- **Enhanced Locale Negotiation**: Ensures guest interactive programs (e.g. `htop`, `mc`, `zsh`, `tmux`) immediately detect UTF-8 and 24-bit TrueColor capability rather than degrading to ASCII or ISO-8859 fallback mode.
 
-### 3. ANSI Rendering Engine & Complete Keyboard Controls
-- **Rich Terminal Emulation**: Full support for standard 16-color ANSI palettes, 256-color palettes, text styling (bold, italic, underline, dim, inverted), cursor positioning, and line erase sequences.
-- **Full Interactive Keyboard Control**: Native handling of shell control combinations (`Ctrl+C`, `Ctrl+D`, `Ctrl+Z`, `Ctrl+L`), Tab auto-completion, directional arrow keys, history recall, backspace, carriage returns, and clipboard text paste.
+### 3. Extended DEC Private Mode Sequences & Buffer Controls
+- **Cursor Visibility Controls**: Added support for DEC private mode cursor show/hide sequences (`?25h` and `?25l`), dynamically synchronizing cursor rendering in the terminal DOM.
+- **Alternate Screen Buffer Handling**: Added alternate screen buffer transitions (`?1049h` / `?1049l`), allowing full-screen interactive programs like `nano` and `vi` to open in isolated buffers and cleanly restore the primary terminal screen upon exit.
+- **Bracketed Paste & Cursor Mode Compatibility**: Gracefully recognizes and ignores bracketed paste (`?2004h/l`) and application cursor key (`?1h/l`) mode toggles without leaking escape sequences to screen text.
 
-### 4. Interactive Window Resizing & Responsive Geometry
-- **Dynamic Dimension Calculation**: Automatically calculates available character columns and rows based on client viewport and font dimensions.
-- **Synchronized PTY Dimensions**: Dispatches live resize events (`{"type": "resize", "cols": N, "rows": N}`) that dynamically reconfigure the container's pseudo-terminal via the Docker exec resize API (`/exec/{id}/resize`).
-
-### 5. Zero-Trust Security & Comprehensive Auditing
-- **Strict Handshake Authentication**: Enforces token authentication prior to WebSocket upgrade; unauthenticated connection attempts are rejected immediately with RFC 6455 policy violation code `1008`.
-- **Audit Logging**: Successful terminal connections log structured audit records (`docker.container.terminal_opened`) capturing container ID, authenticated user, remote IP, and timestamp.
+### 4. Monospace Typography & Grid Alignment Refinements
+- **Font Stack & Metric Consistency**: Updated `static/styles.css` with a dedicated modern monospace font stack (`ui-monospace`, `SFMono-Regular`, `Menlo`, `Monaco`, `Consolas`, `monospace`), explicit character line-height, and subpixel antialiasing to guarantee strict column alignment across all platforms.
 
 ## Reliability & Fixes
-
-### Cross-Tier Quality & Automated Test Coverage
-- **Automated Quality Gate**: Cross-tier verification gate (`validate_requirements.sh`) passed with 0 errors, 100% DOM contract compliance, and clean JavaScript syntax.
-- **Comprehensive Test Suite**: 243/243 unit, integration, frontend VM, and security tests passing with 0 failures.
+- **Cross-Tier Validation Gate**: 100% compliance across all 58 frontend API routes and 623 DOM element contracts with 0 errors.
+- **Comprehensive Test Suite**: All 243 unit, integration, and frontend Node VM tests passed successfully.
