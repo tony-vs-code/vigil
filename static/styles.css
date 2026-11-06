@@ -3026,7 +3026,7 @@ hr.overview-flow-divider {
 .notif-modal-card {
   max-width: 680px;
   width: 100%;
-  max-height: 88vh;
+  max-height: 85vh;
   overflow-y: auto;
 }
 
@@ -3132,6 +3132,53 @@ hr.overview-flow-divider {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.channel-routing-group {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.routing-group-title {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted, #94a3b8);
+}
+
+.channel-routing-group .routing-checkboxes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+}
+
+.routing-checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #cbd5e1);
+  cursor: pointer;
+  user-select: none;
+  transition: color 0.15s ease;
+}
+
+.routing-checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--accent-primary, #38bdf8);
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.routing-checkbox-label:hover {
+  color: var(--text-primary, #f8fafc);
 }
 
 /* Test Notification Toolbar */
@@ -3449,6 +3496,12 @@ hr.overview-flow-divider {
 }
 
 .status-badge.status-disabled {
+  background: rgba(148, 163, 184, 0.14);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.35);
+}
+
+.status-badge.status-not-configured {
   background: var(--state-degraded-bg);
   color: var(--state-degraded);
   border-color: rgba(245, 158, 11, 0.4);
