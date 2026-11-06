@@ -249,7 +249,12 @@ class SettingsUpdateRequest(BaseModel):
 class StackCreateRequest(BaseModel):
     name: str
     compose_yaml: str
+    env_content: Optional[str] = None
     deploy: Optional[bool] = True
+
+
+class StackValidateRequest(BaseModel):
+    compose_yaml: str
 
 
 class StackActionRequest(BaseModel):
@@ -1203,6 +1208,24 @@ async def api_docker_install(_user: str = Depends(require_auth)) -> dict[str, An
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.get("/api/docker/templates")
+async def api_docker_templates(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    templates = await asyncio.to_thread(main.docker_manager.get_templates)
+    return {"templates": templates}
+
+
+@app.post("/api/docker/stacks/validate")
+async def api_docker_validate_stack(
+    payload: StackValidateRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    result = await asyncio.to_thread(
+        main.docker_manager.validate_compose_yaml,
+        payload.compose_yaml,
+    )
+    return result
+
+
 @app.get("/api/docker/stacks")
 async def api_docker_stacks(_user: str = Depends(require_auth)) -> dict[str, Any]:
     stacks = await asyncio.to_thread(main.docker_manager.list_stacks)
@@ -1219,6 +1242,7 @@ async def api_docker_create_stack(
             main.docker_manager.save_stack,
             payload.name,
             payload.compose_yaml,
+            env_content=payload.env_content,
             deploy=bool(payload.deploy),
         )
         return {"success": True, "stack": stack}
@@ -1239,6 +1263,7 @@ async def api_docker_update_stack(
             main.docker_manager.save_stack,
             name,
             payload.compose_yaml,
+            env_content=payload.env_content,
             deploy=bool(payload.deploy),
         )
         return {"success": True, "stack": stack}

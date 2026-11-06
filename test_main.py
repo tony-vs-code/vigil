@@ -2901,6 +2901,8 @@ class TestDockerBackend(unittest.TestCase):
             ("GET", "/api/docker/updates/schedule"),
             ("POST", "/api/docker/updates/schedule"),
             ("GET", "/api/docker/volumes/testvol"),
+            ("GET", "/api/docker/templates"),
+            ("POST", "/api/docker/stacks/validate"),
         ]
         for method, path in endpoints:
             resp = asgi_request(api.app, method, path)
@@ -4696,6 +4698,239 @@ class TestDockerBackend(unittest.TestCase):
                     "stacks": 0,
                 },
             )
+
+    def test_docker_templates_endpoint(self):
+        """Verifies GET /api/docker/templates returns curated homelab templates with complete schemas."""
+        unauth_resp = asgi_get(api.app, "/api/docker/templates")
+        self.assertEqual(unauth_resp.status_code, 401)
+
+        resp = asgi_get(api.app, "/api/docker/templates", cookies=self.auth_cookies)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("templates", data)
+        templates = data["templates"]
+        self.assertGreaterEqual(len(templates), 10)
+
+        required_keys = {
+            "id",
+            "name",
+            "category",
+            "description",
+            "icon",
+            "default_ports",
+            "compose_yaml",
+            "env_content",
+        }
+        found_ids = set()
+        for tpl in templates:
+            for k in required_keys:
+                self.assertIn(k, tpl, f"Template {tpl.get('id')} missing key '{k}'")
+            self.assertIsInstance(tpl["default_ports"], list)
+            self.assertIsInstance(tpl["compose_yaml"], str)
+            found_ids.add(tpl["id"])
+
+            val = main.docker_manager.validate_compose_yaml(tpl["compose_yaml"])
+            self.assertTrue(
+                val["valid"],
+                f"Template {tpl['id']} failed YAML validation: {val.get('errors')}",
+            )
+            self.assertGreater(len(val["services"]), 0)
+
+        expected_apps = {
+            "pihole",
+            "uptime-kuma",
+            "nginx-proxy-manager",
+            "vaultwarden",
+            "jellyfin",
+            "home-assistant",
+            "portainer-ce",
+            "dozzle",
+            "redis",
+            "postgresql",
+            "glances",
+        }
+        for app_id in expected_apps:
+            self.assertIn(app_id, found_ids, f"Expected template '{app_id}' not found in catalog")
+
+    def test_docker_stack_validate_endpoint(self):
+        """Verifies POST /api/docker/stacks/validate validates compose YAML, syntax, services, and ports."""
+        unauth_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            json_body={"compose_yaml": "services:\n  app:\n    image: nginx\n"},
+        )
+        self.assertEqual(unauth_resp.status_code, 401)
+
+        valid_yaml = (
+            "services:\n"
+            "  web:\n"
+            "    image: nginx:1.25-alpine\n"
+            "    ports:\n"
+            "      - '8080:80'\n"
+            "    volumes:\n"
+            "      - webdata:/usr/share/nginx/html\n"
+            "volumes:\n"
+            "  webdata:\n"
+        )
+        resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": valid_yaml},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data.get("valid"))
+        self.assertIn("web", data.get("services", []))
+        self.assertIn("8080:80", data.get("ports", []))
+        self.assertIn("webdata", data.get("volumes", []))
+        self.assertIn("nginx:1.25-alpine", data.get("image_tags", []))
+
+        resp_empty = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": "   \n   "},
+        )
+        self.assertEqual(resp_empty.status_code, 200)
+        empty_data = resp_empty.json()
+        self.assertFalse(empty_data.get("valid"))
+        self.assertGreater(len(empty_data.get("errors", [])), 0)
+
+        bad_syntax_yaml = "services:\n  web:\n    image: [unbalanced list"
+        resp_bad = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": bad_syntax_yaml},
+        )
+        self.assertEqual(resp_bad.status_code, 200)
+        bad_data = resp_bad.json()
+        self.assertFalse(bad_data.get("valid"))
+        self.assertGreater(len(bad_data.get("errors", [])), 0)
+
+        missing_services_yaml = "version: '3.8'\nnetworks:\n  default:\n"
+        resp_missing = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": missing_services_yaml},
+        )
+        self.assertEqual(resp_missing.status_code, 200)
+        missing_data = resp_missing.json()
+        self.assertFalse(missing_data.get("valid"))
+        self.assertTrue(any("services" in err.lower() for err in missing_data.get("errors", [])))
+
+        list_services_yaml = "services:\n  - web\n  - db\n"
+        resp_list = asgi_post(
+            api.app,
+            "/api/docker/stacks/validate",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": list_services_yaml},
+        )
+        self.assertEqual(resp_list.status_code, 200)
+        list_data = resp_list.json()
+        self.assertFalse(list_data.get("valid"))
+        self.assertGreater(len(list_data.get("errors", [])), 0)
+
+    def test_docker_stack_env_persistence(self):
+        """Verifies stack .env creation, SQLite storage, migration, and retrieval via save_stack, get_stack, and API."""
+        compose_yaml = "services:\n  app:\n    image: postgres:16\n"
+        env_content = "POSTGRES_USER=admin\nPOSTGRES_PASSWORD=supersecret\n"
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(main.docker_manager, "_run_compose", return_value=""),
+        ):
+            saved = main.docker_manager.save_stack(
+                "pg_stack",
+                compose_yaml,
+                env_content=env_content,
+                deploy=False,
+            )
+            self.assertEqual(saved["name"], "pg_stack")
+            self.assertEqual(saved["env_content"], env_content)
+
+            env_file = self.stacks_path / "pg_stack" / ".env"
+            self.assertTrue(env_file.is_file())
+            self.assertEqual(env_file.read_text(encoding="utf-8"), env_content)
+
+            retrieved = main.docker_manager.get_stack("pg_stack")
+            self.assertIsNotNone(retrieved)
+            self.assertEqual(retrieved["env_content"], env_content)
+
+            stacks = main.docker_manager.list_stacks()
+            pg_meta = next((s for s in stacks if s["name"] == "pg_stack"), None)
+            self.assertIsNotNone(pg_meta)
+            self.assertEqual(pg_meta["env_content"], env_content)
+
+            api_compose = "services:\n  web:\n    image: nginx\n"
+            api_env = "VIRTUAL_HOST=example.com\n"
+            post_resp = asgi_post(
+                api.app,
+                "/api/docker/stacks",
+                cookies=self.auth_cookies,
+                json_body={
+                    "name": "api_stack",
+                    "compose_yaml": api_compose,
+                    "env_content": api_env,
+                    "deploy": False,
+                },
+            )
+            self.assertEqual(post_resp.status_code, 200)
+            self.assertEqual(post_resp.json()["stack"]["env_content"], api_env)
+
+            get_resp = asgi_get(
+                api.app,
+                "/api/docker/stacks/api_stack",
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(get_resp.status_code, 200)
+            self.assertEqual(get_resp.json()["stack"]["env_content"], api_env)
+
+            updated_env = "VIRTUAL_HOST=updated.org\nDEBUG=1\n"
+            put_resp = asgi_put(
+                api.app,
+                "/api/docker/stacks/api_stack",
+                cookies=self.auth_cookies,
+                json_body={
+                    "name": "api_stack",
+                    "compose_yaml": api_compose,
+                    "env_content": updated_env,
+                    "deploy": False,
+                },
+            )
+            self.assertEqual(put_resp.status_code, 200)
+            self.assertEqual(put_resp.json()["stack"]["env_content"], updated_env)
+
+            api_env_file = self.stacks_path / "api_stack" / ".env"
+            self.assertEqual(api_env_file.read_text(encoding="utf-8"), updated_env)
+
+            legacy_db = Path(self.temp_dir.name) / "legacy.sqlite3"
+            conn = sqlite3.connect(legacy_db)
+            conn.execute(
+                "CREATE TABLE docker_stacks ("
+                "name TEXT PRIMARY KEY, "
+                "compose_yaml TEXT NOT NULL, "
+                "status TEXT NOT NULL, "
+                "created_at REAL NOT NULL, "
+                "updated_at REAL NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO docker_stacks VALUES (?, ?, ?, ?, ?)",
+                ("old_stack", "services:\n  a:\n    image: b\n", "saved", 100.0, 100.0),
+            )
+            conn.commit()
+            conn.close()
+
+            with patch.object(main, "RAID_STATE_DB", legacy_db):
+                m_conn = main._connect_state_db(legacy_db)
+                cols = {r[1] for r in m_conn.execute("PRAGMA table_info(docker_stacks)")}
+                self.assertIn("env_content", cols)
+                row = m_conn.execute("SELECT name, env_content FROM docker_stacks WHERE name = 'old_stack'").fetchone()
+                self.assertEqual(row[0], "old_stack")
+                self.assertEqual(row[1], "")
+                m_conn.close()
 
 
 class DirectSystemStreamsTests(unittest.TestCase):
@@ -12706,6 +12941,690 @@ console.log("ALL_NODE_ACTIONS_DROPDOWN_VM_CHECKS_PASSED");
         res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
         self.assertIn("ALL_NODE_ACTIONS_DROPDOWN_VM_CHECKS_PASSED", res.stdout)
+
+
+class DockerAppCatalogAndComposeEditorFrontendTests(unittest.TestCase):
+    """Validation tests for Homelab 1-Click App Catalog and Visual Compose Editor."""
+
+    def test_docker_compose_and_app_catalog_dom_contracts(self):
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        # 1. App Catalog Modal DOM contracts
+        catalog_dom_ids = [
+            "app-catalog-modal",
+            "app-catalog-title",
+            "app-catalog-subtitle",
+            "close-app-catalog-btn",
+            "catalog-search-input",
+            "catalog-category-filters",
+            "app-catalog-grid",
+            "btn-app-catalog",
+        ]
+        for dom_id in catalog_dom_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        # Category filter buttons
+        categories = ["All", "Monitoring", "Networking", "Security", "Media", "Database", "Automation", "Management"]
+        for cat in categories:
+            self.assertIn(f'data-category="{cat}"', html, f"Missing category filter '{cat}' in index.html")
+
+        # 2. Stack Editor Modal DOM contracts
+        stack_editor_dom_ids = [
+            "stack-editor-modal",
+            "stack-editor-title",
+            "stack-editor-subtitle",
+            "close-stack-editor-btn",
+            "stack-editor-feedback",
+            "stack-editor-form",
+            "stack-name-input",
+            "stack-editor-tabs-nav",
+            "tab-btn-compose",
+            "tab-btn-env",
+            "editor-tab-panel-compose",
+            "editor-tab-panel-env",
+            "stack-yaml-input",
+            "stack-env-input",
+            "stack-validate-btn",
+            "stack-template-btn",
+            "stack-validation-status",
+            "stack-deploy-toggle",
+            "save-stack-btn",
+            "save-stack-text",
+            "btn-new-stack",
+        ]
+        for dom_id in stack_editor_dom_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        # 3. CSS Contracts
+        css_selectors = [
+            ".app-catalog-modal-card",
+            ".catalog-toolbar",
+            ".catalog-category-filters",
+            ".category-filter-btn",
+            ".app-catalog-grid",
+            ".catalog-card",
+            ".btn-catalog-deploy",
+            ".btn-catalog-customize",
+            ".editor-tabs-nav",
+            ".editor-tab-btn",
+            ".editor-tab-btn.active",
+            ".validation-status-box",
+            ".validation-badge-valid",
+            ".validation-badge-invalid",
+        ]
+        for sel in css_selectors:
+            self.assertIn(sel, css, f"Missing CSS selector '{sel}' in static/styles.css")
+
+        # 4. JS Function & Event Contract Parity
+        required_js_symbols = [
+            "function openAppCatalog(",
+            "function closeAppCatalog(",
+            "function renderAppCatalog(",
+            "function handle1ClickLaunch(",
+            "function handleCustomizeTemplate(",
+            "function openStackEditor(",
+            "function closeStackEditor(",
+            "function switchStackEditorTab(",
+            "function validateStackYaml(",
+            "function handleSaveStack(",
+            "function fetchAppTemplates(",
+            "btn-app-catalog",
+            "close-app-catalog-btn",
+            "btn-new-stack",
+            "close-stack-editor-btn",
+            "stack-validate-btn",
+            "stack-template-btn",
+            "tab-btn-compose",
+            "tab-btn-env",
+        ]
+        for symbol in required_js_symbols:
+            self.assertIn(symbol, js, f"Missing JS function or element symbol '{symbol}' in static/app.js")
+
+    def test_app_catalog_filtering_search_and_rendering_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const listeners = {{}};
+  return {{
+    id: id,
+    classList: {{
+      add: (cls) => classes.add(cls),
+      remove: (cls) => classes.delete(cls),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {{
+        if (force === undefined) {{
+          if (classes.has(cls)) classes.delete(cls); else classes.add(cls);
+        }} else if (force) {{
+          classes.add(cls);
+        }} else {{
+          classes.delete(cls);
+        }}
+      }}
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    listeners: listeners,
+    addEventListener(evt, fn) {{
+      if (!listeners[evt]) listeners[evt] = [];
+      listeners[evt].push(fn);
+    }},
+    value: '',
+    checked: false,
+    disabled: false,
+    textContent: '',
+    innerHTML: '',
+    querySelectorAll(sel) {{
+      if (sel === 'button[data-template-action]') {{
+        const regex = /<button[^>]*data-template-action="([^"]+)"[^>]*data-template-id="([^"]+)"/g;
+        const matches = [];
+        let m;
+        while ((m = regex.exec(this.innerHTML)) !== null) {{
+          const action = m[1];
+          const tid = m[2];
+          const btnElem = createMockElement("btn-" + tid + "-" + action);
+          btnElem.getAttribute = (attr) => attr === "data-template-action" ? action : (attr === "data-template-id" ? tid : null);
+          matches.push(btnElem);
+        }}
+        return matches;
+      }}
+      return [];
+    }},
+    focus() {{}},
+    scrollIntoView() {{}}
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{ addEventListener: () => {{}} }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams,
+  confirm: () => true,
+  alert: () => {{}}
+}});
+
+vm.runInContext(appJs, ctx);
+
+const mockTemplates = [
+  {{ id: 'pihole', name: 'Pi-hole', category: 'Security', description: 'Network-wide ad blocking', default_ports: ['53', '80'], compose_yaml: 'services:\\n  pihole:\\n    image: pihole/pihole', env_content: 'TZ=America/New_York' }},
+  {{ id: 'uptime-kuma', name: 'Uptime Kuma', category: 'Monitoring', description: 'Self-hosted monitoring tool', default_ports: ['3001'], compose_yaml: 'services:\\n  uptime-kuma:\\n    image: louislam/uptime-kuma:1', env_content: '' }},
+  {{ id: 'nginx-proxy-manager', name: 'Nginx Proxy Manager', category: 'Networking', description: 'Docker container management web UI', default_ports: ['80', '81', '443'], compose_yaml: 'services:\\n  npm:\\n    image: jc21/nginx-proxy-manager', env_content: '' }},
+  {{ id: 'jellyfin', name: 'Jellyfin', category: 'Media', description: 'The Free Software Media System', default_ports: ['8096'], compose_yaml: 'services:\\n  jellyfin:\\n    image: jellyfin/jellyfin', env_content: '' }},
+  {{ id: 'vaultwarden', name: 'Vaultwarden', category: 'Security', description: 'Lightweight Bitwarden server', default_ports: ['8080'], compose_yaml: 'services:\\n  vaultwarden:\\n    image: vaultwarden/server', env_content: '' }}
+];
+
+ctx.mockTemplates = mockTemplates;
+vm.runInContext("cachedAppTemplates = mockTemplates;", ctx);
+
+// 1. Test modal opening
+const catalogModal = getEl('app-catalog-modal');
+catalogModal.classList.add('hidden');
+ctx.openAppCatalog();
+if (catalogModal.classList.contains('hidden')) {{
+  throw new Error("openAppCatalog failed to remove hidden class");
+}}
+
+// 2. Test Category filtering
+// Category: Monitoring
+vm.runInContext("currentAppCatalogCategory = 'Monitoring';", ctx);
+getEl('catalog-search-input').value = '';
+ctx.renderAppCatalog();
+let gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Uptime Kuma')) throw new Error("Monitoring category missing Uptime Kuma");
+if (gridHtml.includes('Pi-hole')) throw new Error("Monitoring category unexpectedly contains Pi-hole");
+if (gridHtml.includes('Jellyfin')) throw new Error("Monitoring category unexpectedly contains Jellyfin");
+
+// Category: Security
+vm.runInContext("currentAppCatalogCategory = 'Security';", ctx);
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Pi-hole')) throw new Error("Security category missing Pi-hole");
+if (!gridHtml.includes('Vaultwarden')) throw new Error("Security category missing Vaultwarden");
+if (gridHtml.includes('Uptime Kuma')) throw new Error("Security category unexpectedly contains Uptime Kuma");
+
+// Category: All
+vm.runInContext("currentAppCatalogCategory = 'All';", ctx);
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Pi-hole') || !gridHtml.includes('Uptime Kuma') || !gridHtml.includes('Jellyfin')) {{
+  throw new Error("All category does not contain all templates");
+}}
+
+// 3. Test Search filtering
+// Search by port
+getEl('catalog-search-input').value = '3001';
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Uptime Kuma') || gridHtml.includes('Pi-hole')) {{
+  throw new Error("Search by port 3001 failed");
+}}
+
+// Search by description keyword
+getEl('catalog-search-input').value = 'bitwarden';
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Vaultwarden') || gridHtml.includes('Jellyfin')) {{
+  throw new Error("Search by description keyword failed");
+}}
+
+// Search by name
+getEl('catalog-search-input').value = 'jellyfin';
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('Jellyfin') || gridHtml.includes('Vaultwarden')) {{
+  throw new Error("Search by name failed");
+}}
+
+// Empty search results
+getEl('catalog-search-input').value = 'nonexistent-app-xyz';
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('No applications found matching filters.')) {{
+  throw new Error("Empty search query state missing");
+}}
+
+// 4. Test Card Buttons & Tags
+getEl('catalog-search-input').value = '';
+ctx.renderAppCatalog();
+gridHtml = getEl('app-catalog-grid').innerHTML;
+if (!gridHtml.includes('data-template-action="deploy"')) throw new Error("Missing 1-Click Launch action button");
+if (!gridHtml.includes('data-template-action="customize"')) throw new Error("Missing Customize action button");
+if (!gridHtml.includes('catalog-port-tag">53</span>')) throw new Error("Missing port tag rendering");
+
+// Test modal close
+ctx.closeAppCatalog();
+if (!catalogModal.classList.contains('hidden')) {{
+  throw new Error("closeAppCatalog failed to add hidden class");
+}}
+
+console.log("ALL_NODE_APP_CATALOG_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_APP_CATALOG_VM_CHECKS_PASSED", res.stdout)
+
+    def test_stack_editor_tab_switching_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  return {{
+    id: id,
+    classList: {{
+      add: (cls) => classes.add(cls),
+      remove: (cls) => classes.delete(cls),
+      contains: (cls) => classes.has(cls),
+    }},
+    value: '',
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{ addEventListener: () => {{}} }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+const tabCompose = getEl('tab-btn-compose');
+const tabEnv = getEl('tab-btn-env');
+const panelCompose = getEl('editor-tab-panel-compose');
+const panelEnv = getEl('editor-tab-panel-env');
+
+// Switch to env tab
+ctx.switchStackEditorTab('env');
+if (!tabEnv.classList.contains('active')) throw new Error("tabEnv missing active class");
+if (tabCompose.classList.contains('active')) throw new Error("tabCompose unexpectedly has active class");
+if (!panelCompose.classList.contains('hidden')) throw new Error("panelCompose missing hidden class");
+if (panelEnv.classList.contains('hidden')) throw new Error("panelEnv unexpectedly has hidden class");
+if (vm.runInContext("activeStackEditorTab", ctx) !== 'env') throw new Error("activeStackEditorTab not 'env'");
+
+// Switch back to compose tab
+ctx.switchStackEditorTab('compose');
+if (!tabCompose.classList.contains('active')) throw new Error("tabCompose missing active class");
+if (tabEnv.classList.contains('active')) throw new Error("tabEnv unexpectedly has active class");
+if (panelCompose.classList.contains('hidden')) throw new Error("panelCompose unexpectedly has hidden class");
+if (!panelEnv.classList.contains('hidden')) throw new Error("panelEnv missing hidden class");
+if (vm.runInContext("activeStackEditorTab", ctx) !== 'compose') throw new Error("activeStackEditorTab not 'compose'");
+
+console.log("ALL_NODE_STACK_EDITOR_TAB_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_STACK_EDITOR_TAB_VM_CHECKS_PASSED", res.stdout)
+
+    def test_stack_yaml_validation_triggering_and_feedback_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  return {{
+    id: id,
+    classList: {{
+      add: (cls) => classes.add(cls),
+      remove: (cls) => classes.delete(cls),
+      contains: (cls) => classes.has(cls),
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    value: '',
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{ addEventListener: () => {{}} }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+(async () => {{
+  const statusBox = getEl('stack-validation-status');
+
+  // Test 1: Empty YAML triggering
+  await ctx.validateStackYaml('');
+  if (statusBox.classList.contains('hidden')) throw new Error("Empty validation statusBox has hidden class");
+  if (!statusBox.innerHTML.includes('Empty YAML') || !statusBox.innerHTML.includes('Compose YAML content cannot be empty.')) {{
+    throw new Error("Empty YAML validation text missing: " + statusBox.innerHTML);
+  }}
+
+  // Test 2: Valid YAML feedback rendering
+  ctx.apiFetch = async function(url, opts) {{
+    return {{
+      ok: true,
+      json: async () => ({{
+        valid: true,
+        services: ['web-server', 'redis-db'],
+        ports: ['8080:80', '6379:6379'],
+        warnings: ['Warning: No restart policy specified']
+      }})
+    }};
+  }};
+
+  await ctx.validateStackYaml('services:\\n  web-server:\\n    image: nginx\\n  redis-db:\\n    image: redis');
+  if (statusBox.classList.contains('hidden')) throw new Error("Valid statusBox has hidden class");
+  if (!statusBox.innerHTML.includes('Valid Compose YAML')) throw new Error("Valid YAML badge missing");
+  if (!statusBox.innerHTML.includes('2 services detected')) throw new Error("Service count missing");
+  if (!statusBox.innerHTML.includes('web-server') || !statusBox.innerHTML.includes('redis-db')) throw new Error("Service names missing in pills");
+  if (!statusBox.innerHTML.includes('8080:80') || !statusBox.innerHTML.includes('6379:6379')) throw new Error("Port pills missing");
+  if (!statusBox.innerHTML.includes('Warning: No restart policy specified')) throw new Error("Warning message missing");
+
+  // Test 3: Invalid YAML feedback rendering
+  ctx.apiFetch = async function(url, opts) {{
+    return {{
+      ok: false,
+      json: async () => ({{
+        valid: false,
+        errors: ['YAML parsing error at line 4: mapping values are not allowed here']
+      }})
+    }};
+  }};
+
+  await ctx.validateStackYaml('services:\\n  bad: [unclosed');
+  if (statusBox.classList.contains('hidden')) throw new Error("Invalid statusBox has hidden class");
+  if (!statusBox.innerHTML.includes('Invalid Compose YAML')) throw new Error("Invalid YAML badge missing");
+  if (!statusBox.innerHTML.includes('YAML parsing error at line 4')) throw new Error("Error details missing");
+
+  // Test 4: Network failure error handling
+  ctx.apiFetch = async function(url, opts) {{
+    throw new Error("Connection failed: backend unreachable");
+  }};
+
+  await ctx.validateStackYaml('services:\\n  valid: test');
+  if (!statusBox.innerHTML.includes('Validation Error') || !statusBox.innerHTML.includes('Connection failed: backend unreachable')) {{
+    throw new Error("Network error feedback missing: " + statusBox.innerHTML);
+  }}
+
+  console.log("ALL_NODE_STACK_YAML_VALIDATION_VM_CHECKS_PASSED");
+}})();
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_STACK_YAML_VALIDATION_VM_CHECKS_PASSED", res.stdout)
+
+    def test_1click_deploy_and_stack_save_payload_construction_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const listeners = {{}};
+  return {{
+    id: id,
+    classList: {{
+      add: (cls) => classes.add(cls),
+      remove: (cls) => classes.delete(cls),
+      contains: (cls) => classes.has(cls),
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    listeners: listeners,
+    addEventListener(evt, fn) {{
+      if (!listeners[evt]) listeners[evt] = [];
+      listeners[evt].push(fn);
+    }},
+    value: '',
+    checked: false,
+    disabled: false,
+    textContent: '',
+    innerHTML: '',
+    focus() {{}},
+    scrollIntoView() {{}}
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const capturedCalls = [];
+
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{ addEventListener: () => {{}} }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams,
+  confirm: (prompt) => true,
+  alert: (msg) => {{}}
+}});
+
+vm.runInContext(appJs, ctx);
+
+ctx.apiFetch = async function(url, options = {{}}) {{
+  capturedCalls.push({{ url, options }});
+  return {{
+    ok: true,
+    json: async () => ({{ success: true }})
+  }};
+}};
+
+(async () => {{
+  // Test 1: 1-Click Launch with .env and collision naming resolution
+  capturedCalls.length = 0;
+  vm.runInContext("cachedDockerStacks = [{{ name: 'pihole' }}];", ctx);
+
+  const template = {{
+    id: 'pihole',
+    name: 'Pi-hole',
+    compose_yaml: 'services:\\n  pihole:\\n    image: pihole/pihole:latest',
+    env_content: 'TZ=America/New_York\\nWEBPASSWORD=admin_pass'
+  }};
+
+  await ctx.handle1ClickLaunch(template);
+
+  const launchCall = capturedCalls.find(c => c.url === '/api/docker/stacks' && c.options.method === 'POST');
+  if (!launchCall) throw new Error("handle1ClickLaunch POST /api/docker/stacks call not found among calls: " + JSON.stringify(capturedCalls));
+  const launchPayload = JSON.parse(launchCall.options.body);
+  if (launchPayload.name !== 'pihole-2') throw new Error("Collision deduplication failed, got: " + launchPayload.name);
+  if (launchPayload.compose_yaml !== template.compose_yaml) throw new Error("Compose YAML mismatch");
+  if (launchPayload.env_content !== 'TZ=America/New_York\\nWEBPASSWORD=admin_pass') throw new Error(".env content mismatch: " + launchPayload.env_content);
+  if (launchPayload.deploy !== true) throw new Error("deploy flag must be true");
+
+  // Test 2: Stack Editor Save - New Stack with .env (POST /api/docker/stacks)
+  capturedCalls.length = 0;
+  getEl('stack-name-input').value = 'homelab-stack';
+  getEl('stack-name-input').disabled = false;
+  getEl('stack-yaml-input').value = 'services:\\n  app:\\n    image: node:alpine';
+  getEl('stack-env-input').value = 'NODE_ENV=production\\nPORT=3000';
+  getEl('stack-deploy-toggle').checked = true;
+
+  await ctx.handleSaveStack();
+
+  const createCall = capturedCalls.find(c => c.url === '/api/docker/stacks' && c.options.method === 'POST');
+  if (!createCall) throw new Error("Create stack POST /api/docker/stacks call not found");
+  const createPayload = JSON.parse(createCall.options.body);
+  if (createPayload.name !== 'homelab-stack') throw new Error("Create name mismatch: " + createPayload.name);
+  if (createPayload.compose_yaml !== 'services:\\n  app:\\n    image: node:alpine') throw new Error("Create compose_yaml mismatch");
+  if (createPayload.env_content !== 'NODE_ENV=production\\nPORT=3000') throw new Error("Create env_content mismatch");
+  if (createPayload.deploy !== true) throw new Error("Create deploy flag mismatch");
+
+  // Test 3: Stack Editor Save - Edit Existing Stack with PUT /api/docker/stacks/:name
+  capturedCalls.length = 0;
+  getEl('stack-name-input').value = 'homelab-stack';
+  getEl('stack-name-input').disabled = true; // Signals edit mode
+  getEl('stack-yaml-input').value = 'services:\\n  app:\\n    image: node:20-alpine';
+  getEl('stack-env-input').value = 'NODE_ENV=production\\nPORT=8080';
+  getEl('stack-deploy-toggle').checked = false;
+
+  await ctx.handleSaveStack();
+
+  const editCall = capturedCalls.find(c => c.url === '/api/docker/stacks/homelab-stack' && c.options.method === 'PUT');
+  if (!editCall) throw new Error("Edit stack PUT /api/docker/stacks/homelab-stack call not found");
+  const editPayload = JSON.parse(editCall.options.body);
+  if (editPayload.name !== 'homelab-stack') throw new Error("Edit name mismatch: " + editPayload.name);
+  if (editPayload.compose_yaml !== 'services:\\n  app:\\n    image: node:20-alpine') throw new Error("Edit compose_yaml mismatch");
+  if (editPayload.env_content !== 'NODE_ENV=production\\nPORT=8080') throw new Error("Edit env_content mismatch");
+  if (editPayload.deploy !== false) throw new Error("Edit deploy flag mismatch, expected false");
+
+  // Test 4: Frontend Validation Protection (Invalid Name)
+  capturedCalls.length = 0;
+  getEl('stack-name-input').disabled = false;
+  getEl('stack-name-input').value = 'invalid name with spaces';
+  const feedback = getEl('stack-editor-feedback');
+  feedback.classList.add('hidden');
+
+  await ctx.handleSaveStack();
+  if (capturedCalls.length !== 0) throw new Error("API call should not be dispatched for invalid stack name");
+  if (feedback.classList.contains('hidden')) throw new Error("Feedback was not displayed for invalid stack name");
+  if (!feedback.textContent.includes("letters, numbers, dashes, and underscores")) {{
+    throw new Error("Feedback message mismatch: " + feedback.textContent);
+  }}
+
+  // Test 5: Frontend Validation Protection (Empty YAML)
+  capturedCalls.length = 0;
+  getEl('stack-name-input').value = 'valid-name';
+  getEl('stack-yaml-input').value = '';
+  feedback.classList.add('hidden');
+
+  await ctx.handleSaveStack();
+  if (capturedCalls.length !== 0) throw new Error("API call should not be dispatched for empty YAML");
+  if (feedback.classList.contains('hidden')) throw new Error("Feedback was not displayed for empty YAML");
+  if (!feedback.textContent.includes("cannot be empty")) {{
+    throw new Error("Feedback message mismatch for empty YAML: " + feedback.textContent);
+  }}
+
+  console.log("ALL_NODE_1CLICK_DEPLOY_AND_SAVE_VM_CHECKS_PASSED");
+}})();
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_1CLICK_DEPLOY_AND_SAVE_VM_CHECKS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":

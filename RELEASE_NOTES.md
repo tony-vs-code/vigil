@@ -1,25 +1,30 @@
-# Release v1.0.31: Streamlined Docker Actions & Quick Dropdown Menus
+# Release v1.0.32: Visual Docker Compose Editor & 1-Click Homelab App Catalog
 
 ## Overview
-Vigil v1.0.31 streamlines the Actions columns for Docker Containers and Docker Stacks across the dashboard. By introducing prominent Primary Quick Actions (`Restart`/`Start`, `Logs`, `Terminal`, `Edit`) paired with an elegant, responsive "⋯" More dropdown for secondary and destructive operations (`Stop`, `Pause`, `Pull`, `Down`, `Remove`, `Delete`), container and stack management is significantly cleaner, prevents horizontal table bloating, and eliminates accidental destructive clicks.
+Vigil v1.0.32 introduces a complete **Visual Docker Compose Editor & 1-Click Homelab App Catalog**, enabling operators to explore, customize, deploy, and manage self-hosted applications effortlessly. Featuring 11 production-ready homelab application templates, instant 1-click deployment, pre-deploy customization with real-time environment variable templating, a dual-tab compose and `.env` editor, live YAML validation with syntax diagnostics, and service/port pill detection, managing multi-container stacks in Vigil is faster, safer, and more intuitive than ever.
 
 ## Highlights & Enhancements
 
-### 1. Streamlined Docker Containers Actions
-- **Primary Quick Actions**: High-frequency workflows remain 1-click accessible. Running containers show prominent `Restart`, `Logs`, and `Terminal` buttons; stopped containers provide instant `Start` and `Logs`; paused containers feature an immediate `Unpause` action.
-- **"⋯" More Dropdown Menu**: Secondary lifecycle actions (`Stop`, `Pause`, `Terminal` for stopped containers, and `Remove`) are consolidated inside a sleek popover dropdown menu.
-- **Accidental Deletion Protection**: Destructive operations like container removal (`Remove`) feature distinctive red danger styling (`actions-dropdown-item danger`) with confirmation dialogs.
+### 1. Curated Homelab App Catalog (11 Templates)
+- **Production-Ready Blueprints**: Includes 11 popular homelab services: Pi-hole (DNS & Ad-blocking), Uptime Kuma (Monitoring), Nginx Proxy Manager (Reverse Proxy), Vaultwarden (Password Management), Jellyfin (Media Server), Home Assistant (Smart Home), Portainer CE (Docker UI), Dozzle (Real-time Container Logs), Redis (In-Memory Datastore), PostgreSQL (Relational Database), and Glances (System Observability).
+- **Category Filter & Instant Search**: Filter catalog apps by category tags (`All`, `Monitoring`, `Networking`, `Security`, `Media`, `Database`, `Automation`, `Management`) or perform instant multi-attribute text search matching application names, descriptions, and categories.
+- **Card-Based App Discovery**: Each application card features iconography, category badge, quick port references, volume hints, and immediate call-to-actions.
 
-### 2. Streamlined Docker Compose Stacks Actions
-- **Primary Quick Actions**: Active stacks feature direct `Restart` and `Edit` buttons, while stopped stacks display immediate `Start` and `Edit` actions. External/unmanaged compose stacks retain their protective `Read-Only (External)` safety badge.
-- **Unified Stack Dropdown**: Lifecycle and teardown operations (`Stop`, `Pull`, `Down`, `Delete`) are consolidated within the stack's "⋯" More dropdown menu.
-- **Contextual Destruction Styling**: Teardown (`Down`) and stack file deletion (`Delete`) operations are cleanly separated by a divider and styled with danger hover highlights.
+### 2. 1-Click Launch & Customize Workflows
+- **1-Click Launch**: Instantly scaffold and deploy default application configurations with automatic port assignments and data directory generation.
+- **Customize & Deploy Modal**: Interactive configuration modal prompting for stack name, exposed host port mapping, host volume storage paths, and environment variable defaults prior to spinning up containers.
+- **Pre-populated Stack Editor**: Effortlessly seed the Docker Compose Stack Editor directly from any catalog template with one click.
 
-### 3. Accessible UX & Dismissal Lifecycle
-- **Click-Outside & Keyboard Dismissal**: Opening any dropdown registers automatic click-outside backdrop dismissal and Escape key listeners, closing all active action popovers instantly.
-- **Multi-Menu Mutual Exclusion**: Activating any dropdown automatically closes any other open dropdown menus across the dashboard.
-- **Dynamic Positioning & Elevated Contrast**: High-contrast, dark-mode elevated card styling (`box-shadow`, subtle borders, and hover micro-transitions) ensures consistent readability across compact viewport widths.
+### 3. Dual-Tab Stack Editor & Multi-File Persistence
+- **Dual-Tab Architecture**: Seamlessly switch between `docker-compose.yml` (YAML Editor) and `.env Variables` (Environment Configuration) without losing unsaved changes.
+- **Multi-File Storage Synchronization**: Synchronizes both Compose specification and environment variables to disk filesystem (`/opt/stacks/<name>/.env` and `docker-compose.yml`) as well as Vigil SQLite storage for persistent management.
+
+### 4. Live YAML Validation & Diagnostic Feedback Pills
+- **Real-Time Validation Endpoint**: Asynchronous `/api/docker/compose/validate` endpoint verifies Docker Compose syntax and structure using PyYAML.
+- **Interactive Service & Port Pills**: Detects defined service names and parsed port forward mappings, displaying live visual pills beneath the editor for immediate feedback.
+- **Actionable Diagnostic Alerts**: Highlights YAML syntax errors, indentation faults, and missing service directives inline with clear warning/success state pills.
 
 ## Reliability & Fixes
-- **Comprehensive Test Suite**: All 245 unit, integration, and frontend Node VM tests passed with 100% success.
-- **Node VM & DOM Contract Verification**: Verified complete HTML generation, DOM event contracts, and CSS selector validity across container states (`running`, `stopped`, `paused`) and stack configurations (`running`, `stopped`, `external`).
+- **Comprehensive Test Suite**: 253/253 automated tests passing (100% PASS), covering backend API endpoints, SQLite/filesystem persistence, YAML validation logic, and frontend DOM/VM contracts.
+- **Node VM Contract Validation**: Full DOM event routing, tab switching, search/filtering, and modal parameter injection verified in automated JavaScript test harnesses.
+- **Backward Compatibility**: Fully compatible with existing standalone containers and previously deployed compose stacks.
