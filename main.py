@@ -4821,6 +4821,117 @@ class DockerManager:
         args.append(container_id)
         return self._run_docker(args, timeout=15)
 
+    def create_container_exec(
+        self,
+        container_id: str,
+        cmd: Optional[list[str]] = None,
+        user: str = "",
+        tty: bool = True,
+    ) -> dict[str, Any]:
+        """Create an exec instance inside a container via Docker Engine API."""
+        cid = container_id.strip()
+        if not cid:
+            raise ValueError("Container ID cannot be empty.")
+        if not self.is_running():
+            raise RuntimeError("Docker daemon is not running.")
+        payload = {
+            "AttachStdin": True,
+            "AttachStdout": True,
+            "AttachStderr": True,
+            "Tty": bool(tty),
+            "Cmd": cmd or ["/bin/sh"],
+            "User": user or "",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        status, data = self._socket_request(
+            "POST",
+            f"/containers/{cid}/exec",
+            body=body,
+            timeout=10.0,
+        )
+        if status not in (200, 201):
+            err_msg = data.decode("utf-8", errors="replace")
+            try:
+                err_json = json.loads(err_msg)
+                if isinstance(err_json, dict) and "message" in err_json:
+                    err_msg = err_json["message"]
+            except Exception:
+                pass
+            if status == 404:
+                raise FileNotFoundError(f"Container '{cid}' not found: {err_msg}")
+            raise RuntimeError(f"Failed to create exec instance ({status}): {err_msg}")
+
+        parsed = json.loads(data.decode("utf-8"))
+        exec_id = parsed.get("Id") or parsed.get("id")
+        if not exec_id:
+            raise RuntimeError("Docker daemon returned invalid exec ID.")
+        return {"id": exec_id}
+
+    def resize_container_exec(
+        self,
+        exec_id: str,
+        height: int,
+        width: int,
+    ) -> bool:
+        """Resize the TTY of an exec instance via Docker Engine API."""
+        eid = exec_id.strip()
+        if not eid:
+            return False
+        if not self.is_running():
+            return False
+        try:
+            status, _ = self._socket_request(
+                "POST",
+                f"/exec/{eid}/resize?h={int(height)}&w={int(width)}",
+                timeout=5.0,
+            )
+            return status in (200, 201)
+        except Exception as exc:
+            logging.debug(f"Failed to resize exec {eid}: {exc}")
+            return False
+
+    def start_container_exec_socket(self, exec_id: str) -> socket.socket:
+        """Connect raw Unix domain socket to Docker daemon and initiate exec stream."""
+        eid = exec_id.strip()
+        if not eid:
+            raise ValueError("Exec ID cannot be empty.")
+        if not os.path.exists(self.socket_path):
+            raise FileNotFoundError(f"Docker socket not found: {self.socket_path}")
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10.0)
+        try:
+            sock.connect(self.socket_path)
+            req = (
+                f"POST /exec/{eid}/start HTTP/1.1\r\n"
+                f"Host: localhost\r\n"
+                f"Content-Type: application/json\r\n"
+                f"Upgrade: tcp\r\n"
+                f"Connection: Upgrade\r\n\r\n"
+                f'{{"Detach": false, "Tty": true}}'
+            )
+            sock.sendall(req.encode("utf-8"))
+
+            header_bytes = bytearray()
+            while not header_bytes.endswith(b"\r\n\r\n"):
+                chunk = sock.recv(1)
+                if not chunk:
+                    break
+                header_bytes.extend(chunk)
+
+            if b"\r\n\r\n" not in header_bytes:
+                raise ConnectionError("Docker daemon closed connection before completing handshake.")
+
+            first_line = header_bytes.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+            if "101" not in first_line and "200" not in first_line:
+                raise RuntimeError(f"Docker exec start failed: {first_line}")
+
+            sock.setblocking(False)
+            return sock
+        except Exception:
+            sock.close()
+            raise
+
     def list_stacks(self) -> list[dict[str, Any]]:
         managed_stacks: dict[str, dict[str, Any]] = {}
         try:
@@ -6268,6 +6379,9 @@ apply_docker_updates = docker_manager.apply_updates
 get_docker_auto_update_config = docker_manager.get_auto_update_config
 set_docker_auto_update_config = docker_manager.set_auto_update_config
 invalidate_docker_cache = docker_manager.invalidate_cache
+create_docker_container_exec = docker_manager.create_container_exec
+resize_docker_container_exec = docker_manager.resize_container_exec
+start_docker_container_exec_socket = docker_manager.start_container_exec_socket
 _clean_docker_error = DockerManager._clean_docker_error
 
 # ============================================================================

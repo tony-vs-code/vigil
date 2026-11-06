@@ -7,10 +7,12 @@ import os
 from pathlib import Path
 import psutil
 import re
+import shutil
 import socket
 import sqlite3
 from subprocess import CalledProcessError
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch, mock_open
@@ -256,7 +258,14 @@ def asgi_ws(
 
     inbound_queue: list[dict] = [{"type": "websocket.connect"}]
     for msg in client_messages or []:
-        inbound_queue.append({"type": "websocket.receive", "text": json.dumps(msg)})
+        if isinstance(msg, dict) and msg.get("type") == "websocket.receive":
+            inbound_queue.append(msg)
+        elif isinstance(msg, str):
+            inbound_queue.append({"type": "websocket.receive", "text": msg})
+        elif isinstance(msg, bytes):
+            inbound_queue.append({"type": "websocket.receive", "bytes": msg})
+        else:
+            inbound_queue.append({"type": "websocket.receive", "text": json.dumps(msg)})
     inbound_queue.append({"type": "websocket.disconnect", "code": 1000})
 
     accepted = False
@@ -275,8 +284,14 @@ def asgi_ws(
             accepted = True
         elif msg_type == "websocket.send":
             text = message.get("text")
-            if text is not None:
-                sent_messages.append(json.loads(text))
+            b_data = message.get("bytes")
+            if b_data is not None:
+                sent_messages.append({"bytes": b_data})
+            elif text is not None:
+                try:
+                    sent_messages.append(json.loads(text))
+                except Exception:
+                    sent_messages.append({"text": text})
         elif msg_type == "websocket.close":
             close_code = message.get("code", 1000)
 
@@ -11755,6 +11770,7 @@ class ApiEndpointAuthenticationSecurityTests(unittest.TestCase):
             "target_id": "1",
             "filename": "test-archive.tar.gz",
             "job_id": "1",
+            "container_id": "test_container",
         }
 
         def fill_route_path(tmpl: str) -> str:
@@ -11773,15 +11789,20 @@ class ApiEndpointAuthenticationSecurityTests(unittest.TestCase):
                 continue
 
             # Check for WebSocket endpoint
-            if path == "/api/ws" or getattr(route, "protocol", None) == "websocket":
-                unauth_ws = asgi_ws(api.app, "/api/ws")
+            if (
+                path == "/api/ws"
+                or getattr(route, "protocol", None) == "websocket"
+                or "websocket" in type(route).__name__.lower()
+            ):
+                resolved_path = fill_route_path(path)
+                unauth_ws = asgi_ws(api.app, resolved_path)
                 self.assertEqual(
                     unauth_ws.close_code,
                     1008,
-                    f"Expected WebSocket unauth connection to close with 1008, got {unauth_ws.close_code}",
+                    f"Expected WebSocket unauth connection to close with 1008 on {resolved_path}, got {unauth_ws.close_code}",
                 )
                 api_routes_found += 1
-                tested_endpoints.append(("WS", "/api/ws"))
+                tested_endpoints.append(("WS", path))
                 continue
 
             # Check HTTP routes
@@ -11859,6 +11880,520 @@ class ApiEndpointAuthenticationSecurityTests(unittest.TestCase):
         self.assertIn("updateBackupsNavBadge()", auth_body)
         self.assertIn('currentViewTab === "backups"', auth_body)
         self.assertIn("isBackupsAndCronRefreshing", content)
+
+
+class DockerContainerTerminalBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "state.db"
+        self.db_patcher = patch.object(main, "STATE_DB_PATH", self.db_path)
+        self.db_patcher.start()
+        main.init_state_db()
+        self.username = "admin"
+        main.create_user(self.username, "Password123!")
+        self.token = main.create_session(self.username)
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_create_container_exec_success_default_and_custom_options(self):
+        mgr = main.DockerManager()
+        with patch.object(mgr, "is_running", return_value=True):
+            # 1. Default options
+            with patch.object(mgr, "_socket_request", return_value=(201, b'{"Id": "exec_12345"}')) as mock_req:
+                res = mgr.create_container_exec("c_test")
+                self.assertEqual(res, {"id": "exec_12345"})
+                mock_req.assert_called_once()
+                args, kwargs = mock_req.call_args
+                self.assertEqual(args[0], "POST")
+                self.assertEqual(args[1], "/containers/c_test/exec")
+                payload = json.loads(kwargs["body"].decode("utf-8"))
+                self.assertEqual(payload["Cmd"], ["/bin/sh"])
+                self.assertEqual(payload["User"], "")
+                self.assertTrue(payload["Tty"])
+                self.assertTrue(payload["AttachStdin"])
+                self.assertTrue(payload["AttachStdout"])
+                self.assertTrue(payload["AttachStderr"])
+
+            # 2. Custom options
+            with patch.object(mgr, "_socket_request", return_value=(200, b'{"Id": "exec_custom"}')) as mock_req:
+                res = mgr.create_container_exec("c_custom", cmd=["/bin/bash"], user="node", tty=False)
+                self.assertEqual(res, {"id": "exec_custom"})
+                payload = json.loads(mock_req.call_args[1]["body"].decode("utf-8"))
+                self.assertEqual(payload["Cmd"], ["/bin/bash"])
+                self.assertEqual(payload["User"], "node")
+                self.assertFalse(payload["Tty"])
+
+    def test_create_container_exec_error_handling(self):
+        mgr = main.DockerManager()
+        # Empty container ID
+        with self.assertRaises(ValueError):
+            mgr.create_container_exec("  ")
+
+        # Daemon offline
+        with patch.object(mgr, "is_running", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                mgr.create_container_exec("c1")
+            self.assertIn("daemon is not running", str(ctx.exception).lower())
+
+        # Container not found (404)
+        with patch.object(mgr, "is_running", return_value=True):
+            with patch.object(mgr, "_socket_request", return_value=(404, b'{"message": "No such container: c1"}')):
+                with self.assertRaises(FileNotFoundError) as ctx:
+                    mgr.create_container_exec("c1")
+                self.assertIn("not found", str(ctx.exception))
+
+            # Server error (500)
+            with patch.object(mgr, "_socket_request", return_value=(500, b'{"message": "daemon crashed"}')):
+                with self.assertRaises(RuntimeError) as ctx:
+                    mgr.create_container_exec("c1")
+                self.assertIn("Failed to create exec instance", str(ctx.exception))
+
+    def test_resize_container_exec(self):
+        mgr = main.DockerManager()
+        with patch.object(mgr, "is_running", return_value=True):
+            # Success 201
+            with patch.object(mgr, "_socket_request", return_value=(201, b"")) as mock_req:
+                ok = mgr.resize_container_exec("exec_abc", height=35, width=110)
+                self.assertTrue(ok)
+                mock_req.assert_called_once_with("POST", "/exec/exec_abc/resize?h=35&w=110", timeout=5.0)
+
+            # Success 200
+            with patch.object(mgr, "_socket_request", return_value=(200, b"")):
+                self.assertTrue(mgr.resize_container_exec("exec_abc", height=24, width=80))
+
+            # Failure HTTP code
+            with patch.object(mgr, "_socket_request", return_value=(500, b"error")):
+                ok = mgr.resize_container_exec("exec_abc", height=24, width=80)
+                self.assertFalse(ok)
+
+        # Empty exec_id or daemon offline
+        self.assertFalse(mgr.resize_container_exec("", 24, 80))
+        with patch.object(mgr, "is_running", return_value=False):
+            self.assertFalse(mgr.resize_container_exec("exec_abc", 24, 80))
+
+    def test_start_container_exec_socket_handshake_and_errors(self):
+        # Empty exec_id
+        mgr = main.DockerManager(socket_path="/tmp/nonexistent_docker.sock")
+        with self.assertRaises(ValueError):
+            mgr.start_container_exec_socket("")
+
+        # Socket file does not exist
+        with self.assertRaises(FileNotFoundError):
+            mgr.start_container_exec_socket("exec_123")
+
+        # Test handshake using a Unix domain socket server
+        sock_dir = tempfile.mkdtemp()
+        real_sock_path = os.path.join(sock_dir, "docker.sock")
+        try:
+            server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server_sock.bind(real_sock_path)
+            server_sock.listen(1)
+
+            received_req = bytearray()
+
+            def handle_client():
+                conn, _ = server_sock.accept()
+                try:
+                    while b"\r\n\r\n" not in received_req:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            break
+                        received_req.extend(chunk)
+                    conn.sendall(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+                    time.sleep(0.05)
+                finally:
+                    pass
+
+            t = threading.Thread(target=handle_client)
+            t.start()
+
+            test_mgr = main.DockerManager(socket_path=real_sock_path)
+            client_sock = test_mgr.start_container_exec_socket("exec_test_456")
+            t.join()
+
+            self.assertIn(b"POST /exec/exec_test_456/start HTTP/1.1", received_req)
+            self.assertIn(b"Upgrade: tcp", received_req)
+            self.assertIn(b"Connection: Upgrade", received_req)
+            self.assertIn(b'{"Detach": false, "Tty": true}', received_req)
+
+            client_sock.close()
+            server_sock.close()
+        finally:
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+    def test_start_container_exec_socket_handshake_failure(self):
+        sock_dir = tempfile.mkdtemp()
+        real_sock_path = os.path.join(sock_dir, "docker.sock")
+        try:
+            server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server_sock.bind(real_sock_path)
+            server_sock.listen(1)
+
+            def handle_bad_client():
+                conn, _ = server_sock.accept()
+                try:
+                    conn.recv(1024)
+                    conn.sendall(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+                finally:
+                    conn.close()
+
+            t = threading.Thread(target=handle_bad_client)
+            t.start()
+
+            test_mgr = main.DockerManager(socket_path=real_sock_path)
+            with self.assertRaises(RuntimeError) as ctx:
+                test_mgr.start_container_exec_socket("exec_bad")
+            self.assertIn("500", str(ctx.exception))
+            t.join()
+            server_sock.close()
+        finally:
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+    def test_terminal_websocket_unauthenticated_rejected_with_1008(self):
+        # 1. No token at all
+        res = asgi_ws(api.app, "/api/docker/containers/c123/terminal")
+        self.assertEqual(res.close_code, 1008)
+
+        # 2. Invalid token
+        res_invalid = asgi_ws(api.app, "/api/docker/containers/c123/terminal?token=invalid_token")
+        self.assertEqual(res_invalid.close_code, 1008)
+
+    def test_terminal_websocket_exec_creation_error_closes_with_1011(self):
+        with patch.object(main.docker_manager, "create_container_exec", side_effect=RuntimeError("Container not running")):
+            res = asgi_ws(
+                api.app,
+                f"/api/docker/containers/c123/terminal?token={self.token}",
+            )
+            self.assertTrue(res.accepted)
+            self.assertEqual(res.close_code, 1011)
+
+    def test_terminal_websocket_socket_connect_error_closes_with_1011(self):
+        with (
+            patch.object(main.docker_manager, "create_container_exec", return_value={"id": "exec_abc"}),
+            patch.object(main.docker_manager, "start_container_exec_socket", side_effect=ConnectionError("Docker socket closed")),
+        ):
+            res = asgi_ws(
+                api.app,
+                f"/api/docker/containers/c123/terminal?token={self.token}",
+            )
+            self.assertTrue(res.accepted)
+            self.assertEqual(res.close_code, 1011)
+
+    def test_terminal_websocket_authenticated_relay(self):
+        sock_a, sock_b = socket.socketpair()
+        try:
+            with (
+                patch.object(main.docker_manager, "create_container_exec", return_value={"id": "exec_live_999"}) as mock_create,
+                patch.object(main.docker_manager, "start_container_exec_socket", return_value=sock_a) as mock_start,
+                patch.object(main.docker_manager, "resize_container_exec", return_value=True) as mock_resize,
+                patch.object(main, "record_audit_event") as mock_audit,
+            ):
+                # Send stdout data from Docker socket end before disconnect
+                sock_b.sendall(b"root@box:/# ")
+
+                client_msgs = [
+                    {"type": "websocket.receive", "text": '{"type": "resize", "cols": 110, "rows": 32}'},
+                    {"type": "websocket.receive", "text": "uname -a\n"},
+                ]
+                res = asgi_ws(
+                    api.app,
+                    f"/api/docker/containers/c123/terminal?token={self.token}&shell=/bin/bash&user=alice",
+                    client_messages=client_msgs,
+                )
+
+                self.assertTrue(res.accepted)
+                mock_create.assert_called_once_with(
+                    "c123",
+                    cmd=["/bin/bash"],
+                    user="alice",
+                    tty=True,
+                )
+                mock_start.assert_called_once_with("exec_live_999")
+                mock_resize.assert_called_with("exec_live_999", height=32, width=110)
+                mock_audit.assert_called_once()
+                self.assertEqual(mock_audit.call_args[0][0], "docker.container.terminal_opened")
+
+                # Verify stdin was written to Docker socket
+                received_stdin = sock_b.recv(1024)
+                self.assertEqual(received_stdin, b"uname -a\n")
+
+                # Verify stdout was delivered to client WebSocket as bytes
+                byte_messages = [m.get("bytes") for m in res.messages if isinstance(m, dict) and "bytes" in m]
+                self.assertIn(b"root@box:/# ", byte_messages)
+        finally:
+            try:
+                sock_b.close()
+            except Exception:
+                pass
+
+
+class DockerContainerTerminalFrontendTests(unittest.TestCase):
+    """Frontend DOM contracts, ANSI terminal rendering, and keyboard handler tests."""
+
+    def test_docker_container_terminal_dom_and_ui_contracts(self):
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        js = (root / "static" / "app.js").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        # 1. HTML DOM ID contracts
+        required_dom_ids = [
+            "container-terminal-modal",
+            "container-terminal-title",
+            "container-terminal-subtitle",
+            "container-terminal-shell-select",
+            "container-terminal-user-input",
+            "btn-reconnect-terminal",
+            "btn-clear-terminal",
+            "btn-fullscreen-terminal",
+            "btn-close-terminal",
+            "container-terminal-body",
+            "container-terminal-screen",
+            "container-terminal-status",
+        ]
+        for dom_id in required_dom_ids:
+            self.assertIn(f'id="{dom_id}"', html, f"Missing #{dom_id} in static/index.html")
+
+        # Shell select options
+        self.assertIn('<option value="/bin/sh" selected>/bin/sh</option>', html)
+        self.assertIn('<option value="/bin/bash">/bin/bash</option>', html)
+
+        # Screen accessibility & focus attributes
+        self.assertIn('tabindex="0"', html)
+        self.assertIn('aria-label="Container Interactive Terminal"', html)
+
+        # Status badge & hint text
+        self.assertIn("Disconnected", html)
+        self.assertIn("Ctrl+C, Ctrl+D, Tab, Arrows, and Copy/Paste supported", html)
+
+        # 2. CSS contracts
+        required_css_selectors = [
+            ".btn-terminal",
+            ".terminal-modal-card",
+            ".modal-overlay.terminal-fullscreen",
+            ".terminal-screen",
+            ".terminal-cursor",
+            ".terminal-row",
+            ".status-dot.pulse",
+            ".ansi-red",
+            ".ansi-green",
+            ".ansi-yellow",
+            ".ansi-blue",
+            ".ansi-magenta",
+            ".ansi-cyan",
+            ".ansi-white",
+            ".ansi-bright-red",
+            ".ansi-bg-red",
+            ".ansi-bold",
+            ".ansi-dim",
+            ".ansi-underline",
+        ]
+        for sel in required_css_selectors:
+            self.assertIn(sel, css, f"Missing CSS selector {sel} in static/styles.css")
+
+        # 3. JS function contracts
+        required_js_funcs = [
+            "function openContainerTerminal(",
+            "function closeContainerTerminal(",
+            "connectContainerTerminal(",
+            "function clearTerminalScreen(",
+            "function toggleTerminalFullscreen(",
+            "function feedTerminalText(",
+            "function handleTerminalKeyDown(",
+            "function sendTerminalResize(",
+            "data-terminal-container-id=",
+        ]
+        for fn in required_js_funcs:
+            self.assertIn(fn, js, f"Missing JS element or function {fn} in static/app.js")
+
+    def test_docker_container_terminal_ansi_engine_and_keyboard_in_node_vm(self):
+        import json
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+
+// Mock browser globals for DOM & WebSocket testing
+let sentWsData = [];
+let mockWsInstance = null;
+
+class MockWebSocket {{
+  constructor(url) {{
+    this.url = url;
+    this.readyState = 1; // OPEN
+    mockWsInstance = this;
+    sentWsData = [];
+  }}
+  send(data) {{
+    sentWsData.push(data);
+  }}
+  close() {{
+    this.readyState = 3;
+    if (this.onclose) this.onclose({{ code: 1000 }});
+  }}
+}}
+MockWebSocket.OPEN = 1;
+
+global.WebSocket = MockWebSocket;
+global.window = {{
+  location: {{ protocol: 'http:', host: 'localhost:8000' }},
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  addEventListener: () => {{}},
+  getSelection: () => ({{ toString: () => '' }}),
+}};
+global.requestAnimationFrame = (fn) => fn();
+
+const mockElements = {{}};
+function getMockElement(id) {{
+  if (!mockElements[id]) {{
+    mockElements[id] = {{
+      id: id,
+      className: '',
+      classList: {{
+        add: function(c) {{ if (!this.classes.includes(c)) this.classes.push(c); }},
+        remove: function(c) {{ this.classes = this.classes.filter(x => x !== c); }},
+        toggle: function(c) {{
+          if (this.classes.includes(c)) {{ this.remove(c); return false; }}
+          else {{ this.add(c); return true; }}
+        }},
+        contains: function(c) {{ return this.classes.includes(c); }},
+        classes: []
+      }},
+      style: {{}},
+      innerHTML: '',
+      textContent: '',
+      value: '',
+      scrollTop: 0,
+      scrollHeight: 100,
+      clientWidth: 800,
+      clientHeight: 400,
+      focus: () => {{}},
+      appendChild: () => {{}},
+      removeChild: () => {{}},
+      getBoundingClientRect: () => ({{ width: 85, height: 19 }})
+    }};
+  }}
+  return mockElements[id];
+}}
+
+global.document = {{
+  getElementById: (id) => getMockElement(id),
+  createElement: (tag) => ({{
+    style: {{}},
+    getBoundingClientRect: () => ({{ width: 85, height: 19 }}),
+    textContent: ''
+  }}),
+  activeElement: null,
+  addEventListener: () => {{}}
+}};
+
+// Read and extract terminal functions from app.js
+const appJsCode = fs.readFileSync('{js_path}', 'utf-8');
+
+const vm = require('vm');
+
+// Evaluate state and terminal methods in current scope
+vm.runInThisContext(`
+var activeTerminalContainerId = null;
+var activeTerminalContainerName = "";
+var terminalWs = null;
+var terminalLines = [[]];
+var terminalCursorRow = 0;
+var terminalCursorCol = 0;
+var terminalCurrentStyle = {{
+  fg: null,
+  bg: null,
+  bold: false,
+  dim: false,
+  italic: false,
+  underline: false,
+  inverse: false,
+}};
+var terminalParserState = "NORMAL";
+var terminalCsiParams = "";
+var terminalOscParams = "";
+var terminalPendingBuffer = "";
+var terminalRenderScheduled = false;
+
+function escapeHtml(str) {{ return String(str || ''); }}
+function getStoredToken() {{ return 'test-session-token-123'; }}
+` + appJsCode.slice(appJsCode.indexOf('function openContainerTerminal('), appJsCode.indexOf('async function fetchDockerImages(')));
+
+// Test 1: Open Terminal & check WebSocket connection
+openContainerTerminal('c_test_99', 'my_service', '/bin/bash', 'developer');
+if (!terminalWs) throw new Error("terminalWs should be initialized");
+if (!terminalWs.url.includes('/api/docker/containers/c_test_99/terminal')) throw new Error("Incorrect WS URL: " + terminalWs.url);
+if (!terminalWs.url.includes('shell=%2Fbin%2Fbash')) throw new Error("Missing shell in WS URL");
+if (!terminalWs.url.includes('user=developer')) throw new Error("Missing user in WS URL");
+if (!terminalWs.url.includes('token=test-session-token-123')) throw new Error("Missing token in WS URL");
+
+// Test 2: Trigger WS onopen & verify resize frame sent
+terminalWs.onopen();
+const resizeMsg = sentWsData.find(d => typeof d === 'string' && d.includes('"resize"'));
+if (!resizeMsg) throw new Error("Expected initial resize message sent on connect, got: " + JSON.stringify(sentWsData));
+const parsedResize = JSON.parse(resizeMsg);
+if (parsedResize.type !== 'resize' || typeof parsedResize.cols !== 'number' || typeof parsedResize.rows !== 'number') {{
+  throw new Error("Invalid resize payload: " + resizeMsg);
+}}
+
+// Test 3: Feed ANSI text stream and verify parser state & DOM output
+sentWsData = [];
+feedTerminalText("\\x1b[32mPASS\\x1b[0m: container healthy\\r\\nSecond line");
+const screenEl = document.getElementById("container-terminal-screen");
+if (!screenEl.innerHTML.includes('ansi-green')) throw new Error("Missing ansi-green span in screen innerHTML: " + screenEl.innerHTML);
+if (!screenEl.innerHTML.includes('PASS')) throw new Error("Missing PASS text in screen innerHTML");
+if (!screenEl.innerHTML.includes('Second line')) throw new Error("Missing Second line in screen innerHTML");
+
+// Test 4: Backspace and Carriage Return handling
+feedTerminalText("\\r\\x1b[KNew Prompt > ");
+if (!screenEl.innerHTML.includes('New Prompt &gt; ')) throw new Error("Carriage return and erase in line failed: " + screenEl.innerHTML);
+
+// Test 5: Keyboard handlers
+// Enter
+sentWsData = [];
+handleTerminalKeyDown({{ key: 'Enter', preventDefault: () => {{}} }});
+if (sentWsData[0] !== '\\r') throw new Error("Enter should send \\\\r, sent: " + JSON.stringify(sentWsData));
+
+// Backspace
+sentWsData = [];
+handleTerminalKeyDown({{ key: 'Backspace', preventDefault: () => {{}} }});
+if (sentWsData[0] !== '\\x7f') throw new Error("Backspace should send \\\\x7f, sent: " + JSON.stringify(sentWsData));
+
+// Tab
+sentWsData = [];
+let tabPrevented = false;
+handleTerminalKeyDown({{ key: 'Tab', preventDefault: () => {{ tabPrevented = true; }} }});
+if (sentWsData[0] !== '\\t' || !tabPrevented) throw new Error("Tab should send \\\\t and prevent default");
+
+// ArrowUp
+sentWsData = [];
+handleTerminalKeyDown({{ key: 'ArrowUp', preventDefault: () => {{}} }});
+if (sentWsData[0] !== '\\x1b[A') throw new Error("ArrowUp should send \\\\x1b[A");
+
+// Ctrl+C
+sentWsData = [];
+handleTerminalKeyDown({{ key: 'c', ctrlKey: true, preventDefault: () => {{}} }});
+if (sentWsData[0] !== '\\x03') throw new Error("Ctrl+C should send \\\\x03");
+
+// Regular character 'x'
+sentWsData = [];
+handleTerminalKeyDown({{ key: 'x', preventDefault: () => {{}} }});
+if (sentWsData[0] !== 'x') throw new Error("Char 'x' should send 'x'");
+
+// Close terminal
+closeContainerTerminal();
+if (terminalWs !== null) throw new Error("terminalWs should be null after close");
+console.log("ALL_NODE_TERMINAL_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_TERMINAL_VM_CHECKS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":
