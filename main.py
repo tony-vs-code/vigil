@@ -856,6 +856,13 @@ def get_audit_logs(
 
 
 
+DEFAULT_NOTIFICATION_ROUTING: dict[str, bool] = {
+    "raid_alerts": True,
+    "raid_weekly": True,
+    "cron_failures": True,
+    "cron_successes": False,
+}
+
 DEFAULT_NOTIFICATION_CENTER_CONFIG: dict[str, Any] = {
     "channels": {
         "discord": {
@@ -863,16 +870,74 @@ DEFAULT_NOTIFICATION_CENTER_CONFIG: dict[str, Any] = {
             "bot_token": "",
             "channel_id": "",
             "webhook_url": "",
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
         },
         "telegram": {
             "enabled": False,
             "bot_token": "",
             "chat_id": "",
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
         },
         "webhook": {
             "enabled": False,
             "url": "",
             "headers": {},
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
+        },
+        "pushover": {
+            "enabled": False,
+            "user_key": "",
+            "api_token": "",
+            "priority": 0,
+            "sound": "",
+            "device": "",
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
+        },
+        "ntfy": {
+            "enabled": False,
+            "server_url": "https://ntfy.sh",
+            "topic": "",
+            "access_token": "",
+            "priority": 3,
+            "tags": [],
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
+        },
+        "gotify": {
+            "enabled": False,
+            "server_url": "",
+            "app_token": "",
+            "priority": 5,
+            "routing": {
+                "raid_alerts": True,
+                "raid_weekly": True,
+                "cron_failures": True,
+                "cron_successes": False,
+            },
         },
     },
     "schedule": {
@@ -1471,6 +1536,7 @@ def format_timestamp(timestamp: float) -> str:
 
 class NotificationProvider:
     name: str = "base"
+    routing: dict[str, bool] = {}
 
     async def send_notification(
         self,
@@ -1489,11 +1555,13 @@ class DiscordProvider(NotificationProvider):
         bot_token: str = "",
         channel_id: str = "",
         webhook_url: str = "",
+        routing: Optional[dict[str, bool]] = None,
         enabled: bool = True,
     ) -> None:
         self.bot_token = bot_token.strip()
         self.channel_id = channel_id.strip()
         self.webhook_url = webhook_url.strip()
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
         self.enabled = enabled
 
     async def send_notification(
@@ -1591,10 +1659,12 @@ class TelegramProvider(NotificationProvider):
         self,
         bot_token: str = "",
         chat_id: str = "",
+        routing: Optional[dict[str, bool]] = None,
         enabled: bool = True,
     ) -> None:
         self.bot_token = bot_token.strip()
         self.chat_id = chat_id.strip()
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
         self.enabled = enabled
 
     async def send_notification(
@@ -1661,6 +1731,9 @@ class TelegramProvider(NotificationProvider):
             return False, err_msg
 
 
+TelegramChannel = TelegramProvider
+
+
 class WebhookProvider(NotificationProvider):
     name: str = "webhook"
 
@@ -1668,10 +1741,12 @@ class WebhookProvider(NotificationProvider):
         self,
         url: str = "",
         headers: Optional[dict[str, str]] = None,
+        routing: Optional[dict[str, bool]] = None,
         enabled: bool = True,
     ) -> None:
         self.url = url.strip()
         self.headers = headers or {}
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
         self.enabled = enabled
 
     async def send_notification(
@@ -1714,6 +1789,214 @@ class WebhookProvider(NotificationProvider):
             return False, err
 
 
+WebhookChannel = WebhookProvider
+
+
+class PushoverProvider(NotificationProvider):
+    name: str = "pushover"
+
+    def __init__(
+        self,
+        user_key: str = "",
+        api_token: str = "",
+        priority: int = 0,
+        sound: str = "",
+        device: str = "",
+        routing: Optional[dict[str, bool]] = None,
+        enabled: bool = True,
+    ) -> None:
+        self.user_key = str(user_key or "").strip()
+        self.api_token = str(api_token or "").strip()
+        try:
+            self.priority = int(priority)
+        except (ValueError, TypeError):
+            self.priority = 0
+        self.sound = str(sound or "").strip()
+        self.device = str(device or "").strip()
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
+        self.enabled = enabled
+
+    async def send_notification(
+        self,
+        title: str,
+        message: str,
+        embed_data: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "Pushover notifications are disabled in settings."
+        if not self.user_key:
+            return False, "Pushover user key is not configured."
+        if not self.api_token:
+            return False, "Pushover API token is not configured."
+
+        payload: dict[str, Any] = {
+            "token": self.api_token,
+            "user": self.user_key,
+            "title": title,
+            "message": message,
+            "priority": self.priority,
+        }
+        if self.sound:
+            payload["sound"] = self.sound
+        if self.device:
+            payload["device"] = self.device
+
+        url = "https://api.pushover.net/1/messages.json"
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10.0)
+            ) as session:
+                async with session.post(url, json=payload) as resp:
+                    resp_text = await resp.text()
+                    if resp.status == 200:
+                        return True, "Pushover notification sent successfully."
+                    err_msg = f"Pushover API error {resp.status}: {resp_text}"
+                    logging.error(err_msg)
+                    return False, err_msg
+        except Exception as exc:
+            err_msg = f"Pushover request failed: {exc}"
+            logging.error(err_msg)
+            return False, err_msg
+
+
+PushoverChannel = PushoverProvider
+
+
+class NtfyProvider(NotificationProvider):
+    name: str = "ntfy"
+
+    def __init__(
+        self,
+        server_url: str = "https://ntfy.sh",
+        topic: str = "",
+        access_token: str = "",
+        priority: Union[int, str] = 3,
+        tags: Optional[Union[list[str], str]] = None,
+        routing: Optional[dict[str, bool]] = None,
+        enabled: bool = True,
+    ) -> None:
+        self.server_url = str(server_url or "https://ntfy.sh").strip()
+        self.topic = str(topic or "").strip()
+        self.access_token = str(access_token or "").strip()
+        self.priority = priority if priority is not None else 3
+        if tags is None:
+            self.tags = []
+        elif isinstance(tags, list):
+            self.tags = tags
+        elif isinstance(tags, str):
+            self.tags = [t.strip() for t in tags.split(",") if t.strip()]
+        else:
+            self.tags = []
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
+        self.enabled = enabled
+
+    async def send_notification(
+        self,
+        title: str,
+        message: str,
+        embed_data: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "Ntfy notifications are disabled in settings."
+        if not self.topic:
+            return False, "Ntfy topic is not configured."
+
+        server = (self.server_url or "https://ntfy.sh").rstrip("/")
+        url = f"{server}/{self.topic}"
+
+        headers: dict[str, str] = {
+            "Title": title,
+            "Priority": str(self.priority),
+        }
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        if self.tags:
+            headers["Tags"] = ",".join(self.tags) if isinstance(self.tags, list) else str(self.tags)
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10.0)
+            ) as session:
+                async with session.post(url, data=message, headers=headers) as resp:
+                    if resp.status in (200, 201, 202, 204):
+                        return True, "Ntfy notification sent successfully."
+                    resp_text = await resp.text()
+                    err_msg = f"Ntfy error {resp.status}: {resp_text}"
+                    logging.error(err_msg)
+                    return False, err_msg
+        except Exception as exc:
+            err_msg = f"Ntfy request failed: {exc}"
+            logging.error(err_msg)
+            return False, err_msg
+
+
+NtfyChannel = NtfyProvider
+
+
+class GotifyProvider(NotificationProvider):
+    name: str = "gotify"
+
+    def __init__(
+        self,
+        server_url: str = "",
+        app_token: str = "",
+        priority: int = 5,
+        routing: Optional[dict[str, bool]] = None,
+        enabled: bool = True,
+    ) -> None:
+        self.server_url = str(server_url or "").strip()
+        self.app_token = str(app_token or "").strip()
+        try:
+            self.priority = int(priority)
+        except (ValueError, TypeError):
+            self.priority = 5
+        self.routing = copy.deepcopy(routing) if routing is not None else copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
+        self.enabled = enabled
+
+    async def send_notification(
+        self,
+        title: str,
+        message: str,
+        embed_data: Optional[dict[str, Any]] = None,
+    ) -> tuple[bool, str]:
+        if not self.enabled:
+            return False, "Gotify notifications are disabled in settings."
+        if not self.server_url:
+            return False, "Gotify server URL is not configured."
+        if not self.app_token:
+            return False, "Gotify app token is not configured."
+
+        server = self.server_url.rstrip("/")
+        url = f"{server}/message"
+        headers = {
+            "X-Gotify-Key": self.app_token,
+        }
+        payload = {
+            "title": title,
+            "message": message,
+            "priority": int(self.priority),
+        }
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10.0)
+            ) as session:
+                async with session.post(url, json=payload, headers=headers) as resp:
+                    if resp.status in (200, 201, 204):
+                        return True, "Gotify notification sent successfully."
+                    resp_text = await resp.text()
+                    err_msg = f"Gotify error {resp.status}: {resp_text}"
+                    logging.error(err_msg)
+                    return False, err_msg
+        except Exception as exc:
+            err_msg = f"Gotify request failed: {exc}"
+            logging.error(err_msg)
+            return False, err_msg
+
+
+GotifyChannel = GotifyProvider
+
+
 class NotificationManager:
     def __init__(self, config_dict: Optional[dict[str, Any]] = None) -> None:
         self.config = (
@@ -1732,6 +2015,7 @@ class NotificationManager:
             bot_token=discord_cfg.get("bot_token", ""),
             channel_id=discord_cfg.get("channel_id", ""),
             webhook_url=discord_cfg.get("webhook_url", ""),
+            routing=discord_cfg.get("routing"),
             enabled=bool(discord_cfg.get("enabled", False)),
         )
 
@@ -1739,6 +2023,7 @@ class NotificationManager:
         self.providers["telegram"] = TelegramProvider(
             bot_token=telegram_cfg.get("bot_token", ""),
             chat_id=telegram_cfg.get("chat_id", ""),
+            routing=telegram_cfg.get("routing"),
             enabled=bool(telegram_cfg.get("enabled", False)),
         )
 
@@ -1746,7 +2031,39 @@ class NotificationManager:
         self.providers["webhook"] = WebhookProvider(
             url=webhook_cfg.get("url", ""),
             headers=webhook_cfg.get("headers", {}),
+            routing=webhook_cfg.get("routing"),
             enabled=bool(webhook_cfg.get("enabled", False)),
+        )
+
+        pushover_cfg = channels.get("pushover", {})
+        self.providers["pushover"] = PushoverProvider(
+            user_key=pushover_cfg.get("user_key", ""),
+            api_token=pushover_cfg.get("api_token", ""),
+            priority=pushover_cfg.get("priority", 0),
+            sound=pushover_cfg.get("sound", ""),
+            device=pushover_cfg.get("device", ""),
+            routing=pushover_cfg.get("routing"),
+            enabled=bool(pushover_cfg.get("enabled", False)),
+        )
+
+        ntfy_cfg = channels.get("ntfy", {})
+        self.providers["ntfy"] = NtfyProvider(
+            server_url=ntfy_cfg.get("server_url", "https://ntfy.sh"),
+            topic=ntfy_cfg.get("topic", ""),
+            access_token=ntfy_cfg.get("access_token", ""),
+            priority=ntfy_cfg.get("priority", 3),
+            tags=ntfy_cfg.get("tags", []),
+            routing=ntfy_cfg.get("routing"),
+            enabled=bool(ntfy_cfg.get("enabled", False)),
+        )
+
+        gotify_cfg = channels.get("gotify", {})
+        self.providers["gotify"] = GotifyProvider(
+            server_url=gotify_cfg.get("server_url", ""),
+            app_token=gotify_cfg.get("app_token", ""),
+            priority=gotify_cfg.get("priority", 5),
+            routing=gotify_cfg.get("routing"),
+            enabled=bool(gotify_cfg.get("enabled", False)),
         )
 
     async def send_channel(
@@ -1762,6 +2079,8 @@ class NotificationManager:
             successes = [k for k, (ok, _) in results.items() if ok]
             if successes:
                 return True, f"Notification sent successfully via {', '.join(successes)}."
+            if "none" in results and len(results) == 1:
+                return False, results["none"][1]
             errors = [f"{k}: {msg}" for k, (ok, msg) in results.items() if not ok]
             return False, "; ".join(errors) if errors else "No notification channels enabled."
 
@@ -1787,6 +2106,27 @@ class NotificationManager:
             results[name] = await provider.send_notification(title, message, embed_data)
         return results
 
+    async def dispatch_event(
+        self,
+        event_type: str,
+        title: str,
+        message: str,
+        embed_data: Optional[dict[str, Any]] = None,
+    ) -> dict[str, tuple[bool, str]]:
+        enabled_providers = {
+            k: p for k, p in self.providers.items() if getattr(p, "enabled", False)
+        }
+        if not enabled_providers:
+            return {"none": (False, "No notification channels are enabled.")}
+
+        results: dict[str, tuple[bool, str]] = {}
+        for name, provider in enabled_providers.items():
+            routing = getattr(provider, "routing", {}) or {}
+            if routing.get(event_type, True) is False:
+                continue
+            results[name] = await provider.send_notification(title, message, embed_data)
+        return results
+
 
 def get_notification_center_config() -> dict[str, Any]:
     settings = get_app_settings()
@@ -1798,9 +2138,29 @@ def get_notification_center_config() -> dict[str, Any]:
             if isinstance(stored, dict):
                 for section in ("channels", "schedule", "topics", "thresholds"):
                     if section in stored and isinstance(stored[section], dict):
-                        config_dict[section].update(stored[section])
+                        if section == "channels":
+                            for ch_name, ch_data in stored["channels"].items():
+                                if isinstance(ch_data, dict):
+                                    if ch_name in config_dict["channels"]:
+                                        for k, v in ch_data.items():
+                                            if (
+                                                k == "routing"
+                                                and isinstance(v, dict)
+                                                and isinstance(config_dict["channels"][ch_name].get("routing"), dict)
+                                            ):
+                                                config_dict["channels"][ch_name]["routing"].update(v)
+                                            else:
+                                                config_dict["channels"][ch_name][k] = v
+                                    else:
+                                        config_dict["channels"][ch_name] = ch_data
+                        else:
+                            config_dict[section].update(stored[section])
         except (json.JSONDecodeError, TypeError):
             pass
+
+    for ch_name, ch_val in config_dict.get("channels", {}).items():
+        if isinstance(ch_val, dict):
+            ch_val.setdefault("routing", copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING))
 
     # Synchronize discord channel with top-level app_settings
     discord_cfg = config_dict["channels"]["discord"]
@@ -1829,7 +2189,9 @@ def get_masked_notification_center_config(
         cfg = get_notification_center_config()
     result = copy.deepcopy(cfg)
 
-    discord_cfg = result.get("channels", {}).get("discord", {})
+    channels = result.get("channels", {})
+
+    discord_cfg = channels.get("discord", {})
     bot_token = discord_cfg.get("bot_token", "")
     discord_cfg["bot_token_configured"] = bool(bot_token)
     discord_cfg["token_configured"] = bool(bot_token)
@@ -1840,7 +2202,7 @@ def get_masked_notification_center_config(
         else ("••••" if bot_token else "")
     )
 
-    telegram_cfg = result.get("channels", {}).get("telegram", {})
+    telegram_cfg = channels.get("telegram", {})
     t_bot_token = telegram_cfg.get("bot_token", "")
     telegram_cfg["bot_token_configured"] = bool(t_bot_token)
     telegram_cfg["token_configured"] = bool(t_bot_token)
@@ -1850,6 +2212,52 @@ def get_masked_notification_center_config(
         if len(t_bot_token) > 4
         else ("••••" if t_bot_token else "")
     )
+
+    pushover_cfg = channels.get("pushover", {})
+    p_user_key = pushover_cfg.get("user_key", "")
+    p_api_token = pushover_cfg.get("api_token", "")
+    pushover_cfg["user_key_configured"] = bool(p_user_key)
+    pushover_cfg["api_token_configured"] = bool(p_api_token)
+    pushover_cfg["token_configured"] = bool(p_api_token)
+    pushover_cfg["user_key"] = "********" if p_user_key else ""
+    pushover_cfg["user_key_masked"] = (
+        f"••••{p_user_key[-4:]}"
+        if len(p_user_key) > 4
+        else ("••••" if p_user_key else "")
+    )
+    pushover_cfg["api_token"] = "********" if p_api_token else ""
+    pushover_cfg["token_masked"] = (
+        f"••••{p_api_token[-4:]}"
+        if len(p_api_token) > 4
+        else ("••••" if p_api_token else "")
+    )
+
+    ntfy_cfg = channels.get("ntfy", {})
+    n_access_token = ntfy_cfg.get("access_token", "")
+    ntfy_cfg["access_token_configured"] = bool(n_access_token)
+    ntfy_cfg["token_configured"] = bool(n_access_token)
+    ntfy_cfg["access_token"] = "********" if n_access_token else ""
+    ntfy_cfg["token_masked"] = (
+        f"••••{n_access_token[-4:]}"
+        if len(n_access_token) > 4
+        else ("••••" if n_access_token else "")
+    )
+
+    gotify_cfg = channels.get("gotify", {})
+    g_app_token = gotify_cfg.get("app_token", "")
+    gotify_cfg["app_token_configured"] = bool(g_app_token)
+    gotify_cfg["token_configured"] = bool(g_app_token)
+    gotify_cfg["app_token"] = "********" if g_app_token else ""
+    gotify_cfg["token_masked"] = (
+        f"••••{g_app_token[-4:]}"
+        if len(g_app_token) > 4
+        else ("••••" if g_app_token else "")
+    )
+
+    for ch_name in ("discord", "telegram", "webhook", "pushover", "ntfy", "gotify"):
+        ch_item = channels.setdefault(ch_name, {})
+        if "routing" not in ch_item or not isinstance(ch_item["routing"], dict):
+            ch_item["routing"] = copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)
 
     topics = result.setdefault("topics", {})
     if "system_status" in topics:
@@ -1900,12 +2308,12 @@ def update_notification_center_config(updates: dict[str, Any]) -> dict[str, Any]
     current = get_notification_center_config()
 
     if "channels" in updates and isinstance(updates["channels"], dict):
-        for ch_key in ("discord", "telegram", "webhook"):
+        for ch_key in ("discord", "telegram", "webhook", "pushover", "ntfy", "gotify"):
             if ch_key in updates["channels"] and isinstance(
                 updates["channels"][ch_key], dict
             ):
                 incoming = updates["channels"][ch_key]
-                target = current["channels"][ch_key]
+                target = current["channels"].setdefault(ch_key, {})
                 for k, v in incoming.items():
                     if k in ("bot_token", "token"):
                         str_val = str(v).strip()
@@ -1914,7 +2322,24 @@ def update_notification_center_config(updates: dict[str, Any]) -> dict[str, Any]
                             and not str_val.startswith("***")
                             and not str_val.startswith("•••")
                         ):
-                            target["bot_token"] = str_val
+                            if ch_key in ("discord", "telegram"):
+                                target["bot_token"] = str_val
+                            elif ch_key == "pushover":
+                                target["api_token"] = str_val
+                            elif ch_key == "ntfy":
+                                target["access_token"] = str_val
+                            elif ch_key == "gotify":
+                                target["app_token"] = str_val
+                    elif k in ("api_token", "user_key", "access_token", "app_token"):
+                        str_val = str(v).strip()
+                        if (
+                            str_val
+                            and not str_val.startswith("***")
+                            and not str_val.startswith("•••")
+                        ):
+                            target[k] = str_val
+                    elif k == "routing" and isinstance(v, dict):
+                        target.setdefault("routing", copy.deepcopy(DEFAULT_NOTIFICATION_ROUTING)).update(v)
                     elif k == "headers" and isinstance(v, dict):
                         target["headers"] = v
                     elif v is not None:
@@ -2707,13 +3132,14 @@ async def send_test_notification(
         {"name": "Dispatch Mode", "value": "Test Notification (Operational)", "inline": True},
     )
 
-    telegram_cfg = config_dict.get("channels", {}).get("telegram", {})
-    webhook_cfg = config_dict.get("channels", {}).get("webhook", {})
-    telegram_enabled = bool(telegram_cfg.get("enabled", False))
-    webhook_enabled = bool(webhook_cfg.get("enabled", False))
+    channels_cfg = config_dict.get("channels", {})
+    other_channels_enabled = any(
+        bool(channels_cfg.get(ch, {}).get("enabled", False))
+        for ch in ("telegram", "webhook", "pushover", "ntfy", "gotify")
+    )
 
     if effective_channel == "discord" or (
-        effective_channel == "all" and not telegram_enabled and not webhook_enabled
+        effective_channel == "all" and not other_channels_enabled
     ):
         settings = get_app_settings()
         discord_cfg = config_dict.get("channels", {}).get("discord", {})

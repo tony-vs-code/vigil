@@ -6237,6 +6237,512 @@ class NotificationCenterTests(unittest.TestCase):
             self.assertEqual(status, "scheduled_report")
 
 
+class MultiChannelAlertHubTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_hub.sqlite3"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_pushover_provider_dispatch_and_validation(self):
+        # 1. Disabled validation
+        disabled = main.PushoverProvider(enabled=False)
+        ok, msg = asyncio.run(disabled.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("disabled", msg.lower())
+
+        # 2. Missing user key
+        no_user = main.PushoverProvider(enabled=True, user_key="", api_token="tok123")
+        ok, msg = asyncio.run(no_user.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("user key", msg.lower())
+
+        # 3. Missing API token
+        no_tok = main.PushoverProvider(enabled=True, user_key="usr123", api_token="")
+        ok, msg = asyncio.run(no_tok.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("api token", msg.lower())
+
+        # 4. Successful dispatch asserting URL, headers, and payload
+        provider = main.PushoverProvider(
+            enabled=True,
+            user_key="u_test_user",
+            api_token="a_test_token",
+            priority=1,
+            sound="cosmic",
+            device="iphone",
+        )
+        mock_resp = MagicMock(status=200)
+        mock_resp.text = AsyncMock(return_value='{"status": 1, "request": "req-123"}')
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Pushover Title", "Pushover Message"))
+            self.assertTrue(ok)
+            self.assertIn("success", msg.lower())
+            mock_session.post.assert_called_once()
+            call_url = mock_session.post.call_args[0][0]
+            call_json = mock_session.post.call_args.kwargs.get("json")
+            self.assertEqual(call_url, "https://api.pushover.net/1/messages.json")
+            self.assertEqual(call_json["user"], "u_test_user")
+            self.assertEqual(call_json["token"], "a_test_token")
+            self.assertEqual(call_json["title"], "Pushover Title")
+            self.assertEqual(call_json["message"], "Pushover Message")
+            self.assertEqual(call_json["priority"], 1)
+            self.assertEqual(call_json["sound"], "cosmic")
+            self.assertEqual(call_json["device"], "iphone")
+
+        # 5. Error status response
+        mock_err_resp = MagicMock(status=400)
+        mock_err_resp.text = AsyncMock(return_value='{"errors": ["user key not found"]}')
+        mock_session_err = MagicMock()
+        mock_session_err.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_err_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session_err),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("400", msg)
+            self.assertIn("user key not found", msg)
+
+        # 6. Request exception
+        with patch("aiohttp.ClientSession", side_effect=Exception("Pushover network timeout")):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("network timeout", msg)
+
+    def test_ntfy_provider_dispatch_and_validation(self):
+        # 1. Disabled validation
+        disabled = main.NtfyProvider(enabled=False)
+        ok, msg = asyncio.run(disabled.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("disabled", msg.lower())
+
+        # 2. Missing topic
+        no_topic = main.NtfyProvider(enabled=True, topic="")
+        ok, msg = asyncio.run(no_topic.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("topic", msg.lower())
+
+        # 3. Successful dispatch asserting URL, headers, and body
+        provider = main.NtfyProvider(
+            enabled=True,
+            server_url="https://ntfy.example.com/",
+            topic="homelab-alerts",
+            access_token="tk_ntfy_secret",
+            priority=4,
+            tags=["warning", "disk"],
+        )
+        mock_resp = MagicMock(status=200)
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Ntfy Alert", "Disk degraded"))
+            self.assertTrue(ok)
+            self.assertIn("success", msg.lower())
+            mock_session.post.assert_called_once()
+            call_url = mock_session.post.call_args[0][0]
+            call_headers = mock_session.post.call_args.kwargs.get("headers")
+            call_data = mock_session.post.call_args.kwargs.get("data")
+            self.assertEqual(call_url, "https://ntfy.example.com/homelab-alerts")
+            self.assertEqual(call_headers["Title"], "Ntfy Alert")
+            self.assertEqual(call_headers["Priority"], "4")
+            self.assertEqual(call_headers["Authorization"], "Bearer tk_ntfy_secret")
+            self.assertEqual(call_headers["Tags"], "warning,disk")
+            self.assertEqual(call_data, "Disk degraded")
+
+        # 4. Error response
+        mock_err_resp = MagicMock(status=403)
+        mock_err_resp.text = AsyncMock(return_value="Forbidden topic write")
+        mock_session_err = MagicMock()
+        mock_session_err.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_err_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session_err),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("403", msg)
+            self.assertIn("Forbidden topic write", msg)
+
+        # 5. Request exception
+        with patch("aiohttp.ClientSession", side_effect=Exception("Connection refused")):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("Connection refused", msg)
+
+    def test_gotify_provider_dispatch_and_validation(self):
+        # 1. Disabled validation
+        disabled = main.GotifyProvider(enabled=False)
+        ok, msg = asyncio.run(disabled.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("disabled", msg.lower())
+
+        # 2. Missing server_url
+        no_url = main.GotifyProvider(enabled=True, server_url="", app_token="gotify123")
+        ok, msg = asyncio.run(no_url.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("server url", msg.lower())
+
+        # 3. Missing app_token
+        no_tok = main.GotifyProvider(enabled=True, server_url="https://gotify.net", app_token="")
+        ok, msg = asyncio.run(no_tok.send_notification("Title", "Message"))
+        self.assertFalse(ok)
+        self.assertIn("app token", msg.lower())
+
+        # 4. Successful dispatch asserting URL, headers, and payload
+        provider = main.GotifyProvider(
+            enabled=True,
+            server_url="https://gotify.internal:8443/",
+            app_token="A1B2C3D4E5",
+            priority=8,
+        )
+        mock_resp = MagicMock(status=200)
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Gotify Notice", "Array recovered"))
+            self.assertTrue(ok)
+            self.assertIn("success", msg.lower())
+            mock_session.post.assert_called_once()
+            call_url = mock_session.post.call_args[0][0]
+            call_headers = mock_session.post.call_args.kwargs.get("headers")
+            call_json = mock_session.post.call_args.kwargs.get("json")
+            self.assertEqual(call_url, "https://gotify.internal:8443/message")
+            self.assertEqual(call_headers["X-Gotify-Key"], "A1B2C3D4E5")
+            self.assertEqual(call_json["title"], "Gotify Notice")
+            self.assertEqual(call_json["message"], "Array recovered")
+            self.assertEqual(call_json["priority"], 8)
+
+        # 5. Error response
+        mock_err_resp = MagicMock(status=500)
+        mock_err_resp.text = AsyncMock(return_value="Internal server error")
+        mock_session_err = MagicMock()
+        mock_session_err.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_err_resp),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session_err),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("500", msg)
+            self.assertIn("Internal server error", msg)
+
+        # 6. Request exception
+        with patch("aiohttp.ClientSession", side_effect=Exception("Gotify timeout")):
+            ok, msg = asyncio.run(provider.send_notification("Title", "Message"))
+            self.assertFalse(ok)
+            self.assertIn("Gotify timeout", msg)
+
+    def test_notification_event_routing_and_dispatch_event(self):
+        cfg = {
+            "channels": {
+                "discord": {
+                    "enabled": True,
+                    "bot_token": "d_tok",
+                    "channel_id": "123",
+                    "routing": {"raid_alerts": True, "raid_weekly": True, "cron_failures": False, "cron_successes": False},
+                },
+                "pushover": {
+                    "enabled": True,
+                    "user_key": "u_key",
+                    "api_token": "a_tok",
+                    "routing": {"raid_alerts": True, "raid_weekly": False, "cron_failures": True, "cron_successes": False},
+                },
+                "ntfy": {
+                    "enabled": True,
+                    "server_url": "https://ntfy.sh",
+                    "topic": "test-topic",
+                    "routing": {"raid_alerts": False, "raid_weekly": False, "cron_failures": True, "cron_successes": True},
+                },
+                "gotify": {
+                    "enabled": False,
+                    "server_url": "https://gotify.lan",
+                    "app_token": "g_tok",
+                },
+            }
+        }
+        mgr = main.NotificationManager(cfg)
+
+        with (
+            patch.object(mgr.providers["discord"], "send_notification", new=AsyncMock(return_value=(True, "Discord OK"))) as mock_disc,
+            patch.object(mgr.providers["pushover"], "send_notification", new=AsyncMock(return_value=(True, "Pushover OK"))) as mock_push,
+            patch.object(mgr.providers["ntfy"], "send_notification", new=AsyncMock(return_value=(True, "Ntfy OK"))) as mock_ntfy,
+        ):
+            # 1. Event: raid_alerts -> discord and pushover are subscribed, ntfy is unsubscribed
+            res_raid = asyncio.run(mgr.dispatch_event("raid_alerts", "RAID Degraded", "Drive sdb failed"))
+            self.assertIn("discord", res_raid)
+            self.assertIn("pushover", res_raid)
+            self.assertNotIn("ntfy", res_raid)
+            self.assertNotIn("gotify", res_raid)
+            mock_disc.assert_awaited_once()
+            mock_push.assert_awaited_once()
+            mock_ntfy.assert_not_awaited()
+
+            mock_disc.reset_mock()
+            mock_push.reset_mock()
+            mock_ntfy.reset_mock()
+
+            # 2. Event: cron_failures -> pushover and ntfy subscribed, discord unsubscribed
+            res_cron = asyncio.run(mgr.dispatch_event("cron_failures", "Cron Failed", "Backup job exited with code 1"))
+            self.assertNotIn("discord", res_cron)
+            self.assertIn("pushover", res_cron)
+            self.assertIn("ntfy", res_cron)
+            mock_disc.assert_not_awaited()
+            mock_push.assert_awaited_once()
+            mock_ntfy.assert_awaited_once()
+
+            mock_disc.reset_mock()
+            mock_push.reset_mock()
+            mock_ntfy.reset_mock()
+
+            # 3. Event: cron_successes -> only ntfy subscribed
+            res_succ = asyncio.run(mgr.dispatch_event("cron_successes", "Cron Succeeded", "Pruned 5 images"))
+            self.assertNotIn("discord", res_succ)
+            self.assertNotIn("pushover", res_succ)
+            self.assertIn("ntfy", res_succ)
+            mock_ntfy.assert_awaited_once()
+
+            # 4. Dispatch with no channels enabled
+            empty_mgr = main.NotificationManager({"channels": {}})
+            empty_res = asyncio.run(empty_mgr.dispatch_event("raid_alerts", "Title", "Msg"))
+            self.assertIn("none", empty_res)
+            self.assertFalse(empty_res["none"][0])
+
+    def test_notification_center_api_channels_crud_and_masking(self):
+        # 1. GET /api/notifications/center - verify default keys for all 6 channels
+        resp = asgi_get(api.app, "/api/notifications/center", cookies=self.auth_cookies)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        channels = data["channels"]
+        for ch in ("discord", "telegram", "webhook", "pushover", "ntfy", "gotify"):
+            self.assertIn(ch, channels)
+            self.assertIn("routing", channels[ch])
+            self.assertIn("raid_alerts", channels[ch]["routing"])
+            self.assertIn("cron_failures", channels[ch]["routing"])
+
+        # Pushover, ntfy, gotify should have configured and masked properties
+        self.assertIn("user_key_configured", channels["pushover"])
+        self.assertIn("api_token_configured", channels["pushover"])
+        self.assertIn("token_masked", channels["pushover"])
+
+        self.assertIn("access_token_configured", channels["ntfy"])
+        self.assertIn("token_masked", channels["ntfy"])
+
+        self.assertIn("app_token_configured", channels["gotify"])
+        self.assertIn("token_masked", channels["gotify"])
+
+        # 2. POST /api/notifications/center - update pushover, ntfy, gotify with real values & custom routing
+        update_payload = {
+            "channels": {
+                "pushover": {
+                    "enabled": True,
+                    "user_key": "u_secret_key_1234",
+                    "api_token": "a_secret_token_5678",
+                    "priority": 1,
+                    "sound": "echo",
+                    "device": "tablet",
+                    "routing": {"raid_alerts": True, "cron_failures": False},
+                },
+                "ntfy": {
+                    "enabled": True,
+                    "server_url": "https://alerts.myhomelab.org",
+                    "topic": "servers",
+                    "access_token": "tk_super_secret_9999",
+                    "priority": 4,
+                    "tags": ["cloud", "server"],
+                    "routing": {"cron_successes": True},
+                },
+                "gotify": {
+                    "enabled": True,
+                    "server_url": "https://gotify.myhomelab.org",
+                    "app_token": "g_secret_key_7777",
+                    "priority": 7,
+                    "routing": {"raid_weekly": False},
+                },
+            }
+        }
+        post_resp = asgi_post(
+            api.app,
+            "/api/notifications/center",
+            json_body=update_payload,
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(post_resp.status_code, 200)
+        post_data = post_resp.json()
+        post_ch = post_data["channels"]
+
+        # Check pushover masking and routing
+        self.assertTrue(post_ch["pushover"]["enabled"])
+        self.assertTrue(post_ch["pushover"]["user_key_configured"])
+        self.assertTrue(post_ch["pushover"]["api_token_configured"])
+        self.assertEqual(post_ch["pushover"]["user_key"], "********")
+        self.assertEqual(post_ch["pushover"]["api_token"], "********")
+        self.assertEqual(post_ch["pushover"]["user_key_masked"], "••••1234")
+        self.assertEqual(post_ch["pushover"]["token_masked"], "••••5678")
+        self.assertTrue(post_ch["pushover"]["routing"]["raid_alerts"])
+        self.assertFalse(post_ch["pushover"]["routing"]["cron_failures"])
+
+        # Check ntfy masking and routing
+        self.assertTrue(post_ch["ntfy"]["enabled"])
+        self.assertTrue(post_ch["ntfy"]["access_token_configured"])
+        self.assertEqual(post_ch["ntfy"]["access_token"], "********")
+        self.assertEqual(post_ch["ntfy"]["token_masked"], "••••9999")
+        self.assertTrue(post_ch["ntfy"]["routing"]["cron_successes"])
+
+        # Check gotify masking and routing
+        self.assertTrue(post_ch["gotify"]["enabled"])
+        self.assertTrue(post_ch["gotify"]["app_token_configured"])
+        self.assertEqual(post_ch["gotify"]["app_token"], "********")
+        self.assertEqual(post_ch["gotify"]["token_masked"], "••••7777")
+        self.assertFalse(post_ch["gotify"]["routing"]["raid_weekly"])
+
+        # 3. Test preserving existing tokens when masked value sent back
+        preserve_payload = {
+            "channels": {
+                "pushover": {
+                    "user_key": "********",
+                    "api_token": "••••5678",
+                    "priority": 2,
+                },
+                "ntfy": {
+                    "access_token": "********",
+                },
+                "gotify": {
+                    "app_token": "••••7777",
+                },
+            }
+        }
+        pres_resp = asgi_post(
+            api.app,
+            "/api/notifications/center",
+            json_body=preserve_payload,
+            cookies=self.auth_cookies,
+        )
+        self.assertEqual(pres_resp.status_code, 200)
+        # Verify underlying unmasked values in DB were preserved!
+        unmasked_cfg = main.get_notification_center_config()
+        self.assertEqual(unmasked_cfg["channels"]["pushover"]["user_key"], "u_secret_key_1234")
+        self.assertEqual(unmasked_cfg["channels"]["pushover"]["api_token"], "a_secret_token_5678")
+        self.assertEqual(unmasked_cfg["channels"]["pushover"]["priority"], 2)
+        self.assertEqual(unmasked_cfg["channels"]["ntfy"]["access_token"], "tk_super_secret_9999")
+        self.assertEqual(unmasked_cfg["channels"]["gotify"]["app_token"], "g_secret_key_7777")
+
+    def test_notifications_test_api_channel_targets(self):
+        # Test targeting pushover, ntfy, gotify via POST /api/notifications/test
+        for channel in ("pushover", "ntfy", "gotify"):
+            with patch.object(
+                main,
+                "send_test_notification",
+                new=AsyncMock(return_value=(True, f"Test notification sent successfully to {channel}.")),
+            ) as mock_send_test:
+                resp = asgi_post(
+                    api.app,
+                    "/api/notifications/test",
+                    json_body={"channel": channel},
+                    cookies=self.auth_cookies,
+                )
+                self.assertEqual(resp.status_code, 200)
+                self.assertEqual(resp.json()["success"], True)
+                self.assertIn(channel, resp.json()["message"])
+                mock_send_test.assert_awaited_once_with(channel=channel)
+
+        # Test live send_test_notification dispatching to Pushover
+        main.update_notification_center_config({
+            "channels": {
+                "pushover": {
+                    "enabled": True,
+                    "user_key": "live_user",
+                    "api_token": "live_token",
+                }
+            }
+        })
+        mock_resp_push = MagicMock(status=200)
+        mock_resp_push.text = AsyncMock(return_value='{"status": 1}')
+        mock_session_push = MagicMock()
+        mock_session_push.post = MagicMock(
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_resp_push),
+                __aexit__=AsyncMock(),
+            )
+        )
+        with patch(
+            "aiohttp.ClientSession",
+            return_value=AsyncMock(
+                __aenter__=AsyncMock(return_value=mock_session_push),
+                __aexit__=AsyncMock(),
+            ),
+        ):
+            ok, msg = asyncio.run(main.send_test_notification(channel="pushover"))
+            self.assertTrue(ok)
+            self.assertIn("success", msg.lower())
+
+
 class DiscordNotificationFormattingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -13625,6 +14131,657 @@ ctx.apiFetch = async function(url, options = {{}}) {{
         res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
         self.assertIn("ALL_NODE_1CLICK_DEPLOY_AND_SAVE_VM_CHECKS_PASSED", res.stdout)
+
+
+class MultiChannelAlertHubFrontendTests(unittest.TestCase):
+    """Validation tests for Multi-Channel Alert Hub DOM elements, UI contracts, and Node VM execution."""
+
+    def test_multichannel_alert_hub_dom_and_ui_contracts(self):
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+
+        # 1. Status badges for all 6 channels in the delivery channels summary ribbon
+        expected_status_badges = [
+            "discord-status-badge",
+            "telegram-status-badge",
+            "webhook-status-badge",
+            "pushover-status-badge",
+            "ntfy-status-badge",
+            "gotify-status-badge",
+        ]
+        for badge_id in expected_status_badges:
+            self.assertIn(f'id="{badge_id}"', html, f"Missing channel badge #{badge_id} in index.html")
+
+        # 2. Modal containers and primary action buttons
+        modal_dom_ids = [
+            "modal-notif-channels",
+            "btn-close-notif-channels",
+            "btn-cancel-notif-channels",
+            "save-discord-btn",
+            "notif-test-channel-select",
+            "send-test-notification-btn",
+        ]
+        for elem_id in modal_dom_ids:
+            self.assertIn(f'id="{elem_id}"', html, f"Missing modal control #{elem_id} in index.html")
+
+        # 3. Channel enable toggle switches
+        channels = ["discord", "telegram", "webhook", "pushover", "ntfy", "gotify"]
+        for ch in channels:
+            toggle_id = f"notif-channel-{ch}-enable"
+            self.assertIn(f'id="{toggle_id}"', html, f"Missing enable toggle #{toggle_id} in index.html")
+
+        # 4. Token status badges for credential masking feedback
+        token_badges = [
+            "discord-token-status",
+            "notif-telegram-token-badge",
+            "notif-pushover-user-key-badge",
+            "notif-pushover-token-badge",
+            "notif-ntfy-token-badge",
+            "notif-gotify-token-badge",
+        ]
+        for badge_id in token_badges:
+            self.assertIn(f'id="{badge_id}"', html, f"Missing token status badge #{badge_id} in index.html")
+
+        # 5. Routing checkboxes for all 6 channels
+        routing_events = ["raid-alerts", "raid-weekly", "cron-failures", "cron-successes"]
+        for ch in channels:
+            for event in routing_events:
+                chk_id = f"notif-{ch}-route-{event}"
+                self.assertIn(f'id="{chk_id}"', html, f"Missing routing checkbox #{chk_id} in index.html")
+
+        # 6. Test target selector options for all 6 channels plus 'all'
+        target_options = ['value="all"', 'value="discord"', 'value="telegram"', 'value="webhook"', 'value="pushover"', 'value="ntfy"', 'value="gotify"']
+        for opt in target_options:
+            self.assertIn(opt, html, f"Missing test channel option {opt} in index.html")
+
+    def test_multichannel_status_badge_rendering_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const attributes = {{}};
+  return {{
+    id: id,
+    style: {{}},
+    classList: {{
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {{
+        if (force === undefined) {{
+          if (classes.has(cls)) classes.delete(cls); else classes.add(cls);
+        }} else if (force) {{
+          classes.add(cls);
+        }} else {{
+          classes.delete(cls);
+        }}
+      }}
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    setAttribute: (name, val) => {{ attributes[name] = String(val); }},
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+    removeAttribute: (name) => {{ delete attributes[name]; }},
+    value: '',
+    placeholder: '',
+    checked: false,
+    disabled: false,
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{
+    addEventListener: () => {{}},
+    clearTimeout: () => {{}},
+    setTimeout: setTimeout,
+  }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+// Test 1: Direct updateChannelStatusBadge behavior for ACTIVE, DISABLED, and NOT CONFIGURED
+const testBadgeId = 'pushover-status-badge';
+
+// Not Configured
+ctx.updateChannelStatusBadge(testBadgeId, false, false);
+let badgeEl = getEl(testBadgeId);
+if (badgeEl.textContent !== 'NOT CONFIGURED') throw new Error("Expected NOT CONFIGURED text, got: " + badgeEl.textContent);
+if (!badgeEl.classList.contains('status-not-configured') || !badgeEl.classList.contains('status-degraded')) {{
+  throw new Error("Missing not-configured classes");
+}}
+if (badgeEl.getAttribute('data-state') !== 'not-configured') throw new Error("Expected data-state not-configured");
+
+// Configured and Active
+ctx.updateChannelStatusBadge(testBadgeId, true, true);
+if (badgeEl.textContent !== 'ACTIVE') throw new Error("Expected ACTIVE text, got: " + badgeEl.textContent);
+if (!badgeEl.classList.contains('status-active') || !badgeEl.classList.contains('status-clean')) {{
+  throw new Error("Missing active classes");
+}}
+if (badgeEl.getAttribute('data-state') !== 'active') throw new Error("Expected data-state active");
+
+// Configured but Disabled
+ctx.updateChannelStatusBadge(testBadgeId, true, false);
+if (badgeEl.textContent !== 'DISABLED') throw new Error("Expected DISABLED text, got: " + badgeEl.textContent);
+if (!badgeEl.classList.contains('status-disabled')) throw new Error("Missing status-disabled class");
+if (badgeEl.getAttribute('data-state') !== 'disabled') throw new Error("Expected data-state disabled");
+
+// Test 2: Full renderNotificationCenterConfig rendering for all 6 channels simultaneously
+const channels = ['discord', 'telegram', 'webhook', 'pushover', 'ntfy', 'gotify'];
+
+// Scenario A: All 6 Channels Configured and Active
+const allActiveConfig = {{
+  channels: {{
+    discord: {{ enabled: true, token_configured: true, channel_id: "123456" }},
+    telegram: {{ enabled: true, token_configured: true, chat_id: "654321" }},
+    webhook: {{ enabled: true, url: "https://webhook.site/test" }},
+    pushover: {{ enabled: true, user_key_configured: true, api_token_configured: true }},
+    ntfy: {{ enabled: true, topic: "homelab-alerts" }},
+    gotify: {{ enabled: true, server_url: "https://gotify.net", app_token_configured: true }}
+  }}
+}};
+ctx.renderNotificationCenterConfig(allActiveConfig);
+for (const ch of channels) {{
+  const b = getEl(`${{ch}}-status-badge`);
+  if (b.textContent !== 'ACTIVE' || b.getAttribute('data-state') !== 'active') {{
+    throw new Error(`Channel ${{ch}} badge not ACTIVE in Scenario A: text=${{b.textContent}}, state=${{b.getAttribute('data-state')}}`);
+  }}
+}}
+
+// Scenario B: All 6 Channels Configured but Disabled
+const allDisabledConfig = {{
+  channels: {{
+    discord: {{ enabled: false, token_configured: true, channel_id: "123456" }},
+    telegram: {{ enabled: false, token_configured: true, chat_id: "654321" }},
+    webhook: {{ enabled: false, url: "https://webhook.site/test" }},
+    pushover: {{ enabled: false, user_key_configured: true, api_token_configured: true }},
+    ntfy: {{ enabled: false, topic: "homelab-alerts" }},
+    gotify: {{ enabled: false, server_url: "https://gotify.net", app_token_configured: true }}
+  }}
+}};
+ctx.renderNotificationCenterConfig(allDisabledConfig);
+for (const ch of channels) {{
+  const b = getEl(`${{ch}}-status-badge`);
+  if (b.textContent !== 'DISABLED' || b.getAttribute('data-state') !== 'disabled') {{
+    throw new Error(`Channel ${{ch}} badge not DISABLED in Scenario B: text=${{b.textContent}}, state=${{b.getAttribute('data-state')}}`);
+  }}
+}}
+
+// Scenario C: All 6 Channels Unconfigured
+const allUnconfigured = {{ channels: {{}} }};
+ctx.renderNotificationCenterConfig(allUnconfigured);
+for (const ch of channels) {{
+  const b = getEl(`${{ch}}-status-badge`);
+  if (b.textContent !== 'NOT CONFIGURED' || b.getAttribute('data-state') !== 'not-configured') {{
+    throw new Error(`Channel ${{ch}} badge not NOT CONFIGURED in Scenario C: text=${{b.textContent}}, state=${{b.getAttribute('data-state')}}`);
+  }}
+}}
+
+console.log("ALL_NODE_MULTICHANNEL_STATUS_BADGE_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_MULTICHANNEL_STATUS_BADGE_VM_CHECKS_PASSED", res.stdout)
+
+    def test_channel_modal_and_credential_masking_population_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const attributes = {{}};
+  return {{
+    id: id,
+    style: {{}},
+    classList: {{
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {{
+        if (force === undefined) {{
+          if (classes.has(cls)) classes.delete(cls); else classes.add(cls);
+        }} else if (force) {{
+          classes.add(cls);
+        }} else {{
+          classes.delete(cls);
+        }}
+      }}
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    setAttribute: (name, val) => {{ attributes[name] = String(val); }},
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+    removeAttribute: (name) => {{ delete attributes[name]; }},
+    value: '',
+    placeholder: '',
+    checked: false,
+    disabled: false,
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{
+    addEventListener: () => {{}},
+    clearTimeout: () => {{}},
+    setTimeout: setTimeout,
+  }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+// 1. Test Modal Open / Close Controllers
+const modal = getEl('modal-notif-channels');
+modal.classList.add('hidden');
+
+ctx.openNotifChannelsModal();
+if (modal.classList.contains('hidden')) throw new Error("openNotifChannelsModal failed to remove 'hidden' class");
+
+ctx.closeNotifChannelsModal();
+if (!modal.classList.contains('hidden')) throw new Error("closeNotifChannelsModal failed to add 'hidden' class");
+
+// 2. Test Form Population with Masked Credentials and Routing Rules
+const payloadConfig = {{
+  channels: {{
+    discord: {{
+      enabled: true,
+      token_configured: true,
+      token_masked: "••••1234",
+      channel_id: "discord-chan-42",
+      routing: {{ raid_alerts: true, raid_weekly: false, cron_failures: true, cron_successes: false }}
+    }},
+    telegram: {{
+      enabled: true,
+      token_configured: true,
+      token_masked: "••••5678",
+      chat_id: "telegram-chat-88",
+      routing: {{ raid_alerts: false, raid_weekly: true, cron_failures: false, cron_successes: true }}
+    }},
+    webhook: {{
+      enabled: true,
+      url: "https://webhook.site/endpoint-custom",
+      routing: {{ raid_alerts: true, raid_weekly: true, cron_failures: false, cron_successes: false }}
+    }},
+    pushover: {{
+      enabled: true,
+      user_key_configured: true,
+      user_key_masked: "••••9999",
+      api_token_configured: true,
+      token_masked: "••••8888",
+      priority: 1,
+      routing: {{ raid_alerts: false, raid_weekly: false, cron_failures: true, cron_successes: true }}
+    }},
+    ntfy: {{
+      enabled: true,
+      server_url: "https://ntfy.example.com",
+      topic: "homelab-ntfy-topic",
+      access_token_configured: true,
+      token_masked: "••••7777",
+      priority: 4,
+      routing: {{ raid_alerts: true, raid_weekly: false, cron_failures: false, cron_successes: true }}
+    }},
+    gotify: {{
+      enabled: true,
+      server_url: "https://gotify.example.com",
+      app_token_configured: true,
+      token_masked: "••••6666",
+      priority: 8,
+      routing: {{ raid_alerts: false, raid_weekly: true, cron_failures: true, cron_successes: false }}
+    }}
+  }}
+}};
+
+ctx.renderNotificationCenterConfig(payloadConfig);
+
+// Verify Discord credentials masking and routing
+if (!getEl('discord-token-status').textContent.includes('••••1234')) throw new Error("Discord token badge missing masked preview");
+if (!getEl('notif-discord-token-input').placeholder.includes('••••1234')) throw new Error("Discord input placeholder missing masked preview");
+if (getEl('notif-discord-channel-input').value !== 'discord-chan-42') throw new Error("Discord channel input mismatch");
+if (getEl('notif-discord-route-raid-alerts').checked !== true) throw new Error("Discord raid-alerts routing mismatch");
+if (getEl('notif-discord-route-raid-weekly').checked !== false) throw new Error("Discord raid-weekly routing mismatch");
+if (getEl('notif-discord-route-cron-failures').checked !== true) throw new Error("Discord cron-failures routing mismatch");
+if (getEl('notif-discord-route-cron-successes').checked !== false) throw new Error("Discord cron-successes routing mismatch");
+
+// Verify Telegram credentials masking and routing
+if (!getEl('notif-telegram-token-badge').textContent.includes('••••5678')) throw new Error("Telegram token badge missing masked preview");
+if (!getEl('notif-telegram-token-input').placeholder.includes('••••5678')) throw new Error("Telegram input placeholder missing masked preview");
+if (getEl('notif-telegram-chat-id-input').value !== 'telegram-chat-88') throw new Error("Telegram chat_id mismatch");
+if (getEl('notif-telegram-route-raid-alerts').checked !== false) throw new Error("Telegram raid-alerts routing mismatch");
+if (getEl('notif-telegram-route-raid-weekly').checked !== true) throw new Error("Telegram raid-weekly routing mismatch");
+if (getEl('notif-telegram-route-cron-failures').checked !== false) throw new Error("Telegram cron-failures routing mismatch");
+if (getEl('notif-telegram-route-cron-successes').checked !== true) throw new Error("Telegram cron-successes routing mismatch");
+
+// Verify Webhook routing
+if (getEl('notif-webhook-url-input').value !== 'https://webhook.site/endpoint-custom') throw new Error("Webhook URL mismatch");
+if (getEl('notif-webhook-route-raid-alerts').checked !== true) throw new Error("Webhook raid-alerts routing mismatch");
+if (getEl('notif-webhook-route-raid-weekly').checked !== true) throw new Error("Webhook raid-weekly routing mismatch");
+if (getEl('notif-webhook-route-cron-failures').checked !== false) throw new Error("Webhook cron-failures routing mismatch");
+if (getEl('notif-webhook-route-cron-successes').checked !== false) throw new Error("Webhook cron-successes routing mismatch");
+
+// Verify Pushover credentials masking and routing
+if (!getEl('notif-pushover-user-key-badge').textContent.includes('••••9999')) throw new Error("Pushover user key badge missing masked preview");
+if (!getEl('notif-pushover-token-badge').textContent.includes('••••8888')) throw new Error("Pushover token badge missing masked preview");
+if (!getEl('notif-pushover-user-key-input').placeholder.includes('••••9999')) throw new Error("Pushover user key placeholder missing masked preview");
+if (!getEl('notif-pushover-token-input').placeholder.includes('••••8888')) throw new Error("Pushover token placeholder missing masked preview");
+if (getEl('notif-pushover-priority-select').value !== '1') throw new Error("Pushover priority mismatch");
+if (getEl('notif-pushover-route-raid-alerts').checked !== false) throw new Error("Pushover raid-alerts routing mismatch");
+if (getEl('notif-pushover-route-raid-weekly').checked !== false) throw new Error("Pushover raid-weekly routing mismatch");
+if (getEl('notif-pushover-route-cron-failures').checked !== true) throw new Error("Pushover cron-failures routing mismatch");
+if (getEl('notif-pushover-route-cron-successes').checked !== true) throw new Error("Pushover cron-successes routing mismatch");
+
+// Verify Ntfy credentials masking and routing
+if (!getEl('notif-ntfy-token-badge').textContent.includes('••••7777')) throw new Error("Ntfy token badge missing masked preview");
+if (!getEl('notif-ntfy-token-input').placeholder.includes('••••7777')) throw new Error("Ntfy token placeholder missing masked preview");
+if (getEl('notif-ntfy-url-input').value !== 'https://ntfy.example.com') throw new Error("Ntfy URL mismatch");
+if (getEl('notif-ntfy-topic-input').value !== 'homelab-ntfy-topic') throw new Error("Ntfy topic mismatch");
+if (getEl('notif-ntfy-priority-select').value !== '4') throw new Error("Ntfy priority mismatch");
+if (getEl('notif-ntfy-route-raid-alerts').checked !== true) throw new Error("Ntfy raid-alerts routing mismatch");
+if (getEl('notif-ntfy-route-raid-weekly').checked !== false) throw new Error("Ntfy raid-weekly routing mismatch");
+if (getEl('notif-ntfy-route-cron-failures').checked !== false) throw new Error("Ntfy cron-failures routing mismatch");
+if (getEl('notif-ntfy-route-cron-successes').checked !== true) throw new Error("Ntfy cron-successes routing mismatch");
+
+// Verify Gotify credentials masking and routing
+if (!getEl('notif-gotify-token-badge').textContent.includes('••••6666')) throw new Error("Gotify token badge missing masked preview");
+if (!getEl('notif-gotify-token-input').placeholder.includes('••••6666')) throw new Error("Gotify token placeholder missing masked preview");
+if (getEl('notif-gotify-url-input').value !== 'https://gotify.example.com') throw new Error("Gotify URL mismatch");
+if (getEl('notif-gotify-priority-select').value !== '8') throw new Error("Gotify priority mismatch");
+if (getEl('notif-gotify-route-raid-alerts').checked !== false) throw new Error("Gotify raid-alerts routing mismatch");
+if (getEl('notif-gotify-route-raid-weekly').checked !== true) throw new Error("Gotify raid-weekly routing mismatch");
+if (getEl('notif-gotify-route-cron-failures').checked !== true) throw new Error("Gotify cron-failures routing mismatch");
+if (getEl('notif-gotify-route-cron-successes').checked !== false) throw new Error("Gotify cron-successes routing mismatch");
+
+console.log("ALL_NODE_CHANNEL_MODAL_AND_MASKING_POPULATION_VM_CHECKS_PASSED");
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_CHANNEL_MODAL_AND_MASKING_POPULATION_VM_CHECKS_PASSED", res.stdout)
+
+    def test_channel_payload_construction_and_test_target_dispatch_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const attributes = {{}};
+  return {{
+    id: id,
+    style: {{}},
+    classList: {{
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {{
+        if (force === undefined) {{
+          if (classes.has(cls)) classes.delete(cls); else classes.add(cls);
+        }} else if (force) {{
+          classes.add(cls);
+        }} else {{
+          classes.delete(cls);
+        }}
+      }}
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    setAttribute: (name, val) => {{ attributes[name] = String(val); }},
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+    removeAttribute: (name) => {{ delete attributes[name]; }},
+    value: '',
+    placeholder: '',
+    checked: false,
+    disabled: false,
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  querySelectorAll: () => [],
+  addEventListener: () => {{}}
+}};
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+const capturedCalls = [];
+
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{
+    addEventListener: () => {{}},
+    clearTimeout: () => {{}},
+    setTimeout: setTimeout,
+  }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: setInterval,
+  clearInterval: clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams
+}});
+
+vm.runInContext(appJs, ctx);
+
+ctx.apiFetch = async function(url, options = {{}}) {{
+  capturedCalls.push({{ url, options }});
+  return {{
+    ok: true,
+    status: 200,
+    json: async () => ({{ success: true, message: "OK" }})
+  }};
+}};
+
+(async () => {{
+  // 1. Payload construction when password inputs are blank (preserves existing tokens)
+  getEl('notif-channel-pushover-enable').checked = true;
+  getEl('notif-pushover-user-key-input').value = ''; // Left blank
+  getEl('notif-pushover-token-input').value = '';    // Left blank
+  getEl('notif-pushover-priority-select').value = '2';
+  getEl('notif-pushover-route-raid-alerts').checked = true;
+  getEl('notif-pushover-route-raid-weekly').checked = false;
+  getEl('notif-pushover-route-cron-failures').checked = true;
+  getEl('notif-pushover-route-cron-successes').checked = false;
+
+  getEl('notif-channel-ntfy-enable').checked = true;
+  getEl('notif-ntfy-url-input').value = 'https://ntfy.sh';
+  getEl('notif-ntfy-topic-input').value = 'my-topic';
+  getEl('notif-ntfy-token-input').value = '';        // Left blank
+  getEl('notif-ntfy-priority-select').value = '5';
+  getEl('notif-ntfy-route-raid-alerts').checked = false;
+  getEl('notif-ntfy-route-raid-weekly').checked = true;
+  getEl('notif-ntfy-route-cron-failures').checked = false;
+  getEl('notif-ntfy-route-cron-successes').checked = true;
+
+  getEl('notif-channel-gotify-enable').checked = true;
+  getEl('notif-gotify-url-input').value = 'https://gotify.me';
+  getEl('notif-gotify-token-input').value = '';      // Left blank
+  getEl('notif-gotify-priority-select').value = '7';
+  getEl('notif-gotify-route-raid-alerts').checked = true;
+  getEl('notif-gotify-route-raid-weekly').checked = false;
+  getEl('notif-gotify-route-cron-failures').checked = true;
+  getEl('notif-gotify-route-cron-successes').checked = false;
+
+  const payloadPreserved = ctx.getDeliveryChannelsPayload();
+  if (payloadPreserved.pushover.user_key !== undefined) throw new Error("user_key should be omitted when empty to preserve masked secret");
+  if (payloadPreserved.pushover.api_token !== undefined) throw new Error("api_token should be omitted when empty to preserve masked secret");
+  if (payloadPreserved.pushover.priority !== 2) throw new Error("Pushover priority mismatch");
+  if (payloadPreserved.pushover.routing.raid_alerts !== true || payloadPreserved.pushover.routing.raid_weekly !== false) {{
+    throw new Error("Pushover routing mismatch in payload");
+  }}
+
+  if (payloadPreserved.ntfy.access_token !== undefined) throw new Error("access_token should be omitted when empty");
+  if (payloadPreserved.ntfy.server_url !== 'https://ntfy.sh') throw new Error("ntfy server_url mismatch");
+  if (payloadPreserved.ntfy.topic !== 'my-topic') throw new Error("ntfy topic mismatch");
+  if (payloadPreserved.ntfy.priority !== 5) throw new Error("ntfy priority mismatch");
+
+  if (payloadPreserved.gotify.app_token !== undefined) throw new Error("app_token should be omitted when empty");
+  if (payloadPreserved.gotify.server_url !== 'https://gotify.me') throw new Error("gotify server_url mismatch");
+  if (payloadPreserved.gotify.priority !== 7) throw new Error("gotify priority mismatch");
+
+  // 2. Payload construction when new credentials are submitted
+  getEl('notif-pushover-user-key-input').value = 'new_u_key_123';
+  getEl('notif-pushover-token-input').value = 'new_a_token_456';
+  getEl('notif-ntfy-token-input').value = 'new_tk_access_789';
+  getEl('notif-gotify-token-input').value = 'new_gotify_token_999';
+
+  const payloadUpdated = ctx.getDeliveryChannelsPayload();
+  if (payloadUpdated.pushover.user_key !== 'new_u_key_123') throw new Error("New Pushover user_key not captured");
+  if (payloadUpdated.pushover.api_token !== 'new_a_token_456') throw new Error("New Pushover api_token not captured");
+  if (payloadUpdated.ntfy.access_token !== 'new_tk_access_789') throw new Error("New Ntfy access_token not captured");
+  if (payloadUpdated.gotify.app_token !== 'new_gotify_token_999') throw new Error("New Gotify app_token not captured");
+
+  // 3. Save Delivery Channels dispatch (handleSaveDiscordSettings)
+  capturedCalls.length = 0;
+  await ctx.handleSaveDiscordSettings();
+  const saveCall = capturedCalls.find(c => c.url === '/api/notifications/center' && c.options.method === 'POST');
+  if (!saveCall) throw new Error("handleSaveDiscordSettings did not POST to /api/notifications/center");
+  const saveBody = JSON.parse(saveCall.options.body);
+  if (!saveBody.channels || !saveBody.channels.pushover || !saveBody.channels.ntfy || !saveBody.channels.gotify) {{
+    throw new Error("Channels structure missing in save payload: " + saveCall.options.body);
+  }}
+
+  // 4. Test Notification Target Selection Dispatch (handleSendTestNotification)
+  // Scenario A: Default select option 'all'
+  capturedCalls.length = 0;
+  getEl('send-test-notification-btn').disabled = false;
+  getEl('notif-test-channel-select').value = 'all';
+  await ctx.handleSendTestNotification();
+  let testCall = capturedCalls.find(c => c.url === '/api/notifications/test' && c.options.method === 'POST');
+  if (!testCall) throw new Error("handleSendTestNotification did not POST to /api/notifications/test");
+  let testBody = JSON.parse(testCall.options.body);
+  if (testBody.channel !== 'all') throw new Error("Expected channel 'all', got: " + testBody.channel);
+
+  // Scenario B: Selected channel option 'telegram'
+  capturedCalls.length = 0;
+  getEl('send-test-notification-btn').disabled = false;
+  getEl('notif-test-channel-select').value = 'telegram';
+  await ctx.handleSendTestNotification();
+  testCall = capturedCalls.find(c => c.url === '/api/notifications/test');
+  testBody = JSON.parse(testCall.options.body);
+  if (testBody.channel !== 'telegram') throw new Error("Expected channel 'telegram', got: " + testBody.channel);
+
+  // Scenario C: Explicit parameter override 'pushover'
+  capturedCalls.length = 0;
+  getEl('send-test-notification-btn').disabled = false;
+  await ctx.handleSendTestNotification('pushover');
+  testCall = capturedCalls.find(c => c.url === '/api/notifications/test');
+  testBody = JSON.parse(testCall.options.body);
+  if (testBody.channel !== 'pushover') throw new Error("Expected channel 'pushover', got: " + testBody.channel);
+
+  // Scenario D: Explicit parameter override 'ntfy'
+  capturedCalls.length = 0;
+  getEl('send-test-notification-btn').disabled = false;
+  await ctx.handleSendTestNotification('ntfy');
+  testCall = capturedCalls.find(c => c.url === '/api/notifications/test');
+  testBody = JSON.parse(testCall.options.body);
+  if (testBody.channel !== 'ntfy') throw new Error("Expected channel 'ntfy', got: " + testBody.channel);
+
+  // Scenario E: Explicit parameter override 'gotify'
+  capturedCalls.length = 0;
+  getEl('send-test-notification-btn').disabled = false;
+  await ctx.handleSendTestNotification('gotify');
+  testCall = capturedCalls.find(c => c.url === '/api/notifications/test');
+  testBody = JSON.parse(testCall.options.body);
+  if (testBody.channel !== 'gotify') throw new Error("Expected channel 'gotify', got: " + testBody.channel);
+
+  console.log("ALL_NODE_CHANNEL_PAYLOAD_AND_TARGET_DISPATCH_VM_CHECKS_PASSED");
+}})();
+""";
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM execution failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_NODE_CHANNEL_PAYLOAD_AND_TARGET_DISPATCH_VM_CHECKS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":

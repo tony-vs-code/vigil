@@ -1574,6 +1574,18 @@
                       <span class="channel-pill-name">Webhook</span>
                       <span id="webhook-status-badge" class="status-badge status-unknown">UNKNOWN</span>
                     </div>
+                    <div class="channel-status-pill">
+                      <span class="channel-pill-name">Pushover</span>
+                      <span id="pushover-status-badge" class="status-badge status-unknown">UNKNOWN</span>
+                    </div>
+                    <div class="channel-status-pill">
+                      <span class="channel-pill-name">Ntfy</span>
+                      <span id="ntfy-status-badge" class="status-badge status-unknown">UNKNOWN</span>
+                    </div>
+                    <div class="channel-status-pill">
+                      <span class="channel-pill-name">Gotify</span>
+                      <span id="gotify-status-badge" class="status-badge status-unknown">UNKNOWN</span>
+                    </div>
                   </div>
                 </div>
 
@@ -3805,7 +3817,7 @@
       <div class="modal-header">
         <div>
           <h2 id="notif-channels-modal-title" class="modal-title">Delivery Channels</h2>
-          <p class="modal-subtitle">Dispatch alerts to Discord, Telegram, or generic webhooks</p>
+          <p class="modal-subtitle">Dispatch alerts to Discord, Telegram, Pushover, Ntfy, Gotify, or generic webhooks</p>
         </div>
         <button id="btn-close-notif-channels" type="button" class="btn-icon-close" aria-label="Close delivery channels modal">&times;</button>
       </div>
@@ -3864,6 +3876,28 @@
                 <input id="discord-channel-input" name="channel_id" type="text" class="hidden" />
                 <small class="form-hint">Target Discord text channel ID where alerts are delivered.</small>
               </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-discord-route-raid-alerts">
+                    <input type="checkbox" id="notif-discord-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-discord-route-raid-weekly">
+                    <input type="checkbox" id="notif-discord-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-discord-route-cron-failures">
+                    <input type="checkbox" id="notif-discord-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-discord-route-cron-successes">
+                    <input type="checkbox" id="notif-discord-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -3914,6 +3948,28 @@
                 />
                 <small class="form-hint">Target chat, group, or channel ID.</small>
               </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-telegram-route-raid-alerts">
+                    <input type="checkbox" id="notif-telegram-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-telegram-route-raid-weekly">
+                    <input type="checkbox" id="notif-telegram-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-telegram-route-cron-failures">
+                    <input type="checkbox" id="notif-telegram-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-telegram-route-cron-successes">
+                    <input type="checkbox" id="notif-telegram-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -3950,6 +4006,300 @@
                 />
                 <small class="form-hint">Standard JSON HTTP POST endpoint.</small>
               </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-webhook-route-raid-alerts">
+                    <input type="checkbox" id="notif-webhook-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-webhook-route-raid-weekly">
+                    <input type="checkbox" id="notif-webhook-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-webhook-route-cron-failures">
+                    <input type="checkbox" id="notif-webhook-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-webhook-route-cron-successes">
+                    <input type="checkbox" id="notif-webhook-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Channel 4: Pushover -->
+          <div class="channel-section">
+            <div class="channel-section-header">
+              <div class="channel-title-group">
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect>
+                  <line x1="12" y1="18" x2="12.01" y2="18"></line>
+                </svg>
+                <span class="channel-title">Pushover</span>
+              </div>
+              <label class="toggle-switch" for="notif-channel-pushover-enable">
+                <input
+                  type="checkbox"
+                  id="notif-channel-pushover-enable"
+                  name="notif_channel_pushover_enable"
+                  class="toggle-input"
+                />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="channel-fields">
+              <div class="form-group">
+                <label for="notif-pushover-user-key-input">
+                  User Key
+                  <span id="notif-pushover-user-key-badge" class="token-status-badge">Not configured</span>
+                </label>
+                <input
+                  id="notif-pushover-user-key-input"
+                  name="notif_pushover_user_key"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="e.g. uQiRzpo4DXghDmr9QzzfQu27cmVRsG"
+                />
+                <small class="form-hint">Pushover user or group key.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-pushover-token-input">
+                  App API Token
+                  <span id="notif-pushover-token-badge" class="token-status-badge">Not configured</span>
+                </label>
+                <input
+                  id="notif-pushover-token-input"
+                  name="notif_pushover_token"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="e.g. azGDORePK8gMaC0QOYAMyEEuzJnyUi"
+                />
+                <small class="form-hint">Pushover application API token.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-pushover-priority-select">Default Priority</label>
+                <select id="notif-pushover-priority-select" class="module-interval-select notif-select full-width">
+                  <option value="-2">-2 (Lowest - Silent)</option>
+                  <option value="-1">-1 (Low - Quiet)</option>
+                  <option value="0" selected>0 (Normal - Default)</option>
+                  <option value="1">1 (High - Bypass quiet hours)</option>
+                  <option value="2">2 (Emergency - Requires acknowledgement)</option>
+                </select>
+                <small class="form-hint">Dispatched message priority level.</small>
+              </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-pushover-route-raid-alerts">
+                    <input type="checkbox" id="notif-pushover-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-pushover-route-raid-weekly">
+                    <input type="checkbox" id="notif-pushover-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-pushover-route-cron-failures">
+                    <input type="checkbox" id="notif-pushover-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-pushover-route-cron-successes">
+                    <input type="checkbox" id="notif-pushover-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Channel 5: Ntfy -->
+          <div class="channel-section">
+            <div class="channel-section-header">
+              <div class="channel-title-group">
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                  <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+                </svg>
+                <span class="channel-title">Ntfy</span>
+              </div>
+              <label class="toggle-switch" for="notif-channel-ntfy-enable">
+                <input
+                  type="checkbox"
+                  id="notif-channel-ntfy-enable"
+                  name="notif_channel_ntfy_enable"
+                  class="toggle-input"
+                />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="channel-fields">
+              <div class="form-group">
+                <label for="notif-ntfy-url-input">Server URL</label>
+                <input
+                  id="notif-ntfy-url-input"
+                  name="notif_ntfy_url"
+                  type="url"
+                  value="https://ntfy.sh"
+                  placeholder="https://ntfy.sh"
+                />
+                <small class="form-hint">Ntfy server base URL (default: https://ntfy.sh).</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-ntfy-topic-input">Topic</label>
+                <input
+                  id="notif-ntfy-topic-input"
+                  name="notif_ntfy_topic"
+                  type="text"
+                  placeholder="e.g. homelab-systemalerts"
+                />
+                <small class="form-hint">Target ntfy notification topic.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-ntfy-token-input">
+                  Access Token (Optional)
+                  <span id="notif-ntfy-token-badge" class="token-status-badge">Not configured</span>
+                </label>
+                <input
+                  id="notif-ntfy-token-input"
+                  name="notif_ntfy_token"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="e.g. tk_your_ntfy_token (optional)"
+                />
+                <small class="form-hint">Bearer access token for private or protected topics.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-ntfy-priority-select">Default Priority</label>
+                <select id="notif-ntfy-priority-select" class="module-interval-select notif-select full-width">
+                  <option value="1">1 (Min)</option>
+                  <option value="2">2 (Low)</option>
+                  <option value="3" selected>3 (Default)</option>
+                  <option value="4">4 (High)</option>
+                  <option value="5">5 (Urgent / Max)</option>
+                </select>
+                <small class="form-hint">Ntfy priority level (1 to 5).</small>
+              </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-ntfy-route-raid-alerts">
+                    <input type="checkbox" id="notif-ntfy-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-ntfy-route-raid-weekly">
+                    <input type="checkbox" id="notif-ntfy-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-ntfy-route-cron-failures">
+                    <input type="checkbox" id="notif-ntfy-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-ntfy-route-cron-successes">
+                    <input type="checkbox" id="notif-ntfy-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Channel 6: Gotify -->
+          <div class="channel-section">
+            <div class="channel-section-header">
+              <div class="channel-title-group">
+                <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path>
+                </svg>
+                <span class="channel-title">Gotify</span>
+              </div>
+              <label class="toggle-switch" for="notif-channel-gotify-enable">
+                <input
+                  type="checkbox"
+                  id="notif-channel-gotify-enable"
+                  name="notif_channel_gotify_enable"
+                  class="toggle-input"
+                />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="channel-fields">
+              <div class="form-group">
+                <label for="notif-gotify-url-input">Server URL</label>
+                <input
+                  id="notif-gotify-url-input"
+                  name="notif_gotify_url"
+                  type="url"
+                  placeholder="https://gotify.example.com"
+                />
+                <small class="form-hint">Base URL of your self-hosted Gotify server.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-gotify-token-input">
+                  App Token
+                  <span id="notif-gotify-token-badge" class="token-status-badge">Not configured</span>
+                </label>
+                <input
+                  id="notif-gotify-token-input"
+                  name="notif_gotify_token"
+                  type="password"
+                  autocomplete="off"
+                  placeholder="e.g. A1B2C3D4E5"
+                />
+                <small class="form-hint">Gotify application token (AppToken).</small>
+              </div>
+
+              <div class="form-group">
+                <label for="notif-gotify-priority-select">Default Priority</label>
+                <select id="notif-gotify-priority-select" class="module-interval-select notif-select full-width">
+                  <option value="1">1 (Min)</option>
+                  <option value="2">2 (Low)</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5" selected>5 (Default / Normal)</option>
+                  <option value="6">6</option>
+                  <option value="7">7 (High)</option>
+                  <option value="8">8</option>
+                  <option value="9">9</option>
+                  <option value="10">10 (Urgent / Emergency)</option>
+                </select>
+                <small class="form-hint">Gotify message priority (1 to 10).</small>
+              </div>
+
+              <div class="channel-routing-group">
+                <span class="routing-group-title">Event Routing</span>
+                <div class="routing-checkboxes">
+                  <label class="routing-checkbox-label" for="notif-gotify-route-raid-alerts">
+                    <input type="checkbox" id="notif-gotify-route-raid-alerts" checked />
+                    <span>RAID Alerts</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-gotify-route-raid-weekly">
+                    <input type="checkbox" id="notif-gotify-route-raid-weekly" checked />
+                    <span>Weekly Reports</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-gotify-route-cron-failures">
+                    <input type="checkbox" id="notif-gotify-route-cron-failures" checked />
+                    <span>Cron Failures</span>
+                  </label>
+                  <label class="routing-checkbox-label" for="notif-gotify-route-cron-successes">
+                    <input type="checkbox" id="notif-gotify-route-cron-successes" />
+                    <span>Cron Successes</span>
+                  </label>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -3962,6 +4312,9 @@
                 <option value="discord">Discord Only</option>
                 <option value="telegram">Telegram Only</option>
                 <option value="webhook">Generic Webhook Only</option>
+                <option value="pushover">Pushover Only</option>
+                <option value="ntfy">Ntfy Only</option>
+                <option value="gotify">Gotify Only</option>
               </select>
             </div>
           </div>

@@ -4346,9 +4346,170 @@ function updateNextRunDisplay(schedule = null) {
 }
 
 /**
- * Populate all Notification Center form controls from GET /api/notifications/center payload.
+ * Updates channel status pill badge showing ACTIVE, DISABLED, or NOT CONFIGURED.
  */
-function populateNotificationCenter(config) {
+function updateChannelStatusBadge(badgeId, isConfigured, isEnabled) {
+  const badge = document.getElementById(badgeId);
+  if (!badge) return;
+  badge.classList.remove(
+    "status-clean",
+    "status-active",
+    "status-enabled",
+    "status-degraded",
+    "status-disabled",
+    "status-not-configured",
+    "status-unknown"
+  );
+  if (!isConfigured) {
+    badge.textContent = "NOT CONFIGURED";
+    badge.classList.add("status-degraded", "status-not-configured");
+    badge.setAttribute("data-state", "not-configured");
+  } else if (isEnabled) {
+    badge.textContent = "ACTIVE";
+    badge.classList.add("status-clean", "status-active", "status-enabled");
+    badge.setAttribute("data-state", "active");
+  } else {
+    badge.textContent = "DISABLED";
+    badge.classList.add("status-disabled");
+    badge.setAttribute("data-state", "disabled");
+  }
+}
+
+/**
+ * Helper to extract payload for all 6 delivery channels (Discord, Telegram, Webhook, Pushover, Ntfy, Gotify)
+ * including credentials and per-channel routing rules.
+ */
+function getDeliveryChannelsPayload() {
+  const discordToggle = document.getElementById("notif-channel-discord-enable");
+  const discordToken = document.getElementById("notif-discord-token-input");
+  const discordChannel = document.getElementById("notif-discord-channel-input");
+
+  const discordPayload = {
+    enabled: Boolean(discordToggle ? discordToggle.checked : false),
+    channel_id: discordChannel ? discordChannel.value.trim() : "",
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-discord-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-discord-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-discord-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-discord-route-cron-successes")?.checked ?? false),
+    },
+  };
+  if (discordToken && discordToken.value.trim().length > 0) {
+    discordPayload.token = discordToken.value.trim();
+    discordPayload.bot_token = discordToken.value.trim();
+  }
+
+  const telegramToggle = document.getElementById("notif-channel-telegram-enable");
+  const telegramToken = document.getElementById("notif-telegram-token-input");
+  const telegramChatId = document.getElementById("notif-telegram-chat-id-input");
+
+  const telegramPayload = {
+    enabled: Boolean(telegramToggle ? telegramToggle.checked : false),
+    chat_id: telegramChatId ? telegramChatId.value.trim() : "",
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-telegram-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-telegram-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-telegram-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-telegram-route-cron-successes")?.checked ?? false),
+    },
+  };
+  if (telegramToken && telegramToken.value.trim().length > 0) {
+    telegramPayload.token = telegramToken.value.trim();
+    telegramPayload.bot_token = telegramToken.value.trim();
+  }
+
+  const webhookToggle = document.getElementById("notif-channel-webhook-enable");
+  const webhookUrl = document.getElementById("notif-webhook-url-input");
+
+  const webhookPayload = {
+    enabled: Boolean(webhookToggle ? webhookToggle.checked : false),
+    url: webhookUrl ? webhookUrl.value.trim() : "",
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-webhook-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-webhook-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-webhook-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-webhook-route-cron-successes")?.checked ?? false),
+    },
+  };
+
+  const pushoverToggle = document.getElementById("notif-channel-pushover-enable");
+  const pushoverUserKey = document.getElementById("notif-pushover-user-key-input");
+  const pushoverToken = document.getElementById("notif-pushover-token-input");
+  const pushoverPriority = document.getElementById("notif-pushover-priority-select");
+
+  const pushoverPayload = {
+    enabled: Boolean(pushoverToggle ? pushoverToggle.checked : false),
+    priority: Number(pushoverPriority?.value ?? 0),
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-pushover-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-pushover-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-pushover-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-pushover-route-cron-successes")?.checked ?? false),
+    },
+  };
+  if (pushoverUserKey && pushoverUserKey.value.trim().length > 0) {
+    pushoverPayload.user_key = pushoverUserKey.value.trim();
+  }
+  if (pushoverToken && pushoverToken.value.trim().length > 0) {
+    pushoverPayload.api_token = pushoverToken.value.trim();
+  }
+
+  const ntfyToggle = document.getElementById("notif-channel-ntfy-enable");
+  const ntfyUrl = document.getElementById("notif-ntfy-url-input");
+  const ntfyTopic = document.getElementById("notif-ntfy-topic-input");
+  const ntfyToken = document.getElementById("notif-ntfy-token-input");
+  const ntfyPriority = document.getElementById("notif-ntfy-priority-select");
+
+  const ntfyPayload = {
+    enabled: Boolean(ntfyToggle ? ntfyToggle.checked : false),
+    server_url: (ntfyUrl?.value || "").trim() || "https://ntfy.sh",
+    topic: (ntfyTopic?.value || "").trim(),
+    priority: Number(ntfyPriority?.value ?? 3),
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-ntfy-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-ntfy-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-ntfy-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-ntfy-route-cron-successes")?.checked ?? false),
+    },
+  };
+  if (ntfyToken && ntfyToken.value.trim().length > 0) {
+    ntfyPayload.access_token = ntfyToken.value.trim();
+  }
+
+  const gotifyToggle = document.getElementById("notif-channel-gotify-enable");
+  const gotifyUrl = document.getElementById("notif-gotify-url-input");
+  const gotifyToken = document.getElementById("notif-gotify-token-input");
+  const gotifyPriority = document.getElementById("notif-gotify-priority-select");
+
+  const gotifyPayload = {
+    enabled: Boolean(gotifyToggle ? gotifyToggle.checked : false),
+    server_url: (gotifyUrl?.value || "").trim(),
+    priority: Number(gotifyPriority?.value ?? 5),
+    routing: {
+      raid_alerts: Boolean(document.getElementById("notif-gotify-route-raid-alerts")?.checked ?? true),
+      raid_weekly: Boolean(document.getElementById("notif-gotify-route-raid-weekly")?.checked ?? true),
+      cron_failures: Boolean(document.getElementById("notif-gotify-route-cron-failures")?.checked ?? true),
+      cron_successes: Boolean(document.getElementById("notif-gotify-route-cron-successes")?.checked ?? false),
+    },
+  };
+  if (gotifyToken && gotifyToken.value.trim().length > 0) {
+    gotifyPayload.app_token = gotifyToken.value.trim();
+  }
+
+  return {
+    discord: discordPayload,
+    telegram: telegramPayload,
+    webhook: webhookPayload,
+    pushover: pushoverPayload,
+    ntfy: ntfyPayload,
+    gotify: gotifyPayload,
+  };
+}
+
+/**
+ * Populate all Notification Center form controls and status pills from GET /api/notifications/center payload.
+ */
+function renderNotificationCenterConfig(config) {
   if (!config || typeof config !== "object") return;
   cachedNotificationCenterConfig = config;
 
@@ -4356,6 +4517,9 @@ function populateNotificationCenter(config) {
   const discordCh = channels.discord || {};
   const telegramCh = channels.telegram || {};
   const webhookCh = channels.webhook || {};
+  const pushoverCh = channels.pushover || {};
+  const ntfyCh = channels.ntfy || {};
+  const gotifyCh = channels.gotify || {};
   const schedule = config.schedule || {};
   const topics = config.topics || {};
   const thresholds = config.thresholds || {};
@@ -4377,7 +4541,7 @@ function populateNotificationCenter(config) {
   const isTokenConfigured = Boolean(
     discordCh.token_configured !== undefined
       ? discordCh.token_configured
-      : config.discord_token_configured
+      : (discordCh.bot_token_configured ?? config.discord_token_configured)
   );
   const tokenMasked = discordCh.token_masked || config.discord_token_masked || "";
 
@@ -4407,30 +4571,24 @@ function populateNotificationCenter(config) {
   if (notifDiscordChannel) notifDiscordChannel.value = channelId;
   if (discordLegacyChannel) discordLegacyChannel.value = channelId;
 
-  const discordStatusBadge = document.getElementById("discord-status-badge");
-  if (discordStatusBadge) {
-    discordStatusBadge.classList.remove(
-      "status-clean",
-      "status-degraded",
-      "status-unknown",
-      "status-enabled",
-      "status-disabled"
-    );
-    if (discordEnabled) {
-      discordStatusBadge.classList.add("status-clean", "status-enabled");
-      discordStatusBadge.textContent = "ENABLED";
-      discordStatusBadge.setAttribute("data-state", "enabled");
-    } else {
-      discordStatusBadge.classList.add("status-degraded", "status-disabled");
-      discordStatusBadge.textContent = "DISABLED";
-      discordStatusBadge.setAttribute("data-state", "disabled");
-    }
-  }
+  // Discord Routing Checkboxes
+  const discordRouting = discordCh.routing || {};
+  const notifDiscordRouteAlerts = document.getElementById("notif-discord-route-raid-alerts");
+  if (notifDiscordRouteAlerts) notifDiscordRouteAlerts.checked = Boolean(discordRouting.raid_alerts ?? true);
+  const notifDiscordRouteWeekly = document.getElementById("notif-discord-route-raid-weekly");
+  if (notifDiscordRouteWeekly) notifDiscordRouteWeekly.checked = Boolean(discordRouting.raid_weekly ?? true);
+  const notifDiscordRouteCronFailures = document.getElementById("notif-discord-route-cron-failures");
+  if (notifDiscordRouteCronFailures) notifDiscordRouteCronFailures.checked = Boolean(discordRouting.cron_failures ?? true);
+  const notifDiscordRouteCronSuccesses = document.getElementById("notif-discord-route-cron-successes");
+  if (notifDiscordRouteCronSuccesses) notifDiscordRouteCronSuccesses.checked = Boolean(discordRouting.cron_successes ?? false);
+
+  const isDiscordConfigured = Boolean((isTokenConfigured || discordCh.bot_token) && channelId);
+  updateChannelStatusBadge("discord-status-badge", isDiscordConfigured, discordEnabled);
 
   const overviewDiscordBadge = document.getElementById("overview-discord-badge");
   if (overviewDiscordBadge) {
     overviewDiscordBadge.className = `status-badge ${discordEnabled ? "status-clean" : "status-degraded"}`;
-    overviewDiscordBadge.textContent = discordEnabled ? "ENABLED" : "DISABLED";
+    overviewDiscordBadge.textContent = discordEnabled ? "ACTIVE" : "DISABLED";
   }
   const overviewDiscordSummary = document.getElementById("overview-discord-summary");
   if (overviewDiscordSummary) {
@@ -4445,7 +4603,7 @@ function populateNotificationCenter(config) {
 
   const notifTelegramToken = document.getElementById("notif-telegram-token-input");
   const notifTelegramBadge = document.getElementById("notif-telegram-token-badge");
-  const isTgConfigured = Boolean(telegramCh.token_configured);
+  const isTgConfigured = Boolean(telegramCh.token_configured || telegramCh.bot_token_configured);
   if (notifTelegramToken) {
     notifTelegramToken.value = "";
     notifTelegramToken.placeholder = isTgConfigured
@@ -4467,6 +4625,20 @@ function populateNotificationCenter(config) {
   const notifTelegramChatId = document.getElementById("notif-telegram-chat-id-input");
   if (notifTelegramChatId) notifTelegramChatId.value = telegramCh.chat_id || "";
 
+  // Telegram Routing Checkboxes
+  const telegramRouting = telegramCh.routing || {};
+  const notifTgRouteAlerts = document.getElementById("notif-telegram-route-raid-alerts");
+  if (notifTgRouteAlerts) notifTgRouteAlerts.checked = Boolean(telegramRouting.raid_alerts ?? true);
+  const notifTgRouteWeekly = document.getElementById("notif-telegram-route-raid-weekly");
+  if (notifTgRouteWeekly) notifTgRouteWeekly.checked = Boolean(telegramRouting.raid_weekly ?? true);
+  const notifTgRouteCronFailures = document.getElementById("notif-telegram-route-cron-failures");
+  if (notifTgRouteCronFailures) notifTgRouteCronFailures.checked = Boolean(telegramRouting.cron_failures ?? true);
+  const notifTgRouteCronSuccesses = document.getElementById("notif-telegram-route-cron-successes");
+  if (notifTgRouteCronSuccesses) notifTgRouteCronSuccesses.checked = Boolean(telegramRouting.cron_successes ?? false);
+
+  const isTgFullyConfigured = Boolean((isTgConfigured || telegramCh.bot_token) && telegramCh.chat_id);
+  updateChannelStatusBadge("telegram-status-badge", isTgFullyConfigured, Boolean(telegramCh.enabled));
+
   // 3. Generic Webhook Channel
   const notifWebhookToggle = document.getElementById("notif-channel-webhook-enable");
   if (notifWebhookToggle) notifWebhookToggle.checked = Boolean(webhookCh.enabled);
@@ -4474,7 +4646,183 @@ function populateNotificationCenter(config) {
   const notifWebhookUrl = document.getElementById("notif-webhook-url-input");
   if (notifWebhookUrl) notifWebhookUrl.value = webhookCh.url || "";
 
-  // 4. Automated Report Schedule
+  // Webhook Routing Checkboxes
+  const webhookRouting = webhookCh.routing || {};
+  const notifWhRouteAlerts = document.getElementById("notif-webhook-route-raid-alerts");
+  if (notifWhRouteAlerts) notifWhRouteAlerts.checked = Boolean(webhookRouting.raid_alerts ?? true);
+  const notifWhRouteWeekly = document.getElementById("notif-webhook-route-raid-weekly");
+  if (notifWhRouteWeekly) notifWhRouteWeekly.checked = Boolean(webhookRouting.raid_weekly ?? true);
+  const notifWhRouteCronFailures = document.getElementById("notif-webhook-route-cron-failures");
+  if (notifWhRouteCronFailures) notifWhRouteCronFailures.checked = Boolean(webhookRouting.cron_failures ?? true);
+  const notifWhRouteCronSuccesses = document.getElementById("notif-webhook-route-cron-successes");
+  if (notifWhRouteCronSuccesses) notifWhRouteCronSuccesses.checked = Boolean(webhookRouting.cron_successes ?? false);
+
+  const isWebhookConfigured = Boolean(webhookCh.url && webhookCh.url.trim().length > 0);
+  updateChannelStatusBadge("webhook-status-badge", isWebhookConfigured, Boolean(webhookCh.enabled));
+
+  // 4. Pushover Channel
+  const notifPushoverToggle = document.getElementById("notif-channel-pushover-enable");
+  if (notifPushoverToggle) notifPushoverToggle.checked = Boolean(pushoverCh.enabled);
+
+  const notifPushoverUserKey = document.getElementById("notif-pushover-user-key-input");
+  const notifPushoverUserKeyBadge = document.getElementById("notif-pushover-user-key-badge");
+  const isPushoverUserConfigured = Boolean(pushoverCh.user_key_configured);
+  if (notifPushoverUserKey) {
+    notifPushoverUserKey.value = "";
+    notifPushoverUserKey.placeholder = isPushoverUserConfigured
+      ? `Configured (${pushoverCh.user_key_masked || "••••••••"}) — type to replace`
+      : "e.g. uQiRzpo4DXghDmr9QzzfQu27cmVRsG";
+  }
+  if (notifPushoverUserKeyBadge) {
+    if (isPushoverUserConfigured) {
+      notifPushoverUserKeyBadge.textContent = pushoverCh.user_key_masked
+        ? `Configured (${pushoverCh.user_key_masked})`
+        : "Configured";
+      notifPushoverUserKeyBadge.classList.add("configured");
+    } else {
+      notifPushoverUserKeyBadge.textContent = "Not configured";
+      notifPushoverUserKeyBadge.classList.remove("configured");
+    }
+  }
+
+  const notifPushoverToken = document.getElementById("notif-pushover-token-input");
+  const notifPushoverTokenBadge = document.getElementById("notif-pushover-token-badge");
+  const isPushoverTokenConfigured = Boolean(pushoverCh.api_token_configured || pushoverCh.token_configured);
+  if (notifPushoverToken) {
+    notifPushoverToken.value = "";
+    notifPushoverToken.placeholder = isPushoverTokenConfigured
+      ? `Configured (${pushoverCh.token_masked || "••••••••"}) — type to replace`
+      : "e.g. azGDORePK8gMaC0QOYAMyEEuzJnyUi";
+  }
+  if (notifPushoverTokenBadge) {
+    if (isPushoverTokenConfigured) {
+      notifPushoverTokenBadge.textContent = pushoverCh.token_masked
+        ? `Configured (${pushoverCh.token_masked})`
+        : "Configured";
+      notifPushoverTokenBadge.classList.add("configured");
+    } else {
+      notifPushoverTokenBadge.textContent = "Not configured";
+      notifPushoverTokenBadge.classList.remove("configured");
+    }
+  }
+
+  const notifPushoverPriority = document.getElementById("notif-pushover-priority-select");
+  if (notifPushoverPriority && pushoverCh.priority !== undefined) {
+    notifPushoverPriority.value = String(pushoverCh.priority);
+  }
+
+  // Pushover Routing Checkboxes
+  const pushoverRouting = pushoverCh.routing || {};
+  const notifPushRouteAlerts = document.getElementById("notif-pushover-route-raid-alerts");
+  if (notifPushRouteAlerts) notifPushRouteAlerts.checked = Boolean(pushoverRouting.raid_alerts ?? true);
+  const notifPushRouteWeekly = document.getElementById("notif-pushover-route-raid-weekly");
+  if (notifPushRouteWeekly) notifPushRouteWeekly.checked = Boolean(pushoverRouting.raid_weekly ?? true);
+  const notifPushRouteCronFailures = document.getElementById("notif-pushover-route-cron-failures");
+  if (notifPushRouteCronFailures) notifPushRouteCronFailures.checked = Boolean(pushoverRouting.cron_failures ?? true);
+  const notifPushRouteCronSuccesses = document.getElementById("notif-pushover-route-cron-successes");
+  if (notifPushRouteCronSuccesses) notifPushRouteCronSuccesses.checked = Boolean(pushoverRouting.cron_successes ?? false);
+
+  const isPushoverConfigured = Boolean(isPushoverUserConfigured && isPushoverTokenConfigured);
+  updateChannelStatusBadge("pushover-status-badge", isPushoverConfigured, Boolean(pushoverCh.enabled));
+
+  // 5. Ntfy Channel
+  const notifNtfyToggle = document.getElementById("notif-channel-ntfy-enable");
+  if (notifNtfyToggle) notifNtfyToggle.checked = Boolean(ntfyCh.enabled);
+
+  const notifNtfyUrl = document.getElementById("notif-ntfy-url-input");
+  if (notifNtfyUrl) notifNtfyUrl.value = ntfyCh.server_url || ntfyCh.url || "https://ntfy.sh";
+
+  const notifNtfyTopic = document.getElementById("notif-ntfy-topic-input");
+  if (notifNtfyTopic) notifNtfyTopic.value = ntfyCh.topic || "";
+
+  const notifNtfyToken = document.getElementById("notif-ntfy-token-input");
+  const notifNtfyTokenBadge = document.getElementById("notif-ntfy-token-badge");
+  const isNtfyTokenConfigured = Boolean(ntfyCh.access_token_configured || ntfyCh.token_configured);
+  if (notifNtfyToken) {
+    notifNtfyToken.value = "";
+    notifNtfyToken.placeholder = isNtfyTokenConfigured
+      ? `Configured (${ntfyCh.token_masked || "••••••••"}) — type to replace`
+      : "e.g. tk_your_ntfy_token (optional)";
+  }
+  if (notifNtfyTokenBadge) {
+    if (isNtfyTokenConfigured) {
+      notifNtfyTokenBadge.textContent = ntfyCh.token_masked
+        ? `Configured (${ntfyCh.token_masked})`
+        : "Configured";
+      notifNtfyTokenBadge.classList.add("configured");
+    } else {
+      notifNtfyTokenBadge.textContent = "Not configured";
+      notifNtfyTokenBadge.classList.remove("configured");
+    }
+  }
+
+  const notifNtfyPriority = document.getElementById("notif-ntfy-priority-select");
+  if (notifNtfyPriority && ntfyCh.priority !== undefined) {
+    notifNtfyPriority.value = String(ntfyCh.priority);
+  }
+
+  // Ntfy Routing Checkboxes
+  const ntfyRouting = ntfyCh.routing || {};
+  const notifNtfyRouteAlerts = document.getElementById("notif-ntfy-route-raid-alerts");
+  if (notifNtfyRouteAlerts) notifNtfyRouteAlerts.checked = Boolean(ntfyRouting.raid_alerts ?? true);
+  const notifNtfyRouteWeekly = document.getElementById("notif-ntfy-route-raid-weekly");
+  if (notifNtfyRouteWeekly) notifNtfyRouteWeekly.checked = Boolean(ntfyRouting.raid_weekly ?? true);
+  const notifNtfyRouteCronFailures = document.getElementById("notif-ntfy-route-cron-failures");
+  if (notifNtfyRouteCronFailures) notifNtfyRouteCronFailures.checked = Boolean(ntfyRouting.cron_failures ?? true);
+  const notifNtfyRouteCronSuccesses = document.getElementById("notif-ntfy-route-cron-successes");
+  if (notifNtfyRouteCronSuccesses) notifNtfyRouteCronSuccesses.checked = Boolean(ntfyRouting.cron_successes ?? false);
+
+  const isNtfyConfigured = Boolean(ntfyCh.topic && ntfyCh.topic.trim().length > 0);
+  updateChannelStatusBadge("ntfy-status-badge", isNtfyConfigured, Boolean(ntfyCh.enabled));
+
+  // 6. Gotify Channel
+  const notifGotifyToggle = document.getElementById("notif-channel-gotify-enable");
+  if (notifGotifyToggle) notifGotifyToggle.checked = Boolean(gotifyCh.enabled);
+
+  const notifGotifyUrl = document.getElementById("notif-gotify-url-input");
+  if (notifGotifyUrl) notifGotifyUrl.value = gotifyCh.server_url || gotifyCh.url || "";
+
+  const notifGotifyToken = document.getElementById("notif-gotify-token-input");
+  const notifGotifyTokenBadge = document.getElementById("notif-gotify-token-badge");
+  const isGotifyTokenConfigured = Boolean(gotifyCh.app_token_configured || gotifyCh.token_configured);
+  if (notifGotifyToken) {
+    notifGotifyToken.value = "";
+    notifGotifyToken.placeholder = isGotifyTokenConfigured
+      ? `Configured (${gotifyCh.token_masked || "••••••••"}) — type to replace`
+      : "e.g. A1B2C3D4E5";
+  }
+  if (notifGotifyTokenBadge) {
+    if (isGotifyTokenConfigured) {
+      notifGotifyTokenBadge.textContent = gotifyCh.token_masked
+        ? `Configured (${gotifyCh.token_masked})`
+        : "Configured";
+      notifGotifyTokenBadge.classList.add("configured");
+    } else {
+      notifGotifyTokenBadge.textContent = "Not configured";
+      notifGotifyTokenBadge.classList.remove("configured");
+    }
+  }
+
+  const notifGotifyPriority = document.getElementById("notif-gotify-priority-select");
+  if (notifGotifyPriority && gotifyCh.priority !== undefined) {
+    notifGotifyPriority.value = String(gotifyCh.priority);
+  }
+
+  // Gotify Routing Checkboxes
+  const gotifyRouting = gotifyCh.routing || {};
+  const notifGotifyRouteAlerts = document.getElementById("notif-gotify-route-raid-alerts");
+  if (notifGotifyRouteAlerts) notifGotifyRouteAlerts.checked = Boolean(gotifyRouting.raid_alerts ?? true);
+  const notifGotifyRouteWeekly = document.getElementById("notif-gotify-route-raid-weekly");
+  if (notifGotifyRouteWeekly) notifGotifyRouteWeekly.checked = Boolean(gotifyRouting.raid_weekly ?? true);
+  const notifGotifyRouteCronFailures = document.getElementById("notif-gotify-route-cron-failures");
+  if (notifGotifyRouteCronFailures) notifGotifyRouteCronFailures.checked = Boolean(gotifyRouting.cron_failures ?? true);
+  const notifGotifyRouteCronSuccesses = document.getElementById("notif-gotify-route-cron-successes");
+  if (notifGotifyRouteCronSuccesses) notifGotifyRouteCronSuccesses.checked = Boolean(gotifyRouting.cron_successes ?? false);
+
+  const isGotifyConfigured = Boolean(gotifyCh.server_url && (isGotifyTokenConfigured || gotifyCh.app_token));
+  updateChannelStatusBadge("gotify-status-badge", isGotifyConfigured, Boolean(gotifyCh.enabled));
+
+  // 7. Automated Report Schedule
   const scheduleToggle = document.getElementById("notif-schedule-enable");
   if (scheduleToggle) scheduleToggle.checked = Boolean(schedule.enabled ?? true);
 
@@ -4494,7 +4842,7 @@ function populateNotificationCenter(config) {
 
   updateNextRunDisplay(schedule);
 
-  // 5. Topics
+  // 8. Topics
   const topicSys = document.getElementById("notif-topic-system");
   if (topicSys) topicSys.checked = Boolean(topics.system ?? true);
 
@@ -4504,7 +4852,7 @@ function populateNotificationCenter(config) {
   const topicRaid = document.getElementById("notif-topic-raid");
   if (topicRaid) topicRaid.checked = Boolean(topics.raid ?? true);
 
-  // 6. Thresholds
+  // 9. Thresholds
   const ramTh = thresholds.ram || {};
   const notifRamEnable = document.getElementById("notif-threshold-ram-enable");
   const notifRamVal = document.getElementById("notif-threshold-ram-value");
@@ -4536,27 +4884,18 @@ function populateNotificationCenter(config) {
   const notifRaidEnable = document.getElementById("notif-threshold-raid-enable");
   if (notifRaidEnable) notifRaidEnable.checked = Boolean(raidTh.enabled ?? true);
 
-  // Update Notification Center ribbon status indicators
-  const telegramStatusBadge = document.getElementById("telegram-status-badge");
-  if (telegramStatusBadge) {
-    const tgActive = Boolean(telegramCh.enabled);
-    telegramStatusBadge.textContent = tgActive ? "ENABLED" : "DISABLED";
-    telegramStatusBadge.className = `status-badge ${tgActive ? "status-clean" : "status-disabled"}`;
-  }
-
-  const webhookStatusBadge = document.getElementById("webhook-status-badge");
-  if (webhookStatusBadge) {
-    const whActive = Boolean(webhookCh.enabled);
-    webhookStatusBadge.textContent = whActive ? "ENABLED" : "DISABLED";
-    webhookStatusBadge.className = `status-badge ${whActive ? "status-clean" : "status-disabled"}`;
-  }
-
   const ribbonRam = document.getElementById("ribbon-thresh-ram-val");
   if (ribbonRam) ribbonRam.textContent = `${ramVal}%`;
   const ribbonCpu = document.getElementById("ribbon-thresh-cpu-val");
   if (ribbonCpu) ribbonCpu.textContent = `${cpuVal}%`;
   const ribbonDisk = document.getElementById("ribbon-thresh-disk-val");
   if (ribbonDisk) ribbonDisk.textContent = `${diskVal}%`;
+}
+
+const populateNotificationCenter = renderNotificationCenterConfig;
+if (typeof window !== "undefined") {
+  window.renderNotificationCenterConfig = renderNotificationCenterConfig;
+  window.populateNotificationCenter = populateNotificationCenter;
 }
 
 /* =========================================================================
@@ -4644,17 +4983,6 @@ async function saveNotificationCenterConfig() {
   if (saveBtn) saveBtn.disabled = true;
   showNotificationFeedback(null);
 
-  const discordToggle = document.getElementById("notif-channel-discord-enable");
-  const discordToken = document.getElementById("notif-discord-token-input");
-  const discordChannel = document.getElementById("notif-discord-channel-input");
-
-  const telegramToggle = document.getElementById("notif-channel-telegram-enable");
-  const telegramToken = document.getElementById("notif-telegram-token-input");
-  const telegramChatId = document.getElementById("notif-telegram-chat-id-input");
-
-  const webhookToggle = document.getElementById("notif-channel-webhook-enable");
-  const webhookUrl = document.getElementById("notif-webhook-url-input");
-
   const scheduleToggle = document.getElementById("notif-schedule-enable");
   const scheduleFreq = document.getElementById("notif-schedule-freq");
   const scheduleDay = document.getElementById("notif-schedule-day");
@@ -4672,33 +5000,8 @@ async function saveNotificationCenterConfig() {
   const diskVal = document.getElementById("notif-threshold-disk-value");
   const raidToggle = document.getElementById("notif-threshold-raid-enable");
 
-  const discordPayload = {
-    enabled: Boolean(discordToggle ? discordToggle.checked : false),
-    channel_id: discordChannel ? discordChannel.value.trim() : "",
-  };
-  if (discordToken && discordToken.value.trim().length > 0) {
-    discordPayload.token = discordToken.value.trim();
-  }
-
-  const telegramPayload = {
-    enabled: Boolean(telegramToggle ? telegramToggle.checked : false),
-    chat_id: telegramChatId ? telegramChatId.value.trim() : "",
-  };
-  if (telegramToken && telegramToken.value.trim().length > 0) {
-    telegramPayload.token = telegramToken.value.trim();
-  }
-
-  const webhookPayload = {
-    enabled: Boolean(webhookToggle ? webhookToggle.checked : false),
-    url: webhookUrl ? webhookUrl.value.trim() : "",
-  };
-
   const payload = {
-    channels: {
-      discord: discordPayload,
-      telegram: telegramPayload,
-      webhook: webhookPayload,
-    },
+    channels: getDeliveryChannelsPayload(),
     schedule: {
       enabled: Boolean(scheduleToggle ? scheduleToggle.checked : false),
       frequency: scheduleFreq ? scheduleFreq.value : "daily",
@@ -4748,7 +5051,7 @@ async function saveNotificationCenterConfig() {
       );
     }
 
-    populateNotificationCenter(data);
+    renderNotificationCenterConfig(data);
     showNotificationFeedback("Notification Center configuration saved successfully.", true);
     closeNotifScheduleModal();
     closeNotifThresholdsModal();
@@ -4763,52 +5066,16 @@ async function saveNotificationCenterConfig() {
 }
 
 /**
- * Save Delivery Channels configuration (Discord, Telegram, Webhook)
- * from Delivery Channels card. Retains #save-discord-btn for contract compatibility.
+ * Save Delivery Channels configuration (Discord, Telegram, Webhook, Pushover, Ntfy, Gotify)
+ * from Delivery Channels modal card. Retains #save-discord-btn for contract compatibility.
  */
 async function handleSaveDiscordSettings() {
   const saveBtn = document.getElementById("save-discord-btn");
   if (saveBtn) saveBtn.disabled = true;
   showNotificationFeedback(null);
 
-  const discordToggle = document.getElementById("notif-channel-discord-enable");
-  const discordToken = document.getElementById("notif-discord-token-input");
-  const discordChannel = document.getElementById("notif-discord-channel-input");
-
-  const telegramToggle = document.getElementById("notif-channel-telegram-enable");
-  const telegramToken = document.getElementById("notif-telegram-token-input");
-  const telegramChatId = document.getElementById("notif-telegram-chat-id-input");
-
-  const webhookToggle = document.getElementById("notif-channel-webhook-enable");
-  const webhookUrl = document.getElementById("notif-webhook-url-input");
-
-  const discordPayload = {
-    enabled: Boolean(discordToggle ? discordToggle.checked : false),
-    channel_id: discordChannel ? discordChannel.value.trim() : "",
-  };
-  if (discordToken && discordToken.value.trim().length > 0) {
-    discordPayload.token = discordToken.value.trim();
-  }
-
-  const telegramPayload = {
-    enabled: Boolean(telegramToggle ? telegramToggle.checked : false),
-    chat_id: telegramChatId ? telegramChatId.value.trim() : "",
-  };
-  if (telegramToken && telegramToken.value.trim().length > 0) {
-    telegramPayload.token = telegramToken.value.trim();
-  }
-
-  const webhookPayload = {
-    enabled: Boolean(webhookToggle ? webhookToggle.checked : false),
-    url: webhookUrl ? webhookUrl.value.trim() : "",
-  };
-
   const payload = {
-    channels: {
-      discord: discordPayload,
-      telegram: telegramPayload,
-      webhook: webhookPayload,
-    },
+    channels: getDeliveryChannelsPayload(),
   };
 
   try {
@@ -4828,7 +5095,7 @@ async function handleSaveDiscordSettings() {
       throw new Error(data.detail || `Failed to save delivery channels (${resp.status})`);
     }
 
-    populateNotificationCenter(data);
+    renderNotificationCenterConfig(data);
     showNotificationFeedback("Delivery channels saved successfully.", true);
     closeNotifChannelsModal();
   } catch (err) {
@@ -4842,9 +5109,9 @@ async function handleSaveDiscordSettings() {
 }
 
 /**
- * Send test notification to target channel ("all", "discord", "telegram", "webhook").
+ * Send test notification to target channel ("all", "discord", "telegram", "webhook", "pushover", "ntfy", "gotify").
  */
-async function handleSendTestNotification() {
+async function handleSendTestNotification(channel) {
   const btn = document.getElementById("send-test-notification-btn");
   if (!btn || btn.disabled) return;
 
@@ -4863,7 +5130,7 @@ async function handleSendTestNotification() {
   showNotificationFeedback(null);
 
   const testSelect = document.getElementById("notif-test-channel-select");
-  const selectedChannel = testSelect ? testSelect.value : "all";
+  const selectedChannel = (typeof channel === "string" && channel) ? channel : (testSelect ? testSelect.value : "all");
 
   try {
     const resp = await apiFetch("/api/notifications/test", {
@@ -4892,7 +5159,7 @@ async function handleSendTestNotification() {
       );
     } else {
       showNotificationFeedback(
-        data.message || "Failed to send test notification.",
+        data.message || `Failed to send test notification to ${selectedChannel}.`,
         false
       );
     }
@@ -4912,6 +5179,11 @@ async function handleSendTestNotification() {
 }
 
 const sendTestNotification = handleSendTestNotification;
+if (typeof window !== "undefined") {
+  window.sendTestNotification = sendTestNotification;
+  window.handleSaveDiscordSettings = handleSaveDiscordSettings;
+  window.saveNotificationCenterConfig = saveNotificationCenterConfig;
+}
 
 /**
  * Refresh notification history table via WebSocket or HTTP fallback.
