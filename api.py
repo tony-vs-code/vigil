@@ -1350,6 +1350,163 @@ async def api_docker_container_stats(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.websocket("/api/docker/containers/{container_id}/terminal")
+async def api_docker_container_terminal(
+    websocket: WebSocket,
+    container_id: str,
+    shell: str = "/bin/sh",
+    user: str = "",
+) -> None:
+    token = _extract_ws_token(websocket)
+    try:
+        username = main.verify_session(token)
+    except (OSError, sqlite3.Error):
+        username = None
+
+    if not username:
+        await websocket.accept()
+        await websocket.close(code=1008)
+        return
+
+    shell_cmd = websocket.query_params.get("shell") or shell or "/bin/sh"
+    target_user = websocket.query_params.get("user") or user or ""
+
+    await websocket.accept()
+
+    try:
+        exec_info = await asyncio.to_thread(
+            main.docker_manager.create_container_exec,
+            container_id,
+            cmd=[shell_cmd],
+            user=target_user,
+            tty=True,
+        )
+        exec_id = exec_info.get("id")
+        if not exec_id:
+            raise RuntimeError("Exec instance creation did not return an ID")
+    except Exception as exc:
+        logging.error(f"Failed to create exec for container {container_id}: {exc}")
+        try:
+            await websocket.send_text(f"\r\n\x1b[31mTerminal error: {exc}\x1b[0m\r\n")
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
+
+    try:
+        main.record_audit_event(
+            "docker.container.terminal_opened",
+            f"Terminal session opened for container '{container_id}' (user: '{target_user or 'default'}', shell: '{shell_cmd}')",
+            actor=username,
+            severity="info",
+            metadata={
+                "container_id": container_id,
+                "shell": shell_cmd,
+                "user": target_user,
+                "exec_id": exec_id,
+            },
+        )
+    except Exception as exc:
+        logging.debug(f"Failed to record audit event for terminal: {exc}")
+
+    try:
+        raw_sock = await asyncio.to_thread(
+            main.docker_manager.start_container_exec_socket,
+            exec_id,
+        )
+        raw_sock.setblocking(False)
+    except Exception as exc:
+        logging.error(f"Failed to start exec socket for {exec_id}: {exc}")
+        try:
+            await websocket.send_text(f"\r\n\x1b[31mSocket connection error: {exc}\x1b[0m\r\n")
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def ws_to_docker() -> None:
+        try:
+            while True:
+                msg = await websocket.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                text = msg.get("text")
+                b_data = msg.get("bytes")
+                if text is not None:
+                    stripped = text.strip()
+                    if (
+                        stripped.startswith('{"type": "resize"')
+                        or stripped.startswith('{"type":"resize"')
+                        or (stripped.startswith("{") and '"type"' in stripped and '"resize"' in stripped)
+                    ):
+                        try:
+                            rd = json.loads(stripped)
+                            if isinstance(rd, dict) and rd.get("type") == "resize":
+                                cols = int(rd.get("cols") or rd.get("width") or 80)
+                                rows = int(rd.get("rows") or rd.get("height") or 24)
+                                await asyncio.to_thread(
+                                    main.docker_manager.resize_container_exec,
+                                    exec_id,
+                                    height=rows,
+                                    width=cols,
+                                )
+                                continue
+                        except Exception as exc:
+                            logging.debug(f"Terminal resize error: {exc}")
+                    await loop.sock_sendall(raw_sock, text.encode("utf-8"))
+                elif b_data is not None:
+                    await loop.sock_sendall(raw_sock, b_data)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logging.debug(f"ws_to_docker relay error: {exc}")
+
+    async def docker_to_ws() -> None:
+        try:
+            while True:
+                chunk = await loop.sock_recv(raw_sock, 4096)
+                if not chunk:
+                    break
+                await websocket.send_bytes(chunk)
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except Exception as exc:
+            logging.debug(f"docker_to_ws relay error: {exc}")
+
+    in_task = asyncio.create_task(ws_to_docker())
+    out_task = asyncio.create_task(docker_to_ws())
+
+    try:
+        done, pending = await asyncio.wait(
+            [in_task, out_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        for task in [in_task, out_task]:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        try:
+            raw_sock.close()
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.get("/api/docker/images")
 async def api_docker_images(_user: str = Depends(require_auth)) -> dict[str, Any]:
     images = await asyncio.to_thread(main.docker_manager.list_images)

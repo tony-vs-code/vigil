@@ -28,6 +28,26 @@ let dockerStatusCache = null;
 let activeLogContainerId = null;
 let activeLogContainerName = "";
 let logsTimerId = null;
+let activeTerminalContainerId = null;
+let activeTerminalContainerName = "";
+let terminalWs = null;
+let terminalLines = [[]];
+let terminalCursorRow = 0;
+let terminalCursorCol = 0;
+let terminalCurrentStyle = {
+  fg: null,
+  bg: null,
+  bold: false,
+  dim: false,
+  italic: false,
+  underline: false,
+  inverse: false,
+};
+let terminalParserState = "NORMAL";
+let terminalCsiParams = "";
+let terminalOscParams = "";
+let terminalPendingBuffer = "";
+let terminalRenderScheduled = false;
 let cachedDockerContainers = [];
 let cachedDockerVolumes = [];
 let cachedDockerUpdates = null;
@@ -7121,6 +7141,7 @@ function renderDockerContainers(highlightCid = null) {
                   : `<button type="button" class="btn-action btn-action-success" data-c-action="start" data-cid="${safeId}">Start</button>`)
           }
           <button type="button" class="btn-action" data-c-action="logs" data-cid="${safeId}" data-cname="${safeName}">Logs</button>
+          <button type="button" class="btn-action btn-action-sm btn-terminal" data-c-action="terminal" data-terminal-container-id="${safeId}" data-terminal-container-name="${safeName}" data-cid="${safeId}" data-cname="${safeName}" title="Open Web Terminal">Terminal</button>
           <button type="button" class="btn-action btn-action-danger" data-c-action="remove" data-cid="${safeId}" data-cname="${safeName}">Remove</button>
         </div>
       </td>
@@ -7134,6 +7155,8 @@ function renderDockerContainers(highlightCid = null) {
       const cname = btn.getAttribute("data-cname") || cid;
       if (action === "logs") {
         openContainerLogs(cid, cname);
+      } else if (action === "terminal") {
+        openContainerTerminal(cid, cname);
       } else if (action === "remove") {
         handleRemoveContainer(cid, cname);
       } else {
@@ -7288,6 +7311,792 @@ function scrollLogsToBottom() {
   const viewer = document.getElementById("container-logs-viewer");
   if (viewer) {
     viewer.scrollTop = viewer.scrollHeight;
+  }
+}
+
+/**
+ * Container Interactive Web Terminal Controller & ANSI Engine.
+ */
+function openContainerTerminal(containerId, containerName, shell = "/bin/sh", user = "") {
+  activeTerminalContainerId = containerId;
+  activeTerminalContainerName = containerName || containerId;
+
+  const modal = document.getElementById("container-terminal-modal");
+  const title = document.getElementById("container-terminal-title");
+  const subtitle = document.getElementById("container-terminal-subtitle");
+  const shellSelect = document.getElementById("container-terminal-shell-select");
+  const userInput = document.getElementById("container-terminal-user-input");
+  const screen = document.getElementById("container-terminal-screen");
+
+  if (title) title.textContent = `Terminal: ${activeTerminalContainerName}`;
+  if (subtitle) subtitle.textContent = `Container ID: ${containerId}`;
+  if (shellSelect) shellSelect.value = shell;
+  if (userInput) userInput.value = user;
+
+  modal?.classList.remove("hidden");
+  resetTerminalBuffer();
+  connectContainerTerminal(containerId, activeTerminalContainerName, shell, user);
+
+  setTimeout(() => {
+    screen?.focus();
+  }, 60);
+}
+
+function closeContainerTerminal() {
+  if (terminalWs) {
+    try {
+      terminalWs.onclose = null;
+      terminalWs.onerror = null;
+      terminalWs.onmessage = null;
+      terminalWs.close();
+    } catch (_) {}
+    terminalWs = null;
+  }
+  activeTerminalContainerId = null;
+  activeTerminalContainerName = "";
+
+  const modal = document.getElementById("container-terminal-modal");
+  modal?.classList.add("hidden");
+  modal?.classList.remove("terminal-fullscreen");
+
+  const fullscreenBtn = document.getElementById("btn-fullscreen-terminal");
+  if (fullscreenBtn) fullscreenBtn.textContent = "Fullscreen";
+
+  setTerminalStatus("disconnected", "Disconnected");
+}
+
+function connectContainerTerminal(containerId, containerName, shell = "/bin/sh", user = "") {
+  if (terminalWs) {
+    try {
+      terminalWs.onclose = null;
+      terminalWs.onerror = null;
+      terminalWs.onmessage = null;
+      terminalWs.close();
+    } catch (_) {}
+    terminalWs = null;
+  }
+
+  setTerminalStatus("connecting", "Connecting...");
+
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const token = getStoredToken();
+  const queryParams = new URLSearchParams();
+  queryParams.set("shell", shell || "/bin/sh");
+  if (user) queryParams.set("user", user);
+  if (token) queryParams.set("token", token);
+
+  const wsUrl = `${protocol}//${window.location.host}/api/docker/containers/${encodeURIComponent(containerId)}/terminal?${queryParams.toString()}`;
+
+  try {
+    terminalWs = new WebSocket(wsUrl);
+  } catch (err) {
+    console.error("Terminal WebSocket creation error:", err);
+    setTerminalStatus("error", "Connection error");
+    feedTerminalText(`\r\n\x1b[31mFailed to connect to terminal: ${err.message}\x1b[0m\r\n`);
+    return;
+  }
+
+  terminalWs.binaryType = "arraybuffer";
+
+  terminalWs.onopen = () => {
+    setTerminalStatus("connected", "Connected");
+    sendTerminalResize();
+    const screen = document.getElementById("container-terminal-screen");
+    screen?.focus();
+  };
+
+  terminalWs.onmessage = (event) => {
+    let text = "";
+    if (typeof event.data === "string") {
+      text = event.data;
+    } else if (event.data instanceof ArrayBuffer) {
+      text = new TextDecoder("utf-8").decode(new Uint8Array(event.data));
+    }
+    feedTerminalText(text);
+  };
+
+  terminalWs.onclose = (event) => {
+    terminalWs = null;
+    let reasonMsg = "Disconnected";
+    if (event.code === 1008) {
+      reasonMsg = "Session unauthenticated (1008)";
+    } else if (event.code === 1011) {
+      reasonMsg = "Container exec error (1011)";
+    }
+    setTerminalStatus("disconnected", reasonMsg);
+    feedTerminalText(`\r\n\x1b[33m[Session disconnected (${reasonMsg})]\x1b[0m\r\n`);
+  };
+
+  terminalWs.onerror = () => {
+    setTerminalStatus("error", "Terminal error");
+  };
+}
+
+function setTerminalStatus(state, message) {
+  const badge = document.getElementById("container-terminal-status");
+  if (!badge) return;
+  badge.className = "status-badge";
+  if (state === "connecting") {
+    badge.classList.add("status-recovering");
+    badge.innerHTML = `<span class="status-dot pulse"></span> ${escapeHtml(message || "Connecting...")}`;
+  } else if (state === "connected") {
+    badge.classList.add("status-clean");
+    badge.innerHTML = `<span class="status-dot"></span> ${escapeHtml(message || "Connected")}`;
+  } else if (state === "error") {
+    badge.classList.add("status-failed");
+    badge.innerHTML = `<span class="status-dot"></span> ${escapeHtml(message || "Error")}`;
+  } else {
+    badge.classList.add("status-none");
+    badge.innerHTML = `<span class="status-dot"></span> ${escapeHtml(message || "Disconnected")}`;
+  }
+}
+
+function resetTerminalBuffer() {
+  terminalLines = [[]];
+  terminalCursorRow = 0;
+  terminalCursorCol = 0;
+  resetTerminalStyle();
+  terminalParserState = "NORMAL";
+  terminalCsiParams = "";
+  terminalOscParams = "";
+  terminalPendingBuffer = "";
+  scheduleTerminalRender();
+}
+
+function resetTerminalStyle() {
+  terminalCurrentStyle = {
+    fg: null,
+    bg: null,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    inverse: false,
+  };
+}
+
+function clearTerminalScreen() {
+  terminalLines = [[]];
+  terminalCursorRow = 0;
+  terminalCursorCol = 0;
+  scheduleTerminalRender();
+  const screen = document.getElementById("container-terminal-screen");
+  screen?.focus();
+}
+
+function toggleTerminalFullscreen() {
+  const modal = document.getElementById("container-terminal-modal");
+  const fullscreenBtn = document.getElementById("btn-fullscreen-terminal");
+  if (!modal) return;
+
+  const isFullscreen = modal.classList.toggle("terminal-fullscreen");
+  if (fullscreenBtn) {
+    fullscreenBtn.textContent = isFullscreen ? "Exit Fullscreen" : "Fullscreen";
+  }
+  setTimeout(() => {
+    sendTerminalResize();
+    const screen = document.getElementById("container-terminal-screen");
+    screen?.focus();
+  }, 100);
+}
+
+function ensureTerminalRow(rowIndex) {
+  while (terminalLines.length <= rowIndex) {
+    terminalLines.push([]);
+  }
+}
+
+function get256ColorClass(num, isBg) {
+  const prefix = isBg ? "ansi-bg-" : "ansi-";
+  if (num >= 0 && num <= 7) {
+    const colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+    return `${prefix}${colors[num]}`;
+  }
+  if (num >= 8 && num <= 15) {
+    const brights = [
+      "bright-black",
+      "bright-red",
+      "bright-green",
+      "bright-yellow",
+      "bright-blue",
+      "bright-magenta",
+      "bright-cyan",
+      "bright-white",
+    ];
+    return `${prefix}${brights[num - 8]}`;
+  }
+  if (num === 16) return `${prefix}black`;
+  if (num === 231 || num === 255) return `${prefix}bright-white`;
+  return `${prefix}white`;
+}
+
+function handleCsiCommand(cmd, params) {
+  const cleanParams = params.replace(/^\?/, "");
+  const args = cleanParams.length > 0 ? cleanParams.split(";").map((x) => parseInt(x, 10)) : [];
+
+  switch (cmd) {
+    case "m": {
+      if (args.length === 0 || (args.length === 1 && (isNaN(args[0]) || args[0] === 0))) {
+        resetTerminalStyle();
+        break;
+      }
+      for (let idx = 0; idx < args.length; idx++) {
+        const code = isNaN(args[idx]) ? 0 : args[idx];
+        if (code === 0) {
+          resetTerminalStyle();
+        } else if (code === 1) {
+          terminalCurrentStyle.bold = true;
+        } else if (code === 2) {
+          terminalCurrentStyle.dim = true;
+        } else if (code === 3) {
+          terminalCurrentStyle.italic = true;
+        } else if (code === 4) {
+          terminalCurrentStyle.underline = true;
+        } else if (code === 7) {
+          terminalCurrentStyle.inverse = true;
+        } else if (code === 22) {
+          terminalCurrentStyle.bold = false;
+          terminalCurrentStyle.dim = false;
+        } else if (code === 23) {
+          terminalCurrentStyle.italic = false;
+        } else if (code === 24) {
+          terminalCurrentStyle.underline = false;
+        } else if (code === 27) {
+          terminalCurrentStyle.inverse = false;
+        } else if (code >= 30 && code <= 37) {
+          const colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+          terminalCurrentStyle.fg = `ansi-${colors[code - 30]}`;
+        } else if (code === 38) {
+          if (args[idx + 1] === 5 && args[idx + 2] !== undefined) {
+            terminalCurrentStyle.fg = get256ColorClass(args[idx + 2], false);
+            idx += 2;
+          }
+        } else if (code === 39) {
+          terminalCurrentStyle.fg = null;
+        } else if (code >= 40 && code <= 47) {
+          const colors = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+          terminalCurrentStyle.bg = `ansi-bg-${colors[code - 40]}`;
+        } else if (code === 48) {
+          if (args[idx + 1] === 5 && args[idx + 2] !== undefined) {
+            terminalCurrentStyle.bg = get256ColorClass(args[idx + 2], true);
+            idx += 2;
+          }
+        } else if (code === 49) {
+          terminalCurrentStyle.bg = null;
+        } else if (code >= 90 && code <= 97) {
+          const brights = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+          terminalCurrentStyle.fg = `ansi-bright-${brights[code - 90]}`;
+        } else if (code >= 100 && code <= 107) {
+          const brights = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
+          terminalCurrentStyle.bg = `ansi-bg-bright-${brights[code - 100]}`;
+        }
+      }
+      break;
+    }
+    case "H":
+    case "f": {
+      const r = args[0] ? args[0] - 1 : 0;
+      const c = args[1] ? args[1] - 1 : 0;
+      terminalCursorRow = Math.max(0, r);
+      terminalCursorCol = Math.max(0, c);
+      ensureTerminalRow(terminalCursorRow);
+      break;
+    }
+    case "A": {
+      const count = args[0] || 1;
+      terminalCursorRow = Math.max(0, terminalCursorRow - count);
+      break;
+    }
+    case "B": {
+      const count = args[0] || 1;
+      terminalCursorRow += count;
+      ensureTerminalRow(terminalCursorRow);
+      break;
+    }
+    case "C": {
+      const count = args[0] || 1;
+      terminalCursorCol += count;
+      break;
+    }
+    case "D": {
+      const count = args[0] || 1;
+      terminalCursorCol = Math.max(0, terminalCursorCol - count);
+      break;
+    }
+    case "K": {
+      const mode = args[0] || 0;
+      ensureTerminalRow(terminalCursorRow);
+      const row = terminalLines[terminalCursorRow];
+      if (mode === 0) {
+        if (terminalCursorCol < row.length) {
+          row.length = terminalCursorCol;
+        }
+      } else if (mode === 1) {
+        for (let j = 0; j <= terminalCursorCol && j < row.length; j++) {
+          row[j] = { char: " " };
+        }
+      } else if (mode === 2) {
+        terminalLines[terminalCursorRow] = [];
+      }
+      break;
+    }
+    case "J": {
+      const mode = args[0] || 0;
+      if (mode === 2 || mode === 3) {
+        terminalLines = [[]];
+        terminalCursorRow = 0;
+        terminalCursorCol = 0;
+      } else if (mode === 0) {
+        terminalLines = terminalLines.slice(0, terminalCursorRow + 1);
+        if (terminalLines[terminalCursorRow]) {
+          terminalLines[terminalCursorRow] = terminalLines[terminalCursorRow].slice(0, terminalCursorCol);
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+function feedTerminalText(text) {
+  if (!text) return;
+  text = terminalPendingBuffer + text;
+  terminalPendingBuffer = "";
+
+  let i = 0;
+  const len = text.length;
+  let seqStartIndex = -1;
+
+  while (i < len) {
+    const ch = text[i];
+
+    if (terminalParserState === "ESCAPE") {
+      if (ch === "[") {
+        terminalParserState = "CSI";
+        terminalCsiParams = "";
+        i++;
+        continue;
+      } else if (ch === "]") {
+        terminalParserState = "OSC";
+        terminalOscParams = "";
+        i++;
+        continue;
+      } else if (ch === "(" || ch === ")") {
+        if (i + 1 < len) {
+          i += 2;
+          terminalParserState = "NORMAL";
+          seqStartIndex = -1;
+          continue;
+        } else {
+          break;
+        }
+      } else {
+        terminalParserState = "NORMAL";
+        seqStartIndex = -1;
+        i++;
+        continue;
+      }
+    }
+
+    if (terminalParserState === "CSI") {
+      if (
+        (ch >= "0" && ch <= "9") ||
+        ch === ";" ||
+        ch === "?" ||
+        ch === ":" ||
+        ch === "<" ||
+        ch === ">" ||
+        ch === "="
+      ) {
+        terminalCsiParams += ch;
+        i++;
+        continue;
+      }
+      if (ch >= " " && ch <= "/") {
+        terminalCsiParams += ch;
+        i++;
+        continue;
+      }
+      handleCsiCommand(ch, terminalCsiParams);
+      terminalParserState = "NORMAL";
+      terminalCsiParams = "";
+      seqStartIndex = -1;
+      i++;
+      continue;
+    }
+
+    if (terminalParserState === "OSC") {
+      if (ch === "\x07") {
+        terminalParserState = "NORMAL";
+        seqStartIndex = -1;
+        i++;
+        continue;
+      }
+      if (ch === "\x1b" && i + 1 < len && text[i + 1] === "\\") {
+        terminalParserState = "NORMAL";
+        seqStartIndex = -1;
+        i += 2;
+        continue;
+      }
+      terminalOscParams += ch;
+      i++;
+      continue;
+    }
+
+    // NORMAL state
+    if (ch === "\x1b") {
+      terminalParserState = "ESCAPE";
+      seqStartIndex = i;
+      i++;
+      continue;
+    }
+
+    if (ch === "\r") {
+      terminalCursorCol = 0;
+      i++;
+      continue;
+    }
+
+    if (ch === "\n") {
+      terminalCursorRow++;
+      ensureTerminalRow(terminalCursorRow);
+      terminalCursorCol = 0;
+      i++;
+      continue;
+    }
+
+    if (ch === "\b") {
+      terminalCursorCol = Math.max(0, terminalCursorCol - 1);
+      i++;
+      continue;
+    }
+
+    if (ch === "\t") {
+      terminalCursorCol = (Math.floor(terminalCursorCol / 8) + 1) * 8;
+      i++;
+      continue;
+    }
+
+    if (ch === "\x07") {
+      i++;
+      continue;
+    }
+
+    ensureTerminalRow(terminalCursorRow);
+    const row = terminalLines[terminalCursorRow];
+    while (row.length < terminalCursorCol) {
+      row.push({ char: " " });
+    }
+    row[terminalCursorCol] = {
+      char: ch,
+      fg: terminalCurrentStyle.fg,
+      bg: terminalCurrentStyle.bg,
+      bold: terminalCurrentStyle.bold,
+      dim: terminalCurrentStyle.dim,
+      italic: terminalCurrentStyle.italic,
+      underline: terminalCurrentStyle.underline,
+      inverse: terminalCurrentStyle.inverse,
+    };
+    terminalCursorCol++;
+    i++;
+  }
+
+  if (terminalParserState !== "NORMAL" && seqStartIndex >= 0) {
+    terminalPendingBuffer = text.slice(seqStartIndex);
+    if (terminalPendingBuffer.length > 256) {
+      terminalPendingBuffer = "";
+      terminalParserState = "NORMAL";
+    }
+  }
+
+  if (terminalLines.length > 2000) {
+    const diff = terminalLines.length - 2000;
+    terminalLines.splice(0, diff);
+    terminalCursorRow = Math.max(0, terminalCursorRow - diff);
+  }
+
+  scheduleTerminalRender();
+}
+
+function scheduleTerminalRender() {
+  if (terminalRenderScheduled) return;
+  terminalRenderScheduled = true;
+  requestAnimationFrame(() => {
+    terminalRenderScheduled = false;
+    renderTerminalToDOM();
+  });
+}
+
+function renderTerminalToDOM() {
+  const screen = document.getElementById("container-terminal-screen");
+  if (!screen) return;
+
+  const htmlPieces = [];
+  const totalRows = terminalLines.length;
+
+  for (let r = 0; r < totalRows; r++) {
+    const row = terminalLines[r] || [];
+    const isCursorRow = r === terminalCursorRow;
+    const maxCols = Math.max(row.length, isCursorRow ? terminalCursorCol + 1 : 0);
+
+    let rowHtml = "";
+    let currentClasses = "";
+    let spanBuffer = "";
+
+    function flushSpan() {
+      if (spanBuffer.length > 0) {
+        if (currentClasses) {
+          rowHtml += `<span class="${currentClasses}">${spanBuffer}</span>`;
+        } else {
+          rowHtml += spanBuffer;
+        }
+        spanBuffer = "";
+      }
+    }
+
+    for (let c = 0; c < maxCols; c++) {
+      const cell = row[c] || { char: " " };
+      const rawChar = cell.char || " ";
+      const safeChar =
+        rawChar === "<"
+          ? "&lt;"
+          : rawChar === ">"
+          ? "&gt;"
+          : rawChar === "&"
+          ? "&amp;"
+          : rawChar === '"'
+          ? "&quot;"
+          : rawChar;
+
+      if (isCursorRow && c === terminalCursorCol) {
+        flushSpan();
+        rowHtml += `<span class="terminal-cursor">${safeChar === " " ? "&nbsp;" : safeChar}</span>`;
+        continue;
+      }
+
+      const classes = [];
+      if (cell.fg) classes.push(cell.fg);
+      if (cell.bg) classes.push(cell.bg);
+      if (cell.bold) classes.push("ansi-bold");
+      if (cell.dim) classes.push("ansi-dim");
+      if (cell.italic) classes.push("ansi-italic");
+      if (cell.underline) classes.push("ansi-underline");
+      if (cell.inverse) classes.push("ansi-inverse");
+      const classStr = classes.join(" ");
+
+      if (classStr !== currentClasses) {
+        flushSpan();
+        currentClasses = classStr;
+      }
+
+      spanBuffer += safeChar === " " ? " " : safeChar;
+    }
+
+    flushSpan();
+
+    if (isCursorRow && terminalCursorCol >= maxCols) {
+      rowHtml += `<span class="terminal-cursor">&nbsp;</span>`;
+    }
+
+    htmlPieces.push(`<div class="terminal-row">${rowHtml || "&nbsp;"}</div>`);
+  }
+
+  screen.innerHTML = htmlPieces.join("");
+  screen.scrollTop = screen.scrollHeight;
+}
+
+function sendTerminalData(data) {
+  if (!terminalWs || terminalWs.readyState !== WebSocket.OPEN) return;
+  try {
+    terminalWs.send(data);
+  } catch (err) {
+    console.debug("Failed to send terminal data:", err);
+  }
+}
+
+function getTerminalDimensions() {
+  const screen = document.getElementById("container-terminal-screen");
+  if (!screen) return { cols: 80, rows: 24 };
+
+  const probe = document.createElement("span");
+  probe.style.fontFamily = "monospace";
+  probe.style.fontSize = "0.86rem";
+  probe.style.lineHeight = "1.42";
+  probe.style.visibility = "hidden";
+  probe.style.position = "absolute";
+  probe.style.whiteSpace = "pre";
+  probe.textContent = "MMMMMMMMMM";
+  screen.appendChild(probe);
+
+  const rect = probe.getBoundingClientRect();
+  const charWidth = rect.width > 0 ? rect.width / 10 : 8.5;
+  const charHeight = rect.height > 0 ? rect.height : 19;
+  screen.removeChild(probe);
+
+  const paddingX = 28;
+  const paddingY = 28;
+  const availW = Math.max(100, (screen.clientWidth || 800) - paddingX);
+  const availH = Math.max(100, (screen.clientHeight || 400) - paddingY);
+
+  const cols = Math.max(20, Math.min(300, Math.floor(availW / charWidth)));
+  const rows = Math.max(5, Math.min(100, Math.floor(availH / charHeight)));
+  return { cols, rows };
+}
+
+function sendTerminalResize() {
+  if (!terminalWs || terminalWs.readyState !== WebSocket.OPEN) return;
+  const dims = getTerminalDimensions();
+  try {
+    terminalWs.send(JSON.stringify({ type: "resize", cols: dims.cols, rows: dims.rows }));
+  } catch (err) {
+    console.debug("Terminal resize send error:", err);
+  }
+}
+
+function handleTerminalKeyDown(e) {
+  if (!terminalWs || terminalWs.readyState !== WebSocket.OPEN) return;
+
+  if (
+    e.key === "F12" ||
+    e.key === "F5" ||
+    (e.ctrlKey && e.shiftKey && ["I", "i", "C", "c", "R", "r"].includes(e.key))
+  ) {
+    return;
+  }
+
+  if (e.ctrlKey && !e.altKey && !e.metaKey) {
+    const k = e.key.toLowerCase();
+    if (k === "c") {
+      const selection = window.getSelection();
+      if (selection && selection.toString().length > 0) {
+        return;
+      }
+      e.preventDefault();
+      sendTerminalData("\x03");
+      return;
+    }
+    if (k === "d") {
+      e.preventDefault();
+      sendTerminalData("\x04");
+      return;
+    }
+    if (k === "z") {
+      e.preventDefault();
+      sendTerminalData("\x1a");
+      return;
+    }
+    if (k === "l") {
+      e.preventDefault();
+      sendTerminalData("\x0c");
+      clearTerminalScreen();
+      return;
+    }
+    if (k === "a") {
+      e.preventDefault();
+      sendTerminalData("\x01");
+      return;
+    }
+    if (k === "e") {
+      e.preventDefault();
+      sendTerminalData("\x05");
+      return;
+    }
+    if (k === "u") {
+      e.preventDefault();
+      sendTerminalData("\x15");
+      return;
+    }
+    if (k === "k") {
+      e.preventDefault();
+      sendTerminalData("\x0b");
+      return;
+    }
+    if (k === "w") {
+      e.preventDefault();
+      sendTerminalData("\x17");
+      return;
+    }
+  }
+
+  if (e.key === "Enter") {
+    e.preventDefault();
+    sendTerminalData("\r");
+    return;
+  }
+  if (e.key === "Backspace") {
+    e.preventDefault();
+    sendTerminalData("\x7f");
+    return;
+  }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    sendTerminalData("\t");
+    return;
+  }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    sendTerminalData("\x1b");
+    return;
+  }
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    sendTerminalData("\x1b[A");
+    return;
+  }
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    sendTerminalData("\x1b[B");
+    return;
+  }
+  if (e.key === "ArrowRight") {
+    e.preventDefault();
+    sendTerminalData("\x1b[C");
+    return;
+  }
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    sendTerminalData("\x1b[D");
+    return;
+  }
+  if (e.key === "Home") {
+    e.preventDefault();
+    sendTerminalData("\x1b[H");
+    return;
+  }
+  if (e.key === "End") {
+    e.preventDefault();
+    sendTerminalData("\x1b[F");
+    return;
+  }
+  if (e.key === "PageUp") {
+    e.preventDefault();
+    sendTerminalData("\x1b[5~");
+    return;
+  }
+  if (e.key === "PageDown") {
+    e.preventDefault();
+    sendTerminalData("\x1b[6~");
+    return;
+  }
+  if (e.key === "Delete") {
+    e.preventDefault();
+    sendTerminalData("\x1b[3~");
+    return;
+  }
+
+  if (!e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+    e.preventDefault();
+    sendTerminalData(e.key);
+  }
+}
+
+function handleTerminalPaste(e) {
+  e.preventDefault();
+  const clipboardData = e.clipboardData || window.clipboardData;
+  const text = clipboardData ? clipboardData.getData("text") : "";
+  if (text) {
+    sendTerminalData(text);
   }
 }
 
@@ -11682,9 +12491,115 @@ function initDashboard() {
     .getElementById("close-vol-modal-btn")
     ?.addEventListener("click", closeVolumeDetails);
 
+  // Container Terminal Modal
+  document
+    .getElementById("btn-close-terminal")
+    ?.addEventListener("click", closeContainerTerminal);
+
+  document
+    .getElementById("btn-reconnect-terminal")
+    ?.addEventListener("click", () => {
+      if (activeTerminalContainerId) {
+        const shell =
+          document.getElementById("container-terminal-shell-select")?.value || "/bin/sh";
+        const user =
+          document.getElementById("container-terminal-user-input")?.value?.trim() || "";
+        connectContainerTerminal(
+          activeTerminalContainerId,
+          activeTerminalContainerName,
+          shell,
+          user
+        );
+      }
+    });
+
+  document
+    .getElementById("btn-clear-terminal")
+    ?.addEventListener("click", clearTerminalScreen);
+
+  document
+    .getElementById("btn-fullscreen-terminal")
+    ?.addEventListener("click", toggleTerminalFullscreen);
+
+  document
+    .getElementById("container-terminal-shell-select")
+    ?.addEventListener("change", (e) => {
+      if (activeTerminalContainerId) {
+        const shell = e.target.value || "/bin/sh";
+        const user =
+          document.getElementById("container-terminal-user-input")?.value?.trim() || "";
+        connectContainerTerminal(
+          activeTerminalContainerId,
+          activeTerminalContainerName,
+          shell,
+          user
+        );
+      }
+    });
+
+  document
+    .getElementById("container-terminal-user-input")
+    ?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && activeTerminalContainerId) {
+        e.preventDefault();
+        const shell =
+          document.getElementById("container-terminal-shell-select")?.value || "/bin/sh";
+        const user = e.target.value.trim();
+        connectContainerTerminal(
+          activeTerminalContainerId,
+          activeTerminalContainerName,
+          shell,
+          user
+        );
+      }
+    });
+
+  const terminalModal = document.getElementById("container-terminal-modal");
+  terminalModal?.addEventListener("click", (e) => {
+    if (e.target === terminalModal) {
+      closeContainerTerminal();
+    }
+  });
+
+  const terminalBody = document.getElementById("container-terminal-body");
+  terminalBody?.addEventListener("click", () => {
+    document.getElementById("container-terminal-screen")?.focus();
+  });
+
+  const terminalScreen = document.getElementById("container-terminal-screen");
+  if (terminalScreen) {
+    terminalScreen.addEventListener("keydown", handleTerminalKeyDown);
+    terminalScreen.addEventListener("paste", handleTerminalPaste);
+  }
+
+  window.addEventListener("resize", () => {
+    if (activeTerminalContainerId && terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+      sendTerminalResize();
+    }
+  });
+
+  // Global delegation for data-terminal-container-id
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-terminal-container-id]");
+    if (btn && !btn.disabled) {
+      const cid = btn.getAttribute("data-terminal-container-id");
+      const cname = btn.getAttribute("data-terminal-container-name") || cid;
+      if (cid) {
+        openContainerTerminal(cid, cname);
+      }
+    }
+  });
+
   // Global Escape Key to dismiss modals
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      if (
+        document.activeElement ===
+        document.getElementById("container-terminal-screen")
+      ) {
+        return;
+      }
+      closeContainerTerminal();
       closeUpdateModal();
       closeSettingsModal();
       closeStackEditor();
