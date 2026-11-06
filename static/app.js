@@ -54,6 +54,7 @@ let terminalOscParams = "";
 let terminalPendingBuffer = "";
 let terminalRenderScheduled = false;
 let cachedDockerContainers = [];
+let cachedDockerStacks = [];
 let cachedDockerVolumes = [];
 let cachedDockerUpdates = null;
 let cachedStorageDisks = null;
@@ -6705,6 +6706,152 @@ async function handleInstallDocker() {
 }
 
 /**
+ * Close any open actions dropdown menus across the dashboard.
+ */
+function closeAllActionsDropdowns() {
+  document.querySelectorAll(".actions-dropdown-menu.show").forEach((menu) => {
+    menu.classList.remove("show");
+  });
+}
+
+/**
+ * Global dropdown toggle, outside-click, and Escape key listener.
+ */
+function initActionsDropdowns() {
+  document.addEventListener("click", (e) => {
+    const moreBtn = e.target.closest(".btn-action-more");
+    if (moreBtn) {
+      e.stopPropagation();
+      const dropdown = moreBtn.closest(".actions-dropdown");
+      const menu = dropdown ? dropdown.querySelector(".actions-dropdown-menu") : null;
+      const isAlreadyOpen = menu ? menu.classList.contains("show") : false;
+
+      // Close any other open dropdown when opening
+      closeAllActionsDropdowns();
+
+      if (menu && !isAlreadyOpen) {
+        menu.classList.add("show");
+      }
+      return;
+    }
+
+    const itemBtn = e.target.closest(".actions-dropdown-item");
+    if (itemBtn) {
+      // Ensure clicking any action item inside the dropdown closes the dropdown immediately
+      closeAllActionsDropdowns();
+      return;
+    }
+
+    // Close on click outside
+    if (!e.target.closest(".actions-dropdown")) {
+      closeAllActionsDropdowns();
+    }
+  });
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      closeAllActionsDropdowns();
+    }
+  });
+}
+
+/**
+ * Render Docker Stacks table rows.
+ */
+function renderDockerStacks(stacks = cachedDockerStacks) {
+  const tbody = document.getElementById("docker-stacks-tbody");
+  if (!tbody) return;
+
+  if (!stacks || stacks.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No Compose stacks configured yet. Click 'Deploy New Stack' to add one.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = stacks.map((s) => {
+    const isRunning = s.status === "running" || (Number(s.running_count || 0) > 0);
+    const statusClass = isRunning ? "status-clean" : (s.status === "stopped" || s.status === "down" ? "status-degraded" : "status-none");
+    const isManaged = Boolean(s.managed);
+    const managedBadge = isManaged
+      ? `<span class="kind-badge kind-weekly" title="Managed in SQLite">Managed</span>`
+      : `<span class="kind-badge" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;">External</span>`;
+    
+    const safeName = escapeHtml(s.name);
+    let actionsContent = "";
+    if (isManaged) {
+      let quickActionsHtml = "";
+      let dropdownActionsHtml = "";
+
+      if (isRunning) {
+        quickActionsHtml = `
+          <button type="button" class="btn-action" data-stack-action="restart" data-stack="${safeName}">Restart</button>
+          <button type="button" class="btn-action" data-stack-action="edit" data-stack="${safeName}">Edit</button>
+        `;
+        dropdownActionsHtml = `
+          <button type="button" class="actions-dropdown-item" data-stack-action="stop" data-stack="${safeName}">Stop</button>
+          <button type="button" class="actions-dropdown-item" data-stack-action="pull" data-stack="${safeName}">Pull</button>
+          <button type="button" class="actions-dropdown-item" data-stack-action="down" data-stack="${safeName}">Down</button>
+          <div class="actions-dropdown-divider"></div>
+          <button type="button" class="actions-dropdown-item danger" data-stack-action="delete" data-stack="${safeName}">Delete</button>
+        `;
+      } else {
+        quickActionsHtml = `
+          <button type="button" class="btn-action btn-action-success" data-stack-action="start" data-stack="${safeName}">Start</button>
+          <button type="button" class="btn-action" data-stack-action="edit" data-stack="${safeName}">Edit</button>
+        `;
+        dropdownActionsHtml = `
+          <button type="button" class="actions-dropdown-item" data-stack-action="pull" data-stack="${safeName}">Pull</button>
+          <button type="button" class="actions-dropdown-item" data-stack-action="down" data-stack="${safeName}">Down</button>
+          <div class="actions-dropdown-divider"></div>
+          <button type="button" class="actions-dropdown-item danger" data-stack-action="delete" data-stack="${safeName}">Delete</button>
+        `;
+      }
+
+      actionsContent = `
+        <div class="btn-action-group">
+          ${quickActionsHtml}
+          <div class="actions-dropdown">
+            <button type="button" class="btn-action btn-action-more" aria-label="More actions" title="More actions">⋯</button>
+            <div class="actions-dropdown-menu">
+              ${dropdownActionsHtml}
+            </div>
+          </div>
+        </div>
+      `;
+    } else {
+      actionsContent = `<span class="kind-badge" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;" title="Managed outside SystemAlerts. Manage individual containers in Containers tab.">Read-Only (External)</span>`;
+    }
+
+    return `<tr>
+      <td><strong>${safeName}</strong></td>
+      <td>
+        <span class="status-badge ${statusClass}">
+          <span class="status-dot"></span>
+          ${escapeHtml((s.status || "unknown").replace(/\s*\(\d+(?:\/\d+)?\)/g, "").trim())}
+        </span>
+      </td>
+      <td>${Number(s.running_count || 0)} / ${Number(s.containers_count || 0)} running</td>
+      <td>${managedBadge}</td>
+      <td class="actions-col">${actionsContent}</td>
+    </tr>`;
+  }).join("");
+
+  tbody.querySelectorAll("button[data-stack-action]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      closeAllActionsDropdowns();
+      const action = btn.getAttribute("data-stack-action");
+      const stackName = btn.getAttribute("data-stack");
+      if (action === "edit") {
+        openStackEditor(stackName);
+      } else if (action === "delete") {
+        handleDeleteStack(stackName);
+      } else {
+        handleStackAction(stackName, action, btn);
+      }
+    });
+  });
+}
+
+/**
  * Fetch and render Docker Stacks.
  */
 async function fetchDockerStacks() {
@@ -6718,6 +6865,7 @@ async function fetchDockerStacks() {
     if (!resp.ok) return;
     const data = await resp.json();
     const stacks = data.stacks || [];
+    cachedDockerStacks = stacks;
 
     const stacksKey = JSON.stringify(stacks);
     if (lastStacksRenderKey === stacksKey && tbody.children.length > 0) {
@@ -6725,62 +6873,7 @@ async function fetchDockerStacks() {
     }
     lastStacksRenderKey = stacksKey;
 
-    if (stacks.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No Compose stacks configured yet. Click 'Deploy New Stack' to add one.</td></tr>`;
-      return;
-    }
-
-    tbody.innerHTML = stacks.map((s) => {
-      const isRunning = s.status === "running" || (Number(s.running_count || 0) > 0);
-      const statusClass = isRunning ? "status-clean" : (s.status === "stopped" || s.status === "down" ? "status-degraded" : "status-none");
-      const isManaged = Boolean(s.managed);
-      const managedBadge = isManaged
-        ? `<span class="kind-badge kind-weekly" title="Managed in SQLite">Managed</span>`
-        : `<span class="kind-badge" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;">External</span>`;
-      
-      const safeName = escapeHtml(s.name);
-      const actionsContent = isManaged
-        ? `<div class="btn-action-group">
-            ${
-              isRunning
-                ? `<button type="button" class="btn-action" data-stack-action="restart" data-stack="${safeName}">Restart</button>
-                   <button type="button" class="btn-action" data-stack-action="stop" data-stack="${safeName}">Stop</button>`
-                : `<button type="button" class="btn-action btn-action-success" data-stack-action="start" data-stack="${safeName}">Start</button>`
-            }
-            <button type="button" class="btn-action" data-stack-action="down" data-stack="${safeName}">Down</button>
-            <button type="button" class="btn-action" data-stack-action="pull" data-stack="${safeName}">Pull</button>
-            <button type="button" class="btn-action" data-stack-action="edit" data-stack="${safeName}">Edit</button>
-            <button type="button" class="btn-action btn-action-danger" data-stack-action="delete" data-stack="${safeName}">Delete</button>
-          </div>`
-        : `<span class="kind-badge" style="background: rgba(148, 163, 184, 0.15); color: #94a3b8;" title="Managed outside SystemAlerts. Manage individual containers in Containers tab.">Read-Only (External)</span>`;
-
-      return `<tr>
-        <td><strong>${safeName}</strong></td>
-        <td>
-          <span class="status-badge ${statusClass}">
-            <span class="status-dot"></span>
-            ${escapeHtml((s.status || "unknown").replace(/\s*\(\d+(?:\/\d+)?\)/g, "").trim())}
-          </span>
-        </td>
-        <td>${Number(s.running_count || 0)} / ${Number(s.containers_count || 0)} running</td>
-        <td>${managedBadge}</td>
-        <td class="actions-col">${actionsContent}</td>
-      </tr>`;
-    }).join("");
-
-    tbody.querySelectorAll("button[data-stack-action]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const action = btn.getAttribute("data-stack-action");
-        const stackName = btn.getAttribute("data-stack");
-        if (action === "edit") {
-          openStackEditor(stackName);
-        } else if (action === "delete") {
-          handleDeleteStack(stackName);
-        } else {
-          handleStackAction(stackName, action, btn);
-        }
-      });
-    });
+    renderDockerStacks(stacks);
   } catch (err) {
     console.warn("Failed to fetch Docker stacks:", err);
   } finally {
@@ -7028,9 +7121,13 @@ async function fetchDockerContainers(highlightCid = null) {
   }
 }
 
-function renderDockerContainers(highlightCid = null) {
+function renderDockerContainers(highlightCid = null, containers = null) {
   const tbody = document.getElementById("docker-containers-tbody");
   if (!tbody) return;
+
+  if (containers) {
+    cachedDockerContainers = containers;
+  }
 
   const searchInput =
     document.getElementById("containers-search-input") ||
@@ -7122,6 +7219,44 @@ function renderDockerContainers(highlightCid = null) {
     const isHighlighted = highlightCid && (c.id === highlightCid || (c.name && c.name === highlightCid) || (highlightCid.includes(c.id)));
     const rowClass = isHighlighted ? ' class="row-highlight"' : "";
 
+    let quickActionsHtml = "";
+    let dropdownActionsHtml = "";
+
+    if (isRunning) {
+      quickActionsHtml = `
+        <button type="button" class="btn-action" data-c-action="restart" data-cid="${safeId}">Restart</button>
+        <button type="button" class="btn-action" data-c-action="logs" data-cid="${safeId}" data-cname="${safeName}">Logs</button>
+        <button type="button" class="btn-action btn-action-sm btn-terminal" data-c-action="terminal" data-terminal-container-id="${safeId}" data-terminal-container-name="${safeName}" data-cid="${safeId}" data-cname="${safeName}" title="Open Web Terminal">Terminal</button>
+      `;
+      dropdownActionsHtml = `
+        <button type="button" class="actions-dropdown-item" data-c-action="stop" data-cid="${safeId}">Stop</button>
+        <button type="button" class="actions-dropdown-item" data-c-action="pause" data-cid="${safeId}">Pause</button>
+        <div class="actions-dropdown-divider"></div>
+        <button type="button" class="actions-dropdown-item danger" data-c-action="remove" data-cid="${safeId}" data-cname="${safeName}">Remove</button>
+      `;
+    } else if (isPaused) {
+      quickActionsHtml = `
+        <button type="button" class="btn-action btn-action-success" data-c-action="unpause" data-cid="${safeId}">Unpause</button>
+        <button type="button" class="btn-action" data-c-action="logs" data-cid="${safeId}" data-cname="${safeName}">Logs</button>
+        <button type="button" class="btn-action btn-action-sm btn-terminal" data-c-action="terminal" data-terminal-container-id="${safeId}" data-terminal-container-name="${safeName}" data-cid="${safeId}" data-cname="${safeName}" title="Open Web Terminal">Terminal</button>
+      `;
+      dropdownActionsHtml = `
+        <button type="button" class="actions-dropdown-item" data-c-action="stop" data-cid="${safeId}">Stop</button>
+        <div class="actions-dropdown-divider"></div>
+        <button type="button" class="actions-dropdown-item danger" data-c-action="remove" data-cid="${safeId}" data-cname="${safeName}">Remove</button>
+      `;
+    } else {
+      quickActionsHtml = `
+        <button type="button" class="btn-action btn-action-success" data-c-action="start" data-cid="${safeId}">Start</button>
+        <button type="button" class="btn-action" data-c-action="logs" data-cid="${safeId}" data-cname="${safeName}">Logs</button>
+      `;
+      dropdownActionsHtml = `
+        <button type="button" class="actions-dropdown-item btn-terminal" data-c-action="terminal" data-terminal-container-id="${safeId}" data-terminal-container-name="${safeName}" data-cid="${safeId}" data-cname="${safeName}" title="Open Web Terminal">Terminal</button>
+        <div class="actions-dropdown-divider"></div>
+        <button type="button" class="actions-dropdown-item danger" data-c-action="remove" data-cid="${safeId}" data-cname="${safeName}">Remove</button>
+      `;
+    }
+
     return `<tr${rowClass}>
       <td><strong>${safeName}</strong></td>
       <td><span class="mono-text">${safeId}</span></td>
@@ -7136,18 +7271,13 @@ function renderDockerContainers(highlightCid = null) {
       <td>${safeStack !== "-" ? `<span class="kind-badge kind-weekly">${safeStack}</span>` : "-"}</td>
       <td class="actions-col">
         <div class="btn-action-group">
-          ${
-            isRunning
-              ? `<button type="button" class="btn-action" data-c-action="restart" data-cid="${safeId}">Restart</button>
-                 <button type="button" class="btn-action" data-c-action="stop" data-cid="${safeId}">Stop</button>
-                 <button type="button" class="btn-action" data-c-action="pause" data-cid="${safeId}">Pause</button>`
-              : (isPaused
-                  ? `<button type="button" class="btn-action btn-action-success" data-c-action="unpause" data-cid="${safeId}">Unpause</button>`
-                  : `<button type="button" class="btn-action btn-action-success" data-c-action="start" data-cid="${safeId}">Start</button>`)
-          }
-          <button type="button" class="btn-action" data-c-action="logs" data-cid="${safeId}" data-cname="${safeName}">Logs</button>
-          <button type="button" class="btn-action btn-action-sm btn-terminal" data-c-action="terminal" data-terminal-container-id="${safeId}" data-terminal-container-name="${safeName}" data-cid="${safeId}" data-cname="${safeName}" title="Open Web Terminal">Terminal</button>
-          <button type="button" class="btn-action btn-action-danger" data-c-action="remove" data-cid="${safeId}" data-cname="${safeName}">Remove</button>
+          ${quickActionsHtml}
+          <div class="actions-dropdown">
+            <button type="button" class="btn-action btn-action-more" aria-label="More actions" title="More actions">⋯</button>
+            <div class="actions-dropdown-menu">
+              ${dropdownActionsHtml}
+            </div>
+          </div>
         </div>
       </td>
     </tr>`;
@@ -7155,6 +7285,7 @@ function renderDockerContainers(highlightCid = null) {
 
   tbody.querySelectorAll("button[data-c-action]").forEach((btn) => {
     btn.addEventListener("click", () => {
+      closeAllActionsDropdowns();
       const action = btn.getAttribute("data-c-action");
       const cid = btn.getAttribute("data-cid");
       const cname = btn.getAttribute("data-cname") || cid;
@@ -13552,6 +13683,8 @@ function initDashboard() {
   updateCronFormTaskConfigVisibility();
 
   initTelemetryTimeMachine();
+
+  initActionsDropdowns();
 
   checkAuthStatus();
 }

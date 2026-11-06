@@ -535,7 +535,7 @@ wheels = [
 
 [[package]]
 name = "systemalerts"
-version = "1.0.29"
+version = "1.0.31"
 source = { editable = "." }
 dependencies = [
     { name = "aiohappyeyeballs" },
