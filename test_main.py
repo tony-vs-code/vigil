@@ -11915,15 +11915,42 @@ class DockerContainerTerminalBackendTests(unittest.TestCase):
                 self.assertTrue(payload["AttachStdin"])
                 self.assertTrue(payload["AttachStdout"])
                 self.assertTrue(payload["AttachStderr"])
+                self.assertEqual(
+                    payload["Env"],
+                    ["TERM=xterm-256color", "COLORTERM=truecolor", "LANG=C.UTF-8"],
+                )
 
-            # 2. Custom options
+            # 2. Custom options with list env
             with patch.object(mgr, "_socket_request", return_value=(200, b'{"Id": "exec_custom"}')) as mock_req:
-                res = mgr.create_container_exec("c_custom", cmd=["/bin/bash"], user="node", tty=False)
+                res = mgr.create_container_exec(
+                    "c_custom",
+                    cmd=["/bin/bash"],
+                    user="node",
+                    tty=False,
+                    env=["TERM=xterm", "CUSTOM_VAR=test"],
+                )
                 self.assertEqual(res, {"id": "exec_custom"})
                 payload = json.loads(mock_req.call_args[1]["body"].decode("utf-8"))
                 self.assertEqual(payload["Cmd"], ["/bin/bash"])
                 self.assertEqual(payload["User"], "node")
                 self.assertFalse(payload["Tty"])
+                self.assertEqual(
+                    payload["Env"],
+                    ["TERM=xterm", "COLORTERM=truecolor", "LANG=C.UTF-8", "CUSTOM_VAR=test"],
+                )
+
+            # 3. Custom options with dict env
+            with patch.object(mgr, "_socket_request", return_value=(200, b'{"Id": "exec_dict"}')) as mock_req:
+                res = mgr.create_container_exec(
+                    "c_dict",
+                    env={"COLORTERM": "24bit", "FOO": "bar"},
+                )
+                self.assertEqual(res, {"id": "exec_dict"})
+                payload = json.loads(mock_req.call_args[1]["body"].decode("utf-8"))
+                self.assertEqual(
+                    payload["Env"],
+                    ["TERM=xterm-256color", "COLORTERM=24bit", "LANG=C.UTF-8", "FOO=bar"],
+                )
 
     def test_create_container_exec_error_handling(self):
         mgr = main.DockerManager()
@@ -12303,9 +12330,14 @@ vm.runInThisContext(`
 var activeTerminalContainerId = null;
 var activeTerminalContainerName = "";
 var terminalWs = null;
+var terminalUtf8Decoder = new TextDecoder("utf-8", {{ stream: true }});
 var terminalLines = [[]];
 var terminalCursorRow = 0;
 var terminalCursorCol = 0;
+var terminalCursorVisible = true;
+var terminalSavedLines = null;
+var terminalSavedCursorRow = 0;
+var terminalSavedCursorCol = 0;
 var terminalCurrentStyle = {{
   fg: null,
   bg: null,
@@ -12385,6 +12417,56 @@ if (sentWsData[0] !== '\\x03') throw new Error("Ctrl+C should send \\\\x03");
 sentWsData = [];
 handleTerminalKeyDown({{ key: 'x', preventDefault: () => {{}} }});
 if (sentWsData[0] !== 'x') throw new Error("Char 'x' should send 'x'");
+
+// Test 6: DEC Private Mode handling (?25h / ?25l cursor visibility)
+resetTerminalBuffer();
+if (!terminalCursorVisible) throw new Error("Cursor should be visible by default");
+feedTerminalText("\\x1b[?25l");
+if (terminalCursorVisible) throw new Error("Cursor should be hidden after ?25l");
+renderTerminalToDOM();
+if (screenEl.innerHTML.includes("terminal-cursor")) throw new Error("DOM should not contain terminal-cursor when hidden");
+feedTerminalText("\\x1b[?25h");
+if (!terminalCursorVisible) throw new Error("Cursor should be visible after ?25h");
+renderTerminalToDOM();
+if (!screenEl.innerHTML.includes("terminal-cursor")) throw new Error("DOM should contain terminal-cursor when visible");
+
+// Test 7: DEC Private Mode handling (?1049h / ?1049l alternate screen buffer)
+resetTerminalBuffer();
+feedTerminalText("Primary Screen Content\\r\\nLine 2");
+if (terminalLines.length < 2) throw new Error("Primary screen should have 2 lines");
+feedTerminalText("\\x1b[?1049h");
+if (terminalLines.length !== 1 || terminalLines[0].length !== 0) throw new Error("Alt buffer should be empty on ?1049h");
+feedTerminalText("Alt Buffer Content");
+if (terminalLines[0].map(c => c.char).join("") !== "Alt Buffer Content") throw new Error("Alt buffer text mismatch");
+feedTerminalText("\\x1b[?1049l");
+const restoredText = terminalLines[0].map(c => c.char).join("");
+if (restoredText !== "Primary Screen Content") throw new Error("Primary buffer not restored after ?1049l: " + restoredText);
+
+// Test 8: DEC Private Mode: Bracketed paste (?2004) and cursor keys (?1) ignored cleanly
+resetTerminalBuffer();
+feedTerminalText("\\x1b[?2004h\\x1b[?1hClean Content\\x1b[?2004l");
+const cleanText = terminalLines[0].map(c => c.char).join("");
+if (cleanText !== "Clean Content") throw new Error("Clean Content corrupted by DEC modes: " + cleanText);
+
+// Test 9: Control Character Filtering (DEL 0x7f, C1 codes 0x80-0x9f, U+FFFD, control chars < 32)
+resetTerminalBuffer();
+feedTerminalText("Valid\\x7f\\x80\\x9f\\ufffdText\\x01\\x02\\x05End");
+const filteredText = terminalLines[0].map(c => c.char).join("");
+if (filteredText !== "ValidTextEnd") throw new Error("Control characters not properly filtered: " + filteredText);
+
+// Test 10: Split ANSI Sequences across chunks and UTF-8 stream decoding
+resetTerminalBuffer();
+feedTerminalText("\\x1b[3");
+feedTerminalText("1mRed\\x1b[0m");
+renderTerminalToDOM();
+if (!screenEl.innerHTML.includes("ansi-red") || !screenEl.innerHTML.includes("Red")) {{
+  throw new Error("Split ANSI sequence failed to render red text: " + screenEl.innerHTML);
+}}
+const utf8Decoder = new TextDecoder("utf-8", {{ stream: true }});
+const chunk1 = new Uint8Array([0xF0, 0x9F]);
+const chunk2 = new Uint8Array([0x9A, 0x80]);
+const decodedChar = utf8Decoder.decode(chunk1, {{ stream: true }}) + utf8Decoder.decode(chunk2, {{ stream: true }});
+if (decodedChar !== "🚀") throw new Error("Stream UTF-8 decode failed: " + decodedChar);
 
 // Close terminal
 closeContainerTerminal();
