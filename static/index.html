@@ -3095,6 +3095,24 @@
 
       <div id="settings-feedback" class="auth-alert hidden" role="status"></div>
 
+      <!-- Settings Subtabs Nav -->
+      <div class="view-subtabs-nav settings-subtabs-nav" role="tablist" aria-label="Settings Subtabs">
+        <button id="subtab-settings-general" class="subtab-nav-btn active" type="button" role="tab" aria-selected="true" aria-controls="subview-settings-general">
+          <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span>General Settings</span>
+        </button>
+        <button id="subtab-settings" class="subtab-nav-btn" type="button" role="tab" aria-selected="false" aria-controls="subview-settings">
+          <span class="btn-icon">⚡</span>
+          <span>System Diagnostics</span>
+        </button>
+        <button id="subtab-settings-diagnostics" class="hidden" style="display:none;" aria-hidden="true"></button>
+      </div>
+
+      <!-- Subtab Panel 1: General Settings Form (#subview-settings-general) -->
+      <div id="subview-settings-general" class="subtab-panel" role="tabpanel" aria-labelledby="subtab-settings-general">
       <form id="settings-form" class="settings-form">
         <div class="settings-grid">
           <div class="form-group">
@@ -3178,6 +3196,133 @@
           <button id="save-settings-btn" type="submit" class="btn-primary">Save Settings</button>
         </div>
       </form>
+      </div>
+
+      <!-- Subtab Panel 2: System Diagnostics & Invariant Self-Test (#subview-settings) -->
+      <div id="subview-settings" class="subtab-panel hidden" role="tabpanel" aria-labelledby="subtab-settings">
+        <article class="card diagnostics-card" id="system-diagnostics-card">
+          <div class="card-header diagnostics-card-header">
+            <div>
+              <h3 class="card-title">System Diagnostics &amp; Invariant Self-Test</h3>
+              <p class="card-subtitle">Live non-destructive verification of SQLite integrity, multi-channel alert hub, Docker templates, telemetry, and security guards</p>
+            </div>
+            <button id="btn-run-diagnostics" type="button" class="btn-primary">
+              <span class="btn-icon">⚡</span> Run Diagnostics
+            </button>
+          </div>
+
+          <!-- Diagnostic Summary Bar (#diagnostics-summary-bar) -->
+          <div id="diagnostics-summary-bar" class="diagnostics-summary-bar">
+            <span id="diagnostics-overall-badge" class="status-badge status-clean">READY</span>
+            <span id="diagnostics-summary-text" class="text-secondary">Click 'Run Diagnostics' to execute automated system self-tests.</span>
+            <span id="diagnostics-timestamp" class="text-muted text-xs"></span>
+          </div>
+
+          <!-- Diagnostic Grid Container (#diagnostics-grid) -->
+          <div id="diagnostics-grid" class="diagnostics-grid">
+            <!-- 1. Database Integrity -->
+            <div class="diagnostic-item" id="diag-item-database">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <ellipse cx="12" cy="5" rx="9" ry="3"></ellipse>
+                    <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path>
+                    <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path>
+                  </svg>
+                  <span class="diag-item-title">Database Integrity</span>
+                </div>
+                <span id="diag-badge-database" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-database" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+
+            <!-- 2. Alert Hub & Routing -->
+            <div class="diagnostic-item" id="diag-item-notification-hub">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                    <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+                  </svg>
+                  <span class="diag-item-title">Alert Hub &amp; Routing</span>
+                </div>
+                <span id="diag-badge-notification-hub" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-notification-hub" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+
+            <!-- 3. Docker & App Catalog -->
+            <div class="diagnostic-item" id="diag-item-docker-templates">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="2" y="7" width="20" height="14" rx="2" ry="2"></rect>
+                    <path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"></path>
+                  </svg>
+                  <span class="diag-item-title">Docker &amp; App Catalog</span>
+                </div>
+                <span id="diag-badge-docker-templates" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-docker-templates" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+
+            <!-- 4. Telemetry Engine -->
+            <div class="diagnostic-item" id="diag-item-telemetry-engine">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+                  </svg>
+                  <span class="diag-item-title">Telemetry Engine</span>
+                </div>
+                <span id="diag-badge-telemetry-engine" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-telemetry-engine" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+
+            <!-- 5. Vigil Cron Scheduler -->
+            <div class="diagnostic-item" id="diag-item-vigil-scheduler">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <polyline points="12 6 12 12 16 14"></polyline>
+                  </svg>
+                  <span class="diag-item-title">Vigil Cron Scheduler</span>
+                </div>
+                <span id="diag-badge-vigil-scheduler" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-vigil-scheduler" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+
+            <!-- 6. Security & Auth Guard -->
+            <div class="diagnostic-item" id="diag-item-api-security">
+              <div class="diag-item-header">
+                <div class="diag-item-title-group">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                  </svg>
+                  <span class="diag-item-title">Security &amp; Auth Guard</span>
+                </div>
+                <span id="diag-badge-api-security" class="status-badge">PENDING</span>
+              </div>
+              <div class="diag-item-body">
+                <p id="diag-msg-api-security" class="diag-item-msg text-secondary">Awaiting self-test execution...</p>
+              </div>
+            </div>
+          </div>
+        </article>
+      </div>
     </div>
   </div>
 

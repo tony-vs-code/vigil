@@ -857,6 +857,16 @@ def api_system_network(_user: str = Depends(require_auth)) -> dict[str, Any]:
         )
 
 
+@app.get("/api/system/diagnostics")
+async def api_system_diagnostics(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(main.run_system_diagnostics)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error executing system diagnostics: {exc}"
+        )
+
+
 VALID_TELEMETRY_RANGES = {"1h", "6h", "24h", "7d"}
 
 

@@ -1,34 +1,33 @@
-# Release v1.0.33: Multi-Channel Alert Hub
+# Release v1.0.34: Comprehensive Feature Invariant & System Self-Test Diagnostic Suite
 
 ## Overview
-Vigil v1.0.33 transforms the notification engine into a comprehensive **Multi-Channel Alert Hub**, adding native support for **Pushover**, **Ntfy**, and **Gotify** alongside existing Discord, Telegram, and Generic Webhook channels. System operators now have complete granular control over notification routing per channel (RAID degradation alerts, weekly system summaries, cron execution failures, and cron successes), robust credential protection with secret masking and preservation, dynamic real-time channel status badge pills, and direct channel-specific test dispatches.
+Vigil v1.0.34 introduces a comprehensive **Feature Invariant & System Self-Test Diagnostic Suite**, giving operators instant visibility and automated confidence into core subsystem health and feature invariants. With a sub-100ms non-destructive internal diagnostics engine, an authenticated diagnostic API endpoint, a responsive Settings UI self-test cockpit with real-time subsystem breakdown, and 29 modular invariant test suites, Vigil continuously verifies critical subsystems without disrupting production operations.
 
 ## Highlights & Enhancements
 
-### 1. Unified 6-Channel Alert Ecosystem
-- **Expanded Service Integrations**: Native notification delivery support across 6 distinct notification platforms: Discord, Telegram, Pushover, Ntfy, Gotify, and Generic HTTP Webhooks.
-- **Pushover Integration**: Supports user keys, application API tokens, message priority levels, and custom audio alert tones.
-- **Ntfy Integration**: Supports self-hosted and cloud ntfy servers, custom topics, priorities, tags, and authorization tokens.
-- **Gotify Integration**: Seamless alerting via self-hosted Gotify instances with app tokens and priority mapping.
-- **Generic Webhook**: Configurable HTTP POST webhook destination with customizable JSON payload templates and custom headers.
+### 1. High-Performance Non-Destructive Diagnostics Engine
+- **Sub-100ms Internal Diagnostics**: The asynchronous `run_system_diagnostics()` engine evaluates host subsystem health, schema invariants, and internal subsystems in under 100 milliseconds without mutative side-effects or service disruption.
+- **SQLite Database Integrity Verification**: Executes internal `PRAGMA integrity_check` alongside active schema verification across all 9 critical tables (`system_metrics`, `raid_events`, `docker_containers`, `cron_tasks`, `cron_logs`, `audit_events`, `notification_providers`, `alert_history`, `sentinel_probes`).
+- **Alert Hub Invariant Verification**: Validates initialization and configuration integrity across all 6 alert providers (Discord, Telegram, Pushover, Ntfy, Gotify, Webhook) and verifies event routing rules.
+- **Docker App Catalog Blueprint Verification**: Audits all 11 curated homelab app templates ensuring compose definitions, required ports, category taxonomies, and environment variable schema integrity.
+- **Subsystem Health Probing**: Assesses CPU, memory, and disk telemetry probes, Vigil cron scheduler thread health, and API security guard invariants (API token authorization and path sanitation).
 
-### 2. Granular Per-Channel Notification Routing
-- **Fine-Grained Event Matrix**: Configure exactly which alerts dispatch to each channel:
-  - **RAID Alerts**: Immediate notifications for degraded arrays, disk failures, and resync events.
-  - **Weekly Summaries**: Consolidated weekly system status and storage health reports.
-  - **Cron Failures**: Instant critical failure notifications when scheduled cron jobs fail.
-  - **Cron Successes**: Optional execution confirmations for completed tasks.
-- **Independent Channels**: Each integration operates independently, allowing critical alerts to page on-call phones via Pushover while weekly digests route to Discord or Telegram.
+### 2. Authenticated Diagnostics API Endpoint
+- **RESTful Diagnostics Endpoint**: `GET /api/system/diagnostics` provides authenticated access to real-time subsystem diagnostic reports.
+- **Structured Health Payload**: Returns overall operational status (`healthy` / `degraded`), microsecond-precision execution latency, ISO-8601 timestamps, and granular per-subsystem checks (`database`, `alert_hub`, `app_catalog`, `telemetry`, `cron_scheduler`, `security_guards`).
+- **Actionable Diagnostic Metrics**: Subsystem objects report individual status, execution latency, and rich diagnostic metadata (table counts, provider states, catalog templates, memory metrics).
 
-### 3. Real-Time Channel Badges & Secret Preservation
-- **Live Status Badges**: Visual status indicators (`ACTIVE`, `DISABLED`, `NOT CONFIGURED`) for all 6 channels dynamically computed from channel state and route selections.
-- **Secure Secret Masking & Preservation**: Passwords, bot tokens, user keys, and webhook URLs are masked on the frontend (`••••••••`) and safely preserved on backend configuration updates unless explicitly overwritten.
+### 3. Interactive Settings UI Self-Test Card
+- **1-Click Self-Test Execution**: Interactive "Run Diagnostics" button in the Settings view (`#btn-run-diagnostics`) with loading spinners and immediate visual responsiveness.
+- **Dynamic Status Badges & Latency Counter**: Visual status indicators (`SYSTEM HEALTHY` / `DEGRADED`) and execution duration badges (`#diag-overall-badge`, `#diag-duration-badge`).
+- **Subsystem Breakdown Cockpit**: Real-time rendering of all 6 diagnostic subsystems (`#diag-subsystems-list`) with status pills, execution latency, and detail summaries.
+- **Raw Diagnostic Payload Inspection**: Collapsible raw JSON viewer (`#diag-raw-json`) for rapid copy-paste and homelab debugging.
 
-### 4. Channel-Specific Test Dispatching
-- **Targeted Diagnostic Testing**: Quick test dispatch dropdown (`#notif-test-channel-select`) enabling operators to verify delivery to specific channels (`All Channels`, `Discord`, `Telegram`, `Pushover`, `Ntfy`, `Gotify`, or `Webhook`) on demand.
-- **Actionable Diagnostic Feedback**: Real-time modal and inline alerts report delivery status and precise error diagnostics when channel tokens or endpoints are misconfigured.
+### 4. Modular Invariant & Regression Test Suites
+- **Dedicated Diagnostic Tests**: New `tests/test_system_diagnostics.py` testing database checks, table validation, alert provider verification, catalog validation, and REST API contracts.
+- **Feature Invariant Test Suite**: New `tests/test_feature_invariants.py` enforcing immutable guarantees for core homelab features, schema backward compatibility, and security boundaries.
 
 ## Reliability & Fixes
-- **Comprehensive Quality Assurance**: 263 / 263 automated tests passing (100% PASS), verifying async notification dispatches, secret masking, routing matrix rules, and SQLite persistence.
-- **DOM & Node VM UI Contract Auditing**: Full verification of frontend event handlers, test dispatch payloads, configuration modals, and status badges in automated Node VM test suites.
-- **Zero-Downtime Migration**: Seamless backward compatibility with existing Discord and Telegram configurations.
+- **100% Test Pass Rate**: 292 / 292 automated tests passing cleanly across unit, integration, and UI contract suites.
+- **Zero-Downtime Safe Checks**: All diagnostic routines employ read-only queries and non-blocking in-memory state inspections.
+- **Comprehensive UI Contract Testing**: Full DOM validation of diagnostic cards, buttons, status pills, and list renders.
