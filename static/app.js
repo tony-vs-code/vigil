@@ -4094,11 +4094,166 @@ function showSettingsFeedback(message, isSuccess = false) {
   el.classList.remove("hidden");
 }
 
-async function openSettingsModal() {
+let hasRunDiagnostics = false;
+let isRunningDiagnostics = false;
+let currentSettingsSubtab = "general";
+
+function switchSettingsSubtab(subtabName) {
+  currentSettingsSubtab = subtabName;
+
+  const btnGeneral = document.getElementById("subtab-settings-general");
+  const btnDiagnostics = document.getElementById("subtab-settings");
+  const btnDiagnosticsAlias = document.getElementById("subtab-settings-diagnostics");
+  const panelGeneral = document.getElementById("subview-settings-general");
+  const panelDiagnostics = document.getElementById("subview-settings");
+
+  if (subtabName === "diagnostics" || subtabName === "settings") {
+    btnGeneral?.classList.remove("active");
+    btnGeneral?.setAttribute("aria-selected", "false");
+    btnDiagnostics?.classList.add("active");
+    btnDiagnostics?.setAttribute("aria-selected", "true");
+    btnDiagnosticsAlias?.classList.add("active");
+    btnDiagnosticsAlias?.setAttribute("aria-selected", "true");
+
+    panelGeneral?.classList.add("hidden");
+    panelDiagnostics?.classList.remove("hidden");
+
+    if (!hasRunDiagnostics) {
+      runSystemDiagnostics();
+    }
+  } else {
+    btnGeneral?.classList.add("active");
+    btnGeneral?.setAttribute("aria-selected", "true");
+    btnDiagnostics?.classList.remove("active");
+    btnDiagnostics?.setAttribute("aria-selected", "false");
+    btnDiagnosticsAlias?.classList.remove("active");
+    btnDiagnosticsAlias?.setAttribute("aria-selected", "false");
+
+    panelGeneral?.classList.remove("hidden");
+    panelDiagnostics?.classList.add("hidden");
+  }
+}
+
+async function runSystemDiagnostics() {
+  if (isRunningDiagnostics) return;
+  isRunningDiagnostics = true;
+
+  const btn = document.getElementById("btn-run-diagnostics");
+  const overallBadge = document.getElementById("diagnostics-overall-badge");
+  const summaryText = document.getElementById("diagnostics-summary-text");
+  const timestampEl = document.getElementById("diagnostics-timestamp");
+
+  const originalBtnHtml = btn ? btn.innerHTML : '<span class="btn-icon">⚡</span> Run Diagnostics';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Running Diagnostics...";
+  }
+
+  try {
+    const resp = await apiFetch("/api/system/diagnostics");
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || `Diagnostic self-test failed (${resp.status})`);
+    }
+
+    const data = await resp.json();
+    hasRunDiagnostics = true;
+
+    // Update overall badge
+    if (overallBadge) {
+      overallBadge.className = "status-badge";
+      if (data.status === "healthy") {
+        overallBadge.classList.add("status-clean");
+        overallBadge.textContent = "HEALTHY";
+      } else {
+        overallBadge.classList.add("status-failed");
+        overallBadge.textContent = "DEGRADED";
+      }
+    }
+
+    // Update summary text
+    if (summaryText) {
+      summaryText.textContent = `${data.checks_passed} of ${data.checks_total} checks passed in ${data.duration_ms} ms`;
+    }
+
+    // Update timestamp
+    if (timestampEl) {
+      timestampEl.textContent = `Tested ${new Date(data.timestamp || Date.now()).toLocaleTimeString()}`;
+    }
+
+    // Subsystem checks mapping
+    const subsystemKeys = [
+      { key: "database", domId: "database" },
+      { key: "notification_hub", domId: "notification-hub" },
+      { key: "docker_and_templates", domId: "docker-templates" },
+      { key: "telemetry_engine", domId: "telemetry-engine" },
+      { key: "vigil_scheduler", domId: "vigil-scheduler" },
+      { key: "api_security", domId: "api-security" },
+    ];
+
+    if (data.checks && typeof data.checks === "object") {
+      subsystemKeys.forEach(({ key, domId }) => {
+        const check = data.checks[key];
+        const badgeEl =
+          document.getElementById(`diag-badge-${domId}`) ||
+          document.getElementById(`diag-badge-${key}`);
+        const msgEl =
+          document.getElementById(`diag-msg-${domId}`) ||
+          document.getElementById(`diag-msg-${key}`);
+
+        if (check) {
+          const isOk = check.status === "ok";
+          if (badgeEl) {
+            badgeEl.className = `status-badge ${isOk ? "status-clean" : "status-failed"}`;
+            badgeEl.textContent = isOk ? "OK" : "FAILED";
+          }
+          if (msgEl) {
+            msgEl.textContent = check.message || (isOk ? "Subsystem verification passed" : "Verification check failed");
+          }
+        }
+      });
+    }
+
+    return data;
+  } catch (err) {
+    if (overallBadge) {
+      overallBadge.className = "status-badge status-failed";
+      overallBadge.textContent = "ERROR";
+    }
+    if (summaryText) {
+      summaryText.textContent = `Self-test failed: ${err.message || String(err)}`;
+    }
+    if (timestampEl) {
+      timestampEl.textContent = `Tested ${new Date().toLocaleTimeString()}`;
+    }
+    if (typeof showToast === "function") {
+      showToast(`Diagnostic check failed: ${err.message || String(err)}`, "error");
+    }
+  } finally {
+    isRunningDiagnostics = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = originalBtnHtml;
+    }
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.runSystemDiagnostics = runSystemDiagnostics;
+  window.switchSettingsSubtab = switchSettingsSubtab;
+}
+
+async function openSettingsModal(defaultSubtab) {
   const modal = document.getElementById("settings-modal");
   if (!modal) return;
   showSettingsFeedback(null);
   modal.classList.remove("hidden");
+
+  if (defaultSubtab) {
+    switchSettingsSubtab(defaultSubtab);
+  } else if (currentSettingsSubtab === "diagnostics" && !hasRunDiagnostics) {
+    runSystemDiagnostics();
+  }
 
   try {
     const resp = await apiFetch("/api/settings");
@@ -14030,6 +14185,23 @@ function initDashboard() {
   document
     .getElementById("settings-form")
     ?.addEventListener("submit", handleSettingsSubmit);
+
+  // Settings Subtabs & System Diagnostics Handlers
+  document
+    .getElementById("subtab-settings-general")
+    ?.addEventListener("click", () => switchSettingsSubtab("general"));
+
+  document
+    .getElementById("subtab-settings")
+    ?.addEventListener("click", () => switchSettingsSubtab("diagnostics"));
+
+  document
+    .getElementById("subtab-settings-diagnostics")
+    ?.addEventListener("click", () => switchSettingsSubtab("diagnostics"));
+
+  document
+    .getElementById("btn-run-diagnostics")
+    ?.addEventListener("click", () => runSystemDiagnostics());
 
   // Notification Drawer Handlers
   document
