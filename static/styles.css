@@ -7851,5 +7851,30 @@ hr.overview-flow-divider {
   word-break: break-word;
 }
 
+/* Zero-Clutter Live Stream UI: Hide manual refresh buttons & interval selectors */
+#refresh-btn,
+.btn-module-refresh,
+#refresh-system-btn,
+#refresh-raid-btn,
+#refresh-docker-btn,
+#refresh-notifications-btn,
+#refresh-probes-btn,
+#refresh-services-btn,
+#refresh-security-btn,
+#refresh-processes-btn,
+#refresh-users-btn,
+#refresh-audit-btn,
+#backups-refresh-btn,
+#btn-refresh-packages,
+#btn-drawer-refresh-history,
+#docker-interval-select,
+#notifications-interval-select,
+#system-interval-select,
+#raid-interval-select,
+#live-stream-indicator,
+#auto-refresh-indicator {
+  display: none !important;
+}
+
 
 

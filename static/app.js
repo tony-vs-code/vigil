@@ -112,6 +112,7 @@ const DOCKER_SUBTAB_THROTTLE_MS = 800;
 let lastContainersRenderKey = "";
 let lastStacksRenderKey = "";
 let lastDockerUpdatesRenderKey = "";
+let lastSystemNetSample = null;
 
 /**
  * Retrieve stored session token if present.
@@ -1056,16 +1057,34 @@ function renderSystemMetrics(system) {
     ifaceIpEl.textContent = primaryIface.ip || (primaryIface.interface ? "No IPv4" : "--");
   }
 
+  const rxBytes = Number(net.total_bytes_recv ?? primaryIface.bytes_recv) || 0;
+  const txBytes = Number(net.total_bytes_sent ?? primaryIface.bytes_sent) || 0;
+  const nowTs = Number(system.timestamp) || Date.now() / 1000;
+  let rx_rate = Number(net.rx_rate ?? net.rx_rate_bps) || 0;
+  let tx_rate = Number(net.tx_rate ?? net.tx_rate_bps) || 0;
+  if (lastSystemNetSample && nowTs > lastSystemNetSample.timestamp) {
+    const dt = nowTs - lastSystemNetSample.timestamp;
+    if (dt > 0.05) {
+      if (!rx_rate && rxBytes >= lastSystemNetSample.rxBytes) {
+        rx_rate = (rxBytes - lastSystemNetSample.rxBytes) / dt;
+      }
+      if (!tx_rate && txBytes >= lastSystemNetSample.txBytes) {
+        tx_rate = (txBytes - lastSystemNetSample.txBytes) / dt;
+      }
+    }
+  }
+  lastSystemNetSample = { timestamp: nowTs, rxBytes, txBytes };
+
   const netRxEl = document.getElementById("host-network-rx");
   if (netRxEl) {
-    const rxBytes = Number(net.total_bytes_recv ?? primaryIface.bytes_recv) || 0;
-    netRxEl.textContent = formatBytes(rxBytes);
+    netRxEl.textContent =
+      rx_rate > 0 ? `${formatBytes(rxBytes)} (${formatBytes(rx_rate)}/s)` : formatBytes(rxBytes);
   }
 
   const netTxEl = document.getElementById("host-network-tx");
   if (netTxEl) {
-    const txBytes = Number(net.total_bytes_sent ?? primaryIface.bytes_sent) || 0;
-    netTxEl.textContent = formatBytes(txBytes);
+    netTxEl.textContent =
+      tx_rate > 0 ? `${formatBytes(txBytes)} (${formatBytes(tx_rate)}/s)` : formatBytes(txBytes);
   }
 
   const netStatusEl = document.getElementById("host-network-status");
@@ -3236,7 +3255,52 @@ function handleDockerEvent(msg) {
 }
 
 /**
- * Process incoming JSON messages from /api/ws ('snapshot' or 'module_update').
+ * Send active view & subtab subscription to backend WebSocket multiplexer.
+ */
+function sendWsSubscription(view = currentViewTab, subtab = currentDockerSubtab) {
+  if (
+    wsConnection &&
+    typeof window.WebSocket === "function" &&
+    wsConnection.readyState === window.WebSocket.OPEN
+  ) {
+    try {
+      wsConnection.send(
+        JSON.stringify({
+          action: "subscribe",
+          view: view || "overview",
+          subtab: subtab || "stacks",
+        })
+      );
+    } catch (err) {
+      console.debug("sendWsSubscription error:", err);
+    }
+  }
+}
+
+/**
+ * Subscribe or unsubscribe live container log streaming over WebSocket.
+ */
+function sendWsLogSubscription(containerId) {
+  if (
+    wsConnection &&
+    typeof window.WebSocket === "function" &&
+    wsConnection.readyState === window.WebSocket.OPEN
+  ) {
+    try {
+      wsConnection.send(
+        JSON.stringify({
+          action: "subscribe_logs",
+          container_id: containerId || null,
+        })
+      );
+    } catch (err) {
+      console.debug("sendWsLogSubscription error:", err);
+    }
+  }
+}
+
+/**
+ * Process incoming JSON messages from /api/ws ('snapshot', 'module_update', or 'container_logs').
  */
 function handleWebSocketMessage(rawData) {
   let msg;
@@ -3250,6 +3314,21 @@ function handleWebSocketMessage(rawData) {
 
   const refreshBtn = document.getElementById("refresh-btn");
   if (refreshBtn) refreshBtn.classList.remove("loading");
+
+  if (msg.type === "container_logs") {
+    if (activeLogContainerId && msg.container_id === activeLogContainerId) {
+      const viewer = document.getElementById("container-logs-viewer");
+      if (viewer) {
+        const isScrolledToBottom =
+          viewer.scrollHeight - viewer.clientHeight <= viewer.scrollTop + 50;
+        viewer.textContent = msg.logs || "No logs available.";
+        if (isScrolledToBottom) {
+          viewer.scrollTop = viewer.scrollHeight;
+        }
+      }
+    }
+    return;
+  }
 
   if (msg.type === "intervals_updated" || msg.refresh_intervals) {
     syncIntervalSelects(msg.refresh_intervals);
@@ -3306,12 +3385,97 @@ function handleWebSocketMessage(rawData) {
       }
       renderDockerStatus(msg.docker || msg);
       setModuleLastUpdated("docker");
-      if (currentViewTab === "containers") {
+      if (Array.isArray(msg.containers)) {
+        cachedDockerContainers = msg.containers;
+        renderDockerContainers(null, msg.containers);
+      }
+      if (Array.isArray(msg.stacks)) {
+        cachedDockerStacks = msg.stacks;
+        renderDockerStacks(msg.stacks);
+      }
+      if (
+        currentViewTab === "containers" &&
+        !Array.isArray(msg.containers) &&
+        !Array.isArray(msg.stacks)
+      ) {
         throttledRefreshDockerSubtab(currentDockerSubtab);
       }
     }
+    if (msg.services || msg.module === "services") {
+      const svcPayload = Array.isArray(msg.services) ? msg : (msg.services || msg);
+      cachedServicesData = svcPayload;
+      renderSystemServices(msg.services || msg);
+    }
+    if (msg.processes || msg.module === "processes") {
+      const procPayload = Array.isArray(msg.processes) ? msg : (msg.processes || msg);
+      cachedProcessesData = procPayload;
+      renderProcesses(msg.processes || msg);
+    }
+    if (msg.users || msg.module === "users") {
+      const usersPayload = Array.isArray(msg.users) ? msg : (msg.users || msg);
+      cachedUsersData = usersPayload;
+      renderSystemUsers(usersPayload);
+      if (msg.groups) {
+        const groupsPayload = Array.isArray(msg.groups)
+          ? { groups: msg.groups, summary: msg.groups_summary || msg.summary }
+          : msg.groups;
+        cachedGroupsData = groupsPayload;
+        renderSystemGroups(groupsPayload);
+      }
+    }
+    if (msg.module === "audit" && msg.logs) {
+      renderAuditLogs(msg);
+    }
+    if (msg.security || msg.module === "security") {
+      const sec = msg.security || msg;
+      const portsPayload = Array.isArray(sec.ports)
+        ? { ports: sec.ports, summary: sec.summary }
+        : (sec.ports || sec);
+      const fwPayload = sec.firewall || sec;
+      cachedSecurityPortsData = portsPayload;
+      cachedSecurityFirewallData = fwPayload;
+      renderNetworkSecurity(portsPayload, fwPayload);
+      if (sec.ssh || sec.ssh_security) {
+        cachedSecuritySshData = sec.ssh || sec.ssh_security;
+        renderSshSecurity(sec.ssh || sec.ssh_security);
+      }
+    }
+    if (msg.backups || msg.cron_jobs || msg.module === "backups") {
+      if (msg.backups) {
+        cachedBackupsData = msg.backups;
+        renderBackups(msg.backups);
+      }
+      if (msg.cron_jobs || msg.cron_runs) {
+        const cronPayload = Array.isArray(msg.cron_jobs)
+          ? {
+              jobs: msg.cron_jobs,
+              recent_runs: msg.cron_runs || cachedCronData?.recent_runs || [],
+              supported_task_types: cachedCronData?.supported_task_types || [],
+            }
+          : msg.cron_jobs && typeof msg.cron_jobs === "object"
+            ? {
+                ...msg.cron_jobs,
+                recent_runs: msg.cron_runs || msg.cron_jobs.recent_runs || [],
+              }
+            : {
+                ...(cachedCronData || {}),
+                recent_runs: msg.cron_runs || [],
+              };
+        cachedCronData = cronPayload;
+        renderCronJobs(cronPayload);
+      }
+      if (typeof updateBackupsNavBadge === "function") {
+        updateBackupsNavBadge();
+      }
+    }
     if (msg.probes || msg.module === "probes" || msg.type === "probe_update") {
-      if (typeof fetchProbes === "function") {
+      if (msg.probes) {
+        const probesPayload = Array.isArray(msg.probes)
+          ? { probes: msg.probes }
+          : msg.probes;
+        cachedProbesData = probesPayload;
+        renderProbes(probesPayload);
+      } else if (typeof fetchProbes === "function") {
         fetchProbes();
       }
     }
@@ -3345,15 +3509,84 @@ function handleWebSocketMessage(rawData) {
     if (msg.version || msg.version_info) {
       updateVersionBadge(msg.version_info || msg.version);
     }
-    if (msg.docker) {
-      renderDockerStatus(msg.docker);
+    if (msg.docker || msg.module === "docker" || msg.module === "containers") {
+      renderDockerStatus(msg.docker || msg);
       setModuleLastUpdated("docker");
-      if (currentViewTab === "containers") {
+      if (Array.isArray(msg.containers)) {
+        cachedDockerContainers = msg.containers;
+        renderDockerContainers(null, msg.containers);
+      }
+      if (Array.isArray(msg.stacks)) {
+        cachedDockerStacks = msg.stacks;
+        renderDockerStacks(msg.stacks);
+      }
+      if (
+        currentViewTab === "containers" &&
+        !Array.isArray(msg.containers) &&
+        !Array.isArray(msg.stacks)
+      ) {
         throttledRefreshDockerSubtab(currentDockerSubtab);
       }
     }
+    if (msg.services || msg.module === "services") {
+      renderSystemServices(msg.services || msg);
+    }
+    if (msg.processes || msg.module === "processes") {
+      renderProcesses(msg.processes || msg);
+    }
+    if (msg.users || msg.module === "users") {
+      const usersPayload = Array.isArray(msg.users) ? msg : (msg.users || msg);
+      renderSystemUsers(usersPayload);
+      if (msg.groups) {
+        renderSystemGroups(
+          Array.isArray(msg.groups)
+            ? { groups: msg.groups, summary: msg.groups_summary || msg.summary }
+            : msg.groups
+        );
+      }
+    }
+    if (msg.module === "audit" && msg.logs) {
+      renderAuditLogs(msg);
+    }
+    if (msg.security || msg.module === "security") {
+      const sec = msg.security || msg;
+      const portsPayload = Array.isArray(sec.ports)
+        ? { ports: sec.ports, summary: sec.summary }
+        : (sec.ports || sec);
+      renderNetworkSecurity(portsPayload, sec.firewall || sec);
+      if (sec.ssh || sec.ssh_security) {
+        renderSshSecurity(sec.ssh || sec.ssh_security);
+      }
+    }
+    if (msg.backups || msg.cron_jobs || msg.module === "backups") {
+      if (msg.backups) {
+        renderBackups(msg.backups);
+      }
+      if (msg.cron_jobs || msg.cron_runs) {
+        const cronPayload = Array.isArray(msg.cron_jobs)
+          ? {
+              jobs: msg.cron_jobs,
+              recent_runs: msg.cron_runs || cachedCronData?.recent_runs || [],
+              supported_task_types: cachedCronData?.supported_task_types || [],
+            }
+          : msg.cron_jobs && typeof msg.cron_jobs === "object"
+            ? {
+                ...msg.cron_jobs,
+                recent_runs: msg.cron_runs || msg.cron_jobs.recent_runs || [],
+              }
+            : {
+                ...(cachedCronData || {}),
+                recent_runs: msg.cron_runs || [],
+              };
+        renderCronJobs(cronPayload);
+      }
+    }
     if (msg.probes || msg.module === "probes" || msg.type === "probe_update") {
-      if (typeof fetchProbes === "function") {
+      if (msg.probes) {
+        renderProbes(
+          Array.isArray(msg.probes) ? { probes: msg.probes } : msg.probes
+        );
+      } else if (typeof fetchProbes === "function") {
         fetchProbes();
       }
     }
@@ -3397,6 +3630,14 @@ function connectWebSocket() {
     updateConnectionIndicator("live");
     // Pause the 10s HTTP polling timer while WebSocket is open
     stopPolling();
+    sendWsSubscription();
+    if (activeLogContainerId) {
+      sendWsLogSubscription(activeLogContainerId);
+      if (logsTimerId) {
+        clearInterval(logsTimerId);
+        logsTimerId = null;
+      }
+    }
   };
 
   wsConnection.onmessage = (event) => {
@@ -5644,6 +5885,8 @@ function switchViewTab(tabName, updateHash = true) {
       history.replaceState(null, "", "#overview");
     }
   }
+
+  sendWsSubscription(currentViewTab, currentDockerSubtab);
 }
 
 /**
@@ -6855,6 +7098,8 @@ function switchDockerSubtab(subtabName, updateHash = true) {
   if (isAuthenticated) {
     refreshDockerSubtab(subtabName);
   }
+
+  sendWsSubscription(currentViewTab, currentDockerSubtab);
 }
 
 /**
@@ -7191,6 +7436,15 @@ function initActionsDropdowns() {
 function renderDockerStacks(stacks = cachedDockerStacks) {
   const tbody = document.getElementById("docker-stacks-tbody");
   if (!tbody) return;
+
+  if (Array.isArray(stacks)) {
+    cachedDockerStacks = stacks;
+  }
+
+  // Preserve open dropdown menu under the user's cursor during live stream updates
+  if (tbody.querySelector?.(".actions-dropdown-menu.show")) {
+    return;
+  }
 
   if (!stacks || stacks.length === 0) {
     tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No Compose stacks configured yet. Click 'Deploy New Stack' to add one.</td></tr>`;
@@ -7939,6 +8193,11 @@ function renderDockerContainers(highlightCid = null, containers = null) {
     cachedDockerContainers = containers;
   }
 
+  // Preserve open dropdown menu under the user's cursor during live stream updates
+  if (!highlightCid && tbody.querySelector?.(".actions-dropdown-menu.show")) {
+    return;
+  }
+
   const searchInput =
     document.getElementById("containers-search-input") ||
     document.getElementById("docker-container-search");
@@ -8185,6 +8444,7 @@ function openContainerLogs(containerId, containerName) {
 
   modal?.classList.remove("hidden");
   fetchContainerLogs();
+  sendWsLogSubscription(containerId);
 
   if (logsTimerId) {
     clearInterval(logsTimerId);
@@ -8192,7 +8452,11 @@ function openContainerLogs(containerId, containerName) {
   }
 
   const autoToggle = document.getElementById("logs-autorefresh-toggle");
-  if (autoToggle?.checked) {
+  const isWsOpen =
+    wsConnection &&
+    typeof window.WebSocket === "function" &&
+    wsConnection.readyState === window.WebSocket.OPEN;
+  if (autoToggle?.checked && !isWsOpen) {
     logsTimerId = setInterval(fetchContainerLogs, 3000);
   }
 }
@@ -8203,6 +8467,7 @@ function closeContainerLogs() {
     logsTimerId = null;
   }
   activeLogContainerId = null;
+  sendWsLogSubscription(null);
   document.getElementById("container-logs-modal")?.classList.add("hidden");
 }
 
@@ -13584,7 +13849,16 @@ function initDashboard() {
         logsTimerId = null;
       }
       if (e.target.checked && activeLogContainerId) {
-        logsTimerId = setInterval(fetchContainerLogs, 3000);
+        sendWsLogSubscription(activeLogContainerId);
+        const isWsOpen =
+          wsConnection &&
+          typeof window.WebSocket === "function" &&
+          wsConnection.readyState === window.WebSocket.OPEN;
+        if (!isWsOpen) {
+          logsTimerId = setInterval(fetchContainerLogs, 3000);
+        }
+      } else {
+        sendWsLogSubscription(null);
       }
     });
 

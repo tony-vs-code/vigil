@@ -126,18 +126,27 @@ _eval_loop_count: int = 0
 async def notifications_evaluator_loop() -> None:
     global _eval_loop_count
     while True:
+        sample = None
         try:
-            main.record_telemetry_sample()
+            sample = main.record_telemetry_sample()
             _eval_loop_count += 1
             if _eval_loop_count % 120 == 0:
                 main.prune_telemetry_samples(7)
         except Exception as exc:
             logging.debug(f"Telemetry collector in evaluator loop error: {exc}")
 
+        if sample is not None:
+            try:
+                await ws_manager.broadcast({"type": "telemetry_sample", "sample": sample})
+            except Exception:
+                pass
+
         try:
             await main.evaluate_threshold_alerts()
             await main.evaluate_scheduled_reports()
-            main.evaluate_due_cron_jobs()
+            cron_runs = main.evaluate_due_cron_jobs()
+            if cron_runs:
+                await _broadcast_module("backups")
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -544,6 +553,17 @@ async def _build_module_update(module_name: str) -> dict[str, Any]:
             "history": _get_formatted_history(20),
             "notification_center": main.get_masked_notification_center_config(),
         }
+    if mod == "docker_full":
+        docker_status = await asyncio.to_thread(main.docker_mgr.get_status)
+        containers = await asyncio.to_thread(main.docker_mgr.list_containers, True)
+        stacks = await asyncio.to_thread(main.docker_mgr.list_stacks)
+        return {
+            "type": "module_update",
+            "module": "docker",
+            "docker": docker_status,
+            "containers": containers,
+            "stacks": stacks,
+        }
     if mod in ("docker", "containers"):
         docker_status = await asyncio.to_thread(main.docker_mgr.get_status)
         return {
@@ -574,7 +594,55 @@ async def _build_module_update(module_name: str) -> dict[str, Any]:
             "users": users_data,
             "groups": groups_data,
         }
+    if mod in ("security", "network_security", "firewall", "ports"):
+        sec_data = await asyncio.to_thread(main.get_network_security_overview)
+        return {
+            "type": "module_update",
+            "module": "security",
+            "security": sec_data,
+        }
+    if mod in ("backups", "cron"):
+        backups_data = await asyncio.to_thread(main.get_backups_overview)
+        cron_jobs = await asyncio.to_thread(main.list_cron_jobs)
+        cron_runs = await asyncio.to_thread(main.list_cron_job_runs, 30)
+        return {
+            "type": "module_update",
+            "module": "backups",
+            "backups": backups_data,
+            "cron_jobs": cron_jobs,
+            "cron_runs": cron_runs,
+        }
+    if mod in ("probes", "sentinel"):
+        probes_data = await asyncio.to_thread(main.list_probes)
+        return {
+            "type": "module_update",
+            "module": "probes",
+            "probes": probes_data,
+        }
+    if mod == "audit":
+        audit_res = await asyncio.to_thread(main.get_audit_logs, 100)
+        if isinstance(audit_res, tuple) and len(audit_res) == 2:
+            logs_list, total_count = audit_res
+        else:
+            logs_list = audit_res
+            total_count = len(logs_list) if isinstance(logs_list, list) else 0
+        return {
+            "type": "module_update",
+            "module": "audit",
+            "logs": logs_list,
+            "total": total_count,
+        }
     return await asyncio.to_thread(_build_full_snapshot)
+
+
+async def _broadcast_module(module_name: str) -> None:
+    try:
+        if not ws_manager.active_connections:
+            return
+        payload = await _build_module_update(module_name)
+        await ws_manager.broadcast(payload)
+    except Exception as exc:
+        logging.debug(f"Broadcast module '{module_name}' error: {exc}")
 
 
 def _format_settings_response(settings: dict[str, str]) -> dict[str, Any]:
@@ -938,7 +1006,7 @@ def api_get_notification_center(
 
 
 @app.post("/api/notifications/center")
-def api_update_notification_center(
+async def api_update_notification_center(
     payload: NotificationCenterUpdateRequest,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -950,6 +1018,7 @@ def api_update_notification_center(
         actor=_user,
         severity="info",
     )
+    await _broadcast_module("notifications")
     return main.get_masked_notification_center_config(updated)
 
 
@@ -960,6 +1029,7 @@ async def api_send_test_notification(
 ) -> dict[str, Any]:
     channel = payload.channel if payload and payload.channel else "all"
     success, message = await main.send_test_notification(channel=channel)
+    await _broadcast_module("notifications")
     return {"success": success, "message": message}
 
 
@@ -994,11 +1064,16 @@ async def api_websocket(websocket: WebSocket) -> None:
         initial_snapshot = await asyncio.to_thread(_build_full_snapshot)
         last_raid_status = initial_snapshot.get("raid", {}).get("status", "unknown")
         await websocket.send_json(initial_snapshot)
-        elapsed = {"system": 0, "raid": 0, "notifications": 0, "docker": 0}
+        elapsed = {"system": 0.0, "raid": 0.0, "notifications": 0.0, "docker": 0.0}
+        tick_count = 0
+        subscribed_view = "overview"
+        subscribed_subtab = "stacks"
+        subscribed_log_container: Optional[str] = None
+        last_sent_container_logs: dict[str, str] = {}
         while True:
             try:
                 raw_text = await asyncio.wait_for(
-                    websocket.receive_text(), timeout=1.0
+                    websocket.receive_text(), timeout=0.5
                 )
                 try:
                     data = json.loads(raw_text)
@@ -1011,7 +1086,7 @@ async def api_websocket(websocket: WebSocket) -> None:
                         last_raid_status = snap.get("raid", {}).get(
                             "status", last_raid_status
                         )
-                        elapsed = {"system": 0, "raid": 0, "notifications": 0, "docker": 0}
+                        elapsed = {"system": 0.0, "raid": 0.0, "notifications": 0.0, "docker": 0.0}
                         await websocket.send_json(snap)
                     elif action == "refresh_module":
                         mod_payload = await _build_module_update(
@@ -1025,6 +1100,52 @@ async def api_websocket(websocket: WebSocket) -> None:
                                 "status", last_raid_status
                             )
                         await websocket.send_json(mod_payload)
+                    elif action == "subscribe":
+                        subscribed_view = str(data.get("view") or "overview").lower()
+                        subscribed_subtab = str(data.get("subtab") or "").lower()
+                        view_mod_map = {
+                            "processes": "processes",
+                            "services": "services",
+                            "security": "security",
+                            "network": "security",
+                            "firewall": "security",
+                            "backups": "backups",
+                            "cron": "backups",
+                            "users": "users",
+                            "audit": "audit",
+                            "probes": "probes",
+                            "sentinel": "probes",
+                            "containers": "docker_full",
+                            "docker": "docker_full",
+                            "storage": "raid",
+                            "disks": "raid",
+                            "raid": "raid",
+                            "notifications": "notifications",
+                        }
+                        target_mod = view_mod_map.get(subscribed_view)
+                        if target_mod:
+                            await websocket.send_json(await _build_module_update(target_mod))
+                    elif action == "subscribe_logs":
+                        subscribed_log_container = (
+                            str(data.get("container_id") or "").strip() or None
+                        )
+                        if subscribed_log_container:
+                            try:
+                                logs_text = await asyncio.to_thread(
+                                    main.docker_mgr.get_container_logs,
+                                    subscribed_log_container,
+                                    200,
+                                )
+                                last_sent_container_logs[subscribed_log_container] = logs_text
+                                await websocket.send_json(
+                                    {
+                                        "type": "container_logs",
+                                        "container_id": subscribed_log_container,
+                                        "logs": logs_text,
+                                    }
+                                )
+                            except Exception as exc:
+                                logging.debug(f"Error fetching subscribed container logs: {exc}")
                     elif action == "set_intervals":
                         raw_intervals = (
                             data.get("intervals")
@@ -1057,18 +1178,49 @@ async def api_websocket(websocket: WebSocket) -> None:
                             }
                         )
             except asyncio.TimeoutError:
+                tick_count += 1
                 intervals = main.get_refresh_intervals()
-                elapsed["system"] += 1
-                elapsed["raid"] += 1
-                elapsed["notifications"] += 1
-                elapsed["docker"] += 1
+                elapsed["system"] += 0.5
+                elapsed["raid"] += 0.5
+                elapsed["notifications"] += 0.5
+                elapsed["docker"] += 0.5
 
-                if (
-                    intervals["system"] > 0
-                    and elapsed["system"] >= intervals["system"]
-                ):
-                    elapsed["system"] = 0
+                if intervals["system"] > 0:
+                    elapsed["system"] = 0.0
                     await websocket.send_json(await _build_module_update("system"))
+
+                if tick_count % 2 == 0:
+                    if subscribed_view == "processes":
+                        await websocket.send_json(await _build_module_update("processes"))
+                    elif subscribed_view in ("security", "network", "firewall"):
+                        await websocket.send_json(await _build_module_update("security"))
+                    elif subscribed_view == "services":
+                        await websocket.send_json(await _build_module_update("services"))
+                    elif subscribed_view in ("containers", "docker"):
+                        await websocket.send_json(await _build_module_update("docker_full"))
+                    elif subscribed_view in ("backups", "cron"):
+                        await websocket.send_json(await _build_module_update("backups"))
+                    elif subscribed_view in ("probes", "sentinel"):
+                        await websocket.send_json(await _build_module_update("probes"))
+
+                    if subscribed_log_container:
+                        try:
+                            logs_text = await asyncio.to_thread(
+                                main.docker_mgr.get_container_logs,
+                                subscribed_log_container,
+                                200,
+                            )
+                            if last_sent_container_logs.get(subscribed_log_container) != logs_text:
+                                last_sent_container_logs[subscribed_log_container] = logs_text
+                                await websocket.send_json(
+                                    {
+                                        "type": "container_logs",
+                                        "container_id": subscribed_log_container,
+                                        "logs": logs_text,
+                                    }
+                                )
+                        except Exception as exc:
+                            logging.debug(f"Error streaming container logs: {exc}")
 
                 adaptive_fast = last_raid_status in (
                     "recovering",
@@ -1081,7 +1233,7 @@ async def api_websocket(websocket: WebSocket) -> None:
                     else intervals["raid"]
                 )
                 if raid_interval > 0 and elapsed["raid"] >= raid_interval:
-                    elapsed["raid"] = 0
+                    elapsed["raid"] = 0.0
                     raid_msg = await _build_module_update("raid")
                     last_raid_status = raid_msg.get("raid", {}).get(
                         "status", last_raid_status
@@ -1092,7 +1244,7 @@ async def api_websocket(websocket: WebSocket) -> None:
                     intervals["notifications"] > 0
                     and elapsed["notifications"] >= intervals["notifications"]
                 ):
-                    elapsed["notifications"] = 0
+                    elapsed["notifications"] = 0.0
                     await websocket.send_json(await _build_module_update("notifications"))
 
                 docker_interval = intervals.get("docker", 5)
@@ -1100,7 +1252,7 @@ async def api_websocket(websocket: WebSocket) -> None:
                     docker_interval > 0
                     and elapsed["docker"] >= docker_interval
                 ):
-                    elapsed["docker"] = 0
+                    elapsed["docker"] = 0.0
                     await websocket.send_json(await _build_module_update("docker"))
     except WebSocketDisconnect:
         pass
@@ -1255,6 +1407,7 @@ async def api_docker_create_stack(
             env_content=payload.env_content,
             deploy=bool(payload.deploy),
         )
+        await _broadcast_module("docker_full")
         return {"success": True, "stack": stack}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1276,6 +1429,7 @@ async def api_docker_update_stack(
             env_content=payload.env_content,
             deploy=bool(payload.deploy),
         )
+        await _broadcast_module("docker_full")
         return {"success": True, "stack": stack}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1301,9 +1455,11 @@ async def api_docker_stack_action(
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(
+        res = await asyncio.to_thread(
             main.docker_manager.execute_stack_action, name, payload.action
         )
+        await _broadcast_module("docker_full")
+        return res
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1320,6 +1476,7 @@ async def api_docker_delete_stack(
 ) -> dict[str, Any]:
     try:
         await asyncio.to_thread(main.docker_manager.delete_stack, name, down=down)
+        await _broadcast_module("docker_full")
         return {"success": True, "deleted": name}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1343,9 +1500,11 @@ async def api_docker_container_action(
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(
+        res = await asyncio.to_thread(
             main.docker_manager.execute_container_action, id, payload.action
         )
+        await _broadcast_module("docker_full")
+        return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1613,6 +1772,7 @@ async def api_docker_prune_volumes(
             actor=_user,
             severity="info",
         )
+        await _broadcast_module("docker_full")
         return res
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1652,6 +1812,7 @@ async def api_docker_remove_volume(
             actor=_user,
             severity="info",
         )
+        await _broadcast_module("docker_full")
         return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1671,7 +1832,9 @@ async def api_docker_remove_network(
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(main.docker_manager.remove_network, id)
+        res = await asyncio.to_thread(main.docker_manager.remove_network, id)
+        await _broadcast_module("docker_full")
+        return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -1785,7 +1948,7 @@ def api_services(_user: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @app.post("/api/services/{service_name}/action")
-def api_service_action(
+async def api_service_action(
     service_name: str,
     payload: ServiceActionRequest,
     _user: str = Depends(require_auth),
@@ -1799,6 +1962,7 @@ def api_service_action(
             severity="info",
             metadata={"service": res["service"], "action": res["action"]},
         )
+        await _broadcast_module("services")
         return res
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2304,6 +2468,7 @@ async def api_create_probe(
     )
 
     enriched = main.get_sentinel_probe_enriched(probe["id"])
+    await _broadcast_module("probes")
     return enriched or probe
 
 
@@ -2319,7 +2484,7 @@ def api_get_probe(
 
 
 @app.put("/api/probes/{probe_id}")
-def api_update_probe(
+async def api_update_probe(
     probe_id: int,
     payload: ProbeUpdateRequest,
     _user: str = Depends(require_auth),
@@ -2359,11 +2524,12 @@ def api_update_probe(
         metadata={"probe_id": probe_id, "updated_fields": list(updates.keys())},
     )
     enriched = main.get_sentinel_probe_enriched(probe_id)
+    await _broadcast_module("probes")
     return enriched or (updated or existing)
 
 
 @app.delete("/api/probes/{probe_id}")
-def api_delete_probe(
+async def api_delete_probe(
     probe_id: int,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2378,6 +2544,7 @@ def api_delete_probe(
         actor=_user,
         metadata={"probe_id": probe_id, "name": probe["name"]},
     )
+    await _broadcast_module("probes")
     return {"ok": True, "message": f"Probe {probe_id} deleted successfully."}
 
 
@@ -2392,6 +2559,7 @@ async def api_test_probe(
 
     result = await main.execute_probe(probe)
     main.record_probe_check(probe_id, result)
+    await _broadcast_module("probes")
     return {
         "ok": result.get("status") in ("up", "degraded"),
         "result": result,
@@ -2660,7 +2828,7 @@ def api_configure_backup_dir(
 
 
 @app.post("/api/backups/run")
-def api_run_backup(
+async def api_run_backup(
     payload: BackupRunRequest,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2680,6 +2848,7 @@ def api_run_backup(
             retain_count=payload.retain_count,
             actor=actor,
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "archive": archive,
@@ -2695,7 +2864,7 @@ def api_run_backup(
 
 
 @app.post("/api/backups/targets")
-def api_save_backup_target(
+async def api_save_backup_target(
     payload: BackupTargetRequest,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2709,6 +2878,7 @@ def api_save_backup_target(
             payload.model_dump(),
             actor=actor,
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "target": target,
@@ -2726,7 +2896,7 @@ def api_save_backup_target(
 
 
 @app.delete("/api/backups/targets/{target_id}")
-def api_delete_backup_target(
+async def api_delete_backup_target(
     target_id: int,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2736,7 +2906,9 @@ def api_delete_backup_target(
         else (str(_user) if _user else "admin")
     )
     try:
-        return main.delete_backup_target(target_id=target_id, actor=actor)
+        res = main.delete_backup_target(target_id=target_id, actor=actor)
+        await _broadcast_module("backups")
+        return res
     except ValueError as exc:
         if "not found" in str(exc).lower():
             raise HTTPException(status_code=404, detail=str(exc))
@@ -2775,7 +2947,7 @@ def api_download_backup_archive(
 
 
 @app.post("/api/backups/archives/{filename}/restore")
-def api_restore_backup_archive(
+async def api_restore_backup_archive(
     filename: str,
     payload: Optional[BackupRestoreRequest] = None,
     _user: str = Depends(require_auth),
@@ -2794,6 +2966,7 @@ def api_restore_backup_archive(
             destination_path=dest_path,
             actor=actor,
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "result": res,
@@ -2815,7 +2988,7 @@ def api_restore_backup_archive(
 
 
 @app.delete("/api/backups/archives/{filename}")
-def api_delete_backup_archive(
+async def api_delete_backup_archive(
     filename: str,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2825,7 +2998,9 @@ def api_delete_backup_archive(
         else (str(_user) if _user else "admin")
     )
     try:
-        return main.delete_backup_archive(filename=filename, actor=actor)
+        res = main.delete_backup_archive(filename=filename, actor=actor)
+        await _broadcast_module("backups")
+        return res
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
@@ -2854,7 +3029,7 @@ def api_get_cron_jobs(_user: str = Depends(require_auth)) -> dict[str, Any]:
 
 
 @app.post("/api/cron/jobs")
-def api_save_cron_job(
+async def api_save_cron_job(
     payload: CronJobRequest,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2868,6 +3043,7 @@ def api_save_cron_job(
             payload.model_dump(),
             actor=actor,
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "job": job,
@@ -2885,7 +3061,7 @@ def api_save_cron_job(
 
 
 @app.put("/api/cron/jobs/{job_id}")
-def api_update_cron_job(
+async def api_update_cron_job(
     job_id: int,
     payload: CronJobRequest,
     _user: str = Depends(require_auth),
@@ -2902,6 +3078,7 @@ def api_update_cron_job(
             data,
             actor=actor,
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "job": job,
@@ -2919,7 +3096,7 @@ def api_update_cron_job(
 
 
 @app.post("/api/cron/jobs/{job_id}/toggle")
-def api_toggle_cron_job(
+async def api_toggle_cron_job(
     job_id: int,
     payload: Optional[CronJobToggleRequest] = None,
     _user: str = Depends(require_auth),
@@ -2932,6 +3109,7 @@ def api_toggle_cron_job(
     enabled = payload.enabled if payload is not None else None
     try:
         job = main.toggle_cron_job(job_id=job_id, enabled=enabled, actor=actor)
+        await _broadcast_module("backups")
         return {
             "success": True,
             "job": job,
@@ -2947,7 +3125,7 @@ def api_toggle_cron_job(
 
 
 @app.post("/api/cron/jobs/{job_id}/run")
-def api_run_cron_job_now(
+async def api_run_cron_job_now(
     job_id: int,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2960,6 +3138,7 @@ def api_run_cron_job_now(
         run = main.run_cron_job_now(
             job_id=job_id, trigger_source="manual", actor=actor
         )
+        await _broadcast_module("backups")
         return {
             "success": True,
             "run": run,
@@ -2975,7 +3154,7 @@ def api_run_cron_job_now(
 
 
 @app.delete("/api/cron/jobs/{job_id}")
-def api_delete_cron_job(
+async def api_delete_cron_job(
     job_id: int,
     _user: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2985,7 +3164,9 @@ def api_delete_cron_job(
         else (str(_user) if _user else "admin")
     )
     try:
-        return main.delete_cron_job(job_id=job_id, actor=actor)
+        res = main.delete_cron_job(job_id=job_id, actor=actor)
+        await _broadcast_module("backups")
+        return res
     except ValueError as exc:
         if "not found" in str(exc).lower():
             raise HTTPException(status_code=404, detail=str(exc))
