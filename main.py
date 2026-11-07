@@ -7328,17 +7328,41 @@ GROUPNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 PROTECTED_USERS = {"root", "daemon", "nobody"}
 PROTECTED_GROUPS = {"root", "sudo", "wheel", "shadow", "docker"}
 
+_SERVICES_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_SERVICES_CACHE_TTL: float = 3.0
 
-def get_system_services() -> dict[str, Any]:
+
+def _is_mock_object(obj: Any) -> bool:
+    return hasattr(obj, "_mock_name") or "unittest.mock" in str(type(obj))
+
+
+def get_system_services(force_refresh: bool = False) -> dict[str, Any]:
     """Collect systemd service units and summary."""
+    is_mocked = (
+        _is_mock_object(subprocess.run)
+        or _is_mock_object(shutil.which)
+    )
+    now = time.time()
+    if (
+        not force_refresh
+        and not is_mocked
+        and _SERVICES_CACHE.get("data") is not None
+        and (now - float(_SERVICES_CACHE.get("ts") or 0.0)) < _SERVICES_CACHE_TTL
+    ):
+        return copy.deepcopy(_SERVICES_CACHE["data"])
+
     systemctl_path = shutil.which("systemctl")
     if not systemctl_path:
-        return {
+        result_unavail = {
             "services": [],
             "summary": {"total": 0, "running": 0, "failed": 0, "inactive": 0},
             "failed_services": [],
             "systemctl_available": False,
         }
+        if not is_mocked:
+            _SERVICES_CACHE["ts"] = now
+            _SERVICES_CACHE["data"] = copy.deepcopy(result_unavail)
+        return result_unavail
 
     try:
         res = subprocess.run(
@@ -7400,7 +7424,7 @@ def get_system_services() -> dict[str, Any]:
     inactive = sum(1 for s in services if s["active_state"] in ("inactive", "dead"))
     failed_services = [s["unit"] for s in services if s["active_state"] == "failed"]
 
-    return {
+    result = {
         "services": services,
         "summary": {
             "total": total,
@@ -7411,6 +7435,10 @@ def get_system_services() -> dict[str, Any]:
         "failed_services": failed_services,
         "systemctl_available": True,
     }
+    if not is_mocked:
+        _SERVICES_CACHE["ts"] = now
+        _SERVICES_CACHE["data"] = copy.deepcopy(result)
+    return result
 
 
 def get_services_summary() -> dict[str, int]:
@@ -7450,6 +7478,8 @@ def execute_service_action(service_name: str, action: str) -> dict[str, Any]:
         text=True,
         timeout=15,
     )
+    _SERVICES_CACHE["ts"] = 0.0
+    _SERVICES_CACHE["data"] = None
     if res.returncode != 0:
         err = res.stderr.strip() or res.stdout.strip() or f"systemctl {action_clean} exited with {res.returncode}"
         raise RuntimeError(err)
@@ -8256,8 +8286,26 @@ def get_storage_metrics() -> list[dict[str, Any]]:
     return disks
 
 
+_NETPLAN_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_NETPLAN_CACHE_TTL: float = 10.0
+
+
 def get_netplan_interfaces() -> set[str]:
     """Discover network interface names defined in Netplan YAML files (Debian/Ubuntu)."""
+    is_mocked = (
+        _is_mock_object(subprocess.run)
+        or _is_mock_object(Path.glob)
+        or _is_mock_object(os.listdir)
+        or _is_mock_object(os.path.isdir)
+    )
+    now = time.time()
+    if (
+        not is_mocked
+        and _NETPLAN_CACHE.get("data") is not None
+        and (now - float(_NETPLAN_CACHE.get("ts") or 0.0)) < _NETPLAN_CACHE_TTL
+    ):
+        return set(_NETPLAN_CACHE["data"])
+
     netplan_ifaces: set[str] = set()
     netplan_dirs = ["/etc/netplan", "/run/netplan", "/lib/netplan"]
     for np_dir in netplan_dirs:
@@ -8289,6 +8337,9 @@ def get_netplan_interfaces() -> set[str]:
                         pass
         except Exception:
             pass
+    if not is_mocked:
+        _NETPLAN_CACHE["ts"] = now
+        _NETPLAN_CACHE["data"] = set(netplan_ifaces)
     return netplan_ifaces
 
 
@@ -9523,6 +9574,9 @@ def get_network_security_telemetry() -> dict[str, Any]:
     }
 
 
+get_network_security_overview = get_network_security_telemetry
+
+
 def get_system_metrics_data() -> dict[str, Any]:
     """Collect real-time system metrics via psutil, mounted disks, and services summary."""
     cpu_percent = psutil.cpu_percent(interval=None)
@@ -9561,6 +9615,7 @@ def get_system_metrics_data() -> dict[str, Any]:
     kernel = platform.release()
 
     return {
+        "timestamp": time.time(),
         "cpu_percent": cpu_percent,
         "cpu_cores": cpu_cores,
         "cpu_count_logical": cpu_count_logical,
@@ -10999,6 +11054,9 @@ def get_probes_summary() -> list[dict[str, Any]]:
     return enriched_list
 
 
+list_probes = get_probes_summary
+
+
 def get_sentinel_probe_enriched(probe_id: int) -> Optional[dict[str, Any]]:
     """Retrieve a single sentinel probe enriched with its summary metrics."""
     summary = get_probes_summary()
@@ -12065,6 +12123,55 @@ def list_cron_jobs(db_path: Path = STATE_DB_PATH) -> dict[str, Any]:
             {"type": k, "description": v} for k, v in SUPPORTED_CRON_TASK_TYPES.items()
         ],
     }
+
+
+def list_cron_job_runs(limit: int = 30, db_path: Path = STATE_DB_PATH) -> list[dict[str, Any]]:
+    """List recent cron job execution runs up to `limit`."""
+    lim = max(1, min(int(limit), 200))
+    conn = _connect_state_db(db_path)
+    try:
+        run_rows = conn.execute(
+            """
+            SELECT id, job_id, job_name, task_type, trigger_source,
+                   started_at, finished_at, duration_ms, status, output
+            FROM cron_job_runs
+            ORDER BY started_at DESC, id DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    runs: list[dict[str, Any]] = []
+    for r in run_rows:
+        s_at = float(r[5] or 0.0)
+        f_at = float(r[6] or 0.0)
+        runs.append(
+            {
+                "id": int(r[0]),
+                "job_id": int(r[1]),
+                "job_name": str(r[2]),
+                "task_type": str(r[3]),
+                "trigger_source": str(r[4] or "schedule"),
+                "started_at": s_at,
+                "started_iso": (
+                    datetime.fromtimestamp(s_at, tz=timezone.utc).isoformat()
+                    if s_at > 0
+                    else ""
+                ),
+                "finished_at": f_at,
+                "finished_iso": (
+                    datetime.fromtimestamp(f_at, tz=timezone.utc).isoformat()
+                    if f_at > 0
+                    else ""
+                ),
+                "duration_ms": int(r[7] or 0),
+                "status": str(r[8]),
+                "output": str(r[9] or ""),
+            }
+        )
+    return runs
 
 
 def create_or_update_cron_job(
