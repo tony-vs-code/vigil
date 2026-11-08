@@ -11,6 +11,10 @@
   <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
   <link rel="stylesheet" href="/static/styles.css?v=0.5.0" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/ace.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/mode-yaml.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/mode-sh.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.36.2/theme-one_dark.min.js" defer></script>
 </head>
 <body>
   <!-- Dedicated Full-Page Login View (#view-login) -->
@@ -3521,34 +3525,62 @@
             <div class="label-with-action">
               <label for="stack-yaml-input">docker-compose.yml</label>
               <div class="stack-editor-actions-inline">
+                <button id="stack-format-btn" type="button" class="btn-text-action" title="Format &amp; Beautify YAML (Ctrl+Shift+F)">✨ Format YAML</button>
                 <button id="stack-validate-btn" type="button" class="btn-text-action">Validate YAML</button>
                 <button id="stack-template-btn" type="button" class="btn-text-action">Insert Example</button>
               </div>
             </div>
-            <textarea
-              id="stack-yaml-input"
-              name="compose_yaml"
-              rows="14"
-              class="mono-textarea"
-              placeholder="services:&#10;  app:&#10;    image: nginx:alpine&#10;    ports:&#10;      - '8088:80'&#10;    restart: unless-stopped"
-              required
-              spellcheck="false"
-            ></textarea>
+            <div id="stack-snippet-toolbar" class="snippet-toolbar" role="toolbar" aria-label="Compose YAML Quick Snippets">
+              <span class="snippet-toolbar-label">Snippets:</span>
+              <button type="button" class="snippet-chip-btn" data-snippet="service">+ Service</button>
+              <button type="button" class="snippet-chip-btn" data-snippet="ports">+ Port</button>
+              <button type="button" class="snippet-chip-btn" data-snippet="volumes">+ Volume</button>
+              <button type="button" class="snippet-chip-btn" data-snippet="environment">+ Env</button>
+              <button type="button" class="snippet-chip-btn" data-snippet="healthcheck">+ Healthcheck</button>
+              <button type="button" class="snippet-chip-btn" data-snippet="network">+ Network</button>
+            </div>
+            <div id="stack-yaml-editor-wrapper" class="stack-editor-wrapper">
+              <div id="stack-yaml-ace-editor" class="ace-editor-container" aria-label="Compose YAML Code Editor"></div>
+              <textarea
+                id="stack-yaml-input"
+                name="compose_yaml"
+                rows="14"
+                class="mono-textarea"
+                placeholder="services:&#10;  app:&#10;    image: nginx:alpine&#10;    ports:&#10;      - '8088:80'&#10;    restart: unless-stopped"
+                required
+                spellcheck="false"
+              ></textarea>
+            </div>
+            <div id="stack-editor-statusbar" class="editor-statusbar" aria-live="polite">
+              <span id="stack-editor-cursor-pos" class="statusbar-item">Ln 1, Col 1</span>
+              <span class="statusbar-sep">•</span>
+              <span id="stack-editor-indent-info" class="statusbar-item">Spaces: 2</span>
+              <span class="statusbar-sep">•</span>
+              <span id="stack-editor-mode-info" class="statusbar-item">UTF-8 / YAML</span>
+            </div>
             <div id="stack-validation-status" class="validation-status-box hidden"></div>
           </div>
         </div>
 
         <div id="editor-tab-panel-env" class="editor-tab-panel hidden">
           <div class="form-group">
-            <label for="stack-env-input">.env Variables</label>
-            <textarea
-              id="stack-env-input"
-              name="env_content"
-              rows="14"
-              class="mono-textarea"
-              placeholder="KEY=VALUE&#10;PORT=8080"
-              spellcheck="false"
-            ></textarea>
+            <div class="label-with-action">
+              <label for="stack-env-input">.env Variables</label>
+              <div class="stack-editor-actions-inline">
+                <button id="stack-env-format-btn" type="button" class="btn-text-action" title="Format .env Variables">✨ Format .env</button>
+              </div>
+            </div>
+            <div id="stack-env-editor-wrapper" class="stack-editor-wrapper">
+              <div id="stack-env-ace-editor" class="ace-editor-container" aria-label="Environment Variables Code Editor"></div>
+              <textarea
+                id="stack-env-input"
+                name="env_content"
+                rows="14"
+                class="mono-textarea"
+                placeholder="KEY=VALUE&#10;PORT=8080"
+                spellcheck="false"
+              ></textarea>
+            </div>
             <small class="form-hint">These environment variables will be saved as <code>.env</code> in the stack directory and used during Compose deployments.</small>
           </div>
         </div>

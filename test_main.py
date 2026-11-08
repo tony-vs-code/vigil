@@ -2903,6 +2903,7 @@ class TestDockerBackend(unittest.TestCase):
             ("GET", "/api/docker/volumes/testvol"),
             ("GET", "/api/docker/templates"),
             ("POST", "/api/docker/stacks/validate"),
+            ("POST", "/api/docker/stacks/format"),
         ]
         for method, path in endpoints:
             resp = asgi_request(api.app, method, path)
@@ -4808,6 +4809,89 @@ class TestDockerBackend(unittest.TestCase):
         bad_data = resp_bad.json()
         self.assertFalse(bad_data.get("valid"))
         self.assertGreater(len(bad_data.get("errors", [])), 0)
+        self.assertIsInstance(bad_data.get("error_line"), int)
+        self.assertIsInstance(bad_data.get("error_col"), int)
+        self.assertGreaterEqual(bad_data.get("error_line"), 1)
+        self.assertGreaterEqual(bad_data.get("error_col"), 1)
+
+    def test_docker_stack_format_endpoint_and_canonical_ordering(self):
+        """Verifies POST /api/docker/stacks/format canonically orders YAML keys, normalizes tabs, and formats .env content."""
+        unauth_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/format",
+            json_body={"compose_yaml": "services:\n  app:\n    image: nginx\n"},
+        )
+        self.assertEqual(unauth_resp.status_code, 401)
+
+        unformatted_yaml = (
+            "volumes:\n"
+            "\tdb_data:   \n"
+            "x-custom:\n"
+            "  foo: bar\n"
+            "services:\n"
+            "\tweb:  \n"
+            "\t\tports:\n"
+            "\t\t\t- '8080:80'\n"
+            "\t\tcustom_opt: true\n"
+            "\t\trestart: unless-stopped\n"
+            "\t\tcontainer_name: my_web\n"
+            "\t\timage: nginx:alpine   \n"
+            "version: '3.8'\n"
+        )
+        raw_env = "  DB_USER = postgres  \r\n# Database secret  \r\n\r\n\r\n\r\n  DB_PASS=secret123   \r\n"
+
+        resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/format",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": unformatted_yaml, "env_content": raw_env},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data.get("valid"))
+        formatted_yaml = data.get("formatted_yaml", "")
+        self.assertNotIn("\t", formatted_yaml)
+        # Top-level key order: version -> services -> volumes -> x-custom
+        self.assertLess(formatted_yaml.index("version:"), formatted_yaml.index("services:"))
+        self.assertLess(formatted_yaml.index("services:"), formatted_yaml.index("volumes:"))
+        self.assertLess(formatted_yaml.index("volumes:"), formatted_yaml.index("x-custom:"))
+        # Service key order: image -> container_name -> restart -> ports -> custom_opt
+        self.assertLess(formatted_yaml.index("image:"), formatted_yaml.index("container_name:"))
+        self.assertLess(formatted_yaml.index("container_name:"), formatted_yaml.index("restart:"))
+        self.assertLess(formatted_yaml.index("restart:"), formatted_yaml.index("ports:"))
+        self.assertLess(formatted_yaml.index("ports:"), formatted_yaml.index("custom_opt:"))
+
+        formatted_env = data.get("formatted_env", "")
+        self.assertEqual(formatted_env, "DB_USER=postgres\n# Database secret\n\nDB_PASS=secret123\n")
+        self.assertIn("web", data.get("services", []))
+        self.assertIn("8080:80", data.get("ports", []))
+        self.assertIn("db_data", data.get("volumes", []))
+
+        # Empty compose_yaml with env_content provided
+        env_only_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/format",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": "   ", "env_content": "  FOO=bar  \r\n"},
+        )
+        self.assertEqual(env_only_resp.status_code, 200)
+        env_only_data = env_only_resp.json()
+        self.assertTrue(env_only_data.get("valid"))
+        self.assertEqual(env_only_data.get("formatted_yaml"), "")
+        self.assertEqual(env_only_data.get("formatted_env"), "FOO=bar\n")
+
+        # Invalid YAML returns valid: False with error_line and error_col
+        invalid_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/format",
+            cookies=self.auth_cookies,
+            json_body={"compose_yaml": "services:\n  app:\n    ports: [unclosed"},
+        )
+        self.assertEqual(invalid_resp.status_code, 200)
+        invalid_data = invalid_resp.json()
+        self.assertFalse(invalid_data.get("valid"))
+        self.assertIsInstance(invalid_data.get("error_line"), int)
+        self.assertIsInstance(invalid_data.get("error_col"), int)
 
         missing_services_yaml = "version: '3.8'\nnetworks:\n  default:\n"
         resp_missing = asgi_post(
