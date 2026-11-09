@@ -3656,23 +3656,79 @@
         <div id="editor-tab-panel-env" class="editor-tab-panel hidden">
           <div class="form-group">
             <div class="label-with-action">
-              <label for="stack-env-input">.env Variables</label>
+              <div class="stack-env-mode-switch-group">
+                <label>Environment Variables</label>
+                <div class="env-mode-pill-toggle" role="tablist" aria-label="Environment Variable Mode">
+                  <button type="button" id="stack-env-mode-kv-btn" class="env-mode-btn active" role="tab" aria-selected="true" title="Portainer-style visual Key-Value table">📋 Key-Value</button>
+                  <button type="button" id="stack-env-mode-raw-btn" class="env-mode-btn" role="tab" aria-selected="false" title="Advanced raw text editor">💻 Raw / Advanced</button>
+                </div>
+              </div>
               <div class="stack-editor-actions-inline">
+                <input type="file" id="stack-env-file-input" class="hidden" accept=".env,text/plain" />
+                <button id="stack-env-import-btn" type="button" class="btn-text-action" title="Import variables from a local .env file">📁 Import .env</button>
+                <button id="stack-env-export-btn" type="button" class="btn-text-action" title="Download variables as a .env file">💾 Export .env</button>
+                <button id="stack-env-copy-btn" type="button" class="btn-text-action" title="Copy variables to clipboard">📋 Copy</button>
                 <button id="stack-env-format-btn" type="button" class="btn-text-action" title="Format .env Variables">✨ Format .env</button>
               </div>
             </div>
-            <div id="stack-env-editor-wrapper" class="stack-editor-wrapper">
-              <div id="stack-env-ace-editor" class="ace-editor-container" aria-label="Environment Variables Code Editor"></div>
-              <textarea
-                id="stack-env-input"
-                name="env_content"
-                rows="14"
-                class="mono-textarea"
-                placeholder="KEY=VALUE&#10;PORT=8080"
-                spellcheck="false"
-              ></textarea>
+
+            <!-- Visual Key-Value Grid Container (#stack-env-kv-container) -->
+            <div id="stack-env-kv-container" class="stack-env-kv-wrapper">
+              <div class="env-kv-toolbar">
+                <div class="search-box env-search-box">
+                  <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <input id="stack-env-search" type="search" placeholder="Filter variables by name or value..." aria-label="Filter Environment Variables" />
+                </div>
+                <div class="env-kv-stats">
+                  <span id="stack-env-count-badge" class="pill-counter">0 variables</span>
+                </div>
+              </div>
+
+              <div class="env-kv-table-wrapper">
+                <table class="data-table env-kv-table" id="stack-env-kv-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 42%;">Name / Key</th>
+                      <th style="width: 48%;">Value</th>
+                      <th style="width: 10%; text-align: right;">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="stack-env-kv-tbody">
+                    <!-- Dynamically populated rows -->
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="env-kv-actions-bottom">
+                <button type="button" id="stack-env-add-var-btn" class="btn-secondary btn-sm" title="Add another environment variable row">
+                  <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                  <span>Add Variable</span>
+                </button>
+              </div>
             </div>
-            <small class="form-hint">These environment variables will be saved as <code>.env</code> in the stack directory and used during Compose deployments.</small>
+
+            <!-- Raw Code Editor Container (#stack-env-raw-container) -->
+            <div id="stack-env-raw-container" class="stack-env-raw-wrapper hidden">
+              <div id="stack-env-editor-wrapper" class="stack-editor-wrapper">
+                <div id="stack-env-ace-editor" class="ace-editor-container" aria-label="Environment Variables Code Editor"></div>
+                <textarea
+                  id="stack-env-input"
+                  name="env_content"
+                  rows="14"
+                  class="mono-textarea"
+                  placeholder="KEY=VALUE&#10;PORT=8080"
+                  spellcheck="false"
+                ></textarea>
+              </div>
+            </div>
+
+            <small class="form-hint">These environment variables are saved as <code>.env</code> in the stack directory and automatically loaded during Compose deployments.</small>
           </div>
         </div>
 

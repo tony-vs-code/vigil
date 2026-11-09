@@ -2,6 +2,7 @@
   --bg-body: #0b0f19;
   --bg-card: #131b2e;
   --bg-card-elevated: #19233c;
+  --bg-tertiary: #19233c;
   --bg-table-row-hover: #1d2946;
   --border-subtle: #243252;
   --text-primary: #f1f5f9;
@@ -4438,6 +4439,196 @@ hr.overview-flow-divider {
 .stack-editor-actions-inline {
   display: flex;
   gap: 8px;
+}
+
+/* Portainer-Style Environment Variable Manager */
+.stack-env-mode-switch-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.env-mode-pill-toggle {
+  display: inline-flex;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+
+.env-mode-btn {
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 0.76rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.env-mode-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.env-mode-btn.active {
+  background: var(--accent-primary);
+  color: #0b0f19;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.stack-env-kv-wrapper {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+.env-kv-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-card-elevated);
+  border-bottom: 1px solid var(--border-subtle);
+  gap: 12px;
+}
+
+.env-search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-body);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  flex: 1;
+  max-width: 320px;
+}
+
+.env-search-box svg {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.env-search-box input {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-size: 0.8rem;
+  width: 100%;
+}
+
+.env-search-box input::placeholder {
+  color: var(--text-muted);
+}
+
+.env-kv-table-wrapper {
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.env-kv-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.env-kv-table th {
+  background: var(--bg-card-elevated);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  text-align: left;
+}
+
+.env-kv-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
+}
+
+.env-kv-table tbody tr:hover {
+  background: var(--bg-table-row-hover);
+}
+
+.env-kv-key-input,
+.env-kv-val-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-body);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  padding: 6px 10px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.env-kv-key-input:focus,
+.env-kv-val-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.env-val-input-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+}
+
+.env-val-input-group .env-kv-val-input {
+  flex: 1;
+}
+
+.btn-toggle-secret {
+  flex-shrink: 0;
+  padding: 5px 8px;
+}
+
+.btn-remove-var {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 0.88rem;
+  transition: all 0.15s ease;
+}
+
+.btn-remove-var:hover {
+  color: var(--state-failed);
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.env-kv-actions-bottom {
+  padding: 10px 12px;
+  background: var(--bg-card-elevated);
+  border-top: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.stack-env-raw-wrapper {
+  margin-top: 8px;
+  margin-bottom: 8px;
 }
 
 /* Stack Validation Status Box */

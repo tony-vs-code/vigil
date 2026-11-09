@@ -271,6 +271,14 @@ class StackFormatRequest(BaseModel):
     env_content: Optional[str] = None
 
 
+class EnvParseRequest(BaseModel):
+    env_content: str = ""
+
+
+class EnvSerializeRequest(BaseModel):
+    variables: list[dict[str, Any]] = []
+
+
 class StackActionRequest(BaseModel):
     action: str
 
@@ -1418,6 +1426,22 @@ async def api_docker_format_stack(
         payload.env_content,
     )
     return result
+
+
+@app.post("/api/docker/stacks/env/parse")
+async def api_docker_parse_env(
+    req: EnvParseRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {"variables": main.docker_manager.parse_env_key_values(req.env_content)}
+
+
+@app.post("/api/docker/stacks/env/serialize")
+async def api_docker_serialize_env(
+    req: EnvSerializeRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    return {"env_content": main.docker_manager.serialize_env_key_values(req.variables)}
 
 
 @app.get("/api/docker/stacks")

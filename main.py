@@ -5987,6 +5987,54 @@ class DockerManager:
             formatted_lines.pop()
         return "\n".join(formatted_lines) + "\n" if formatted_lines else ""
 
+    def parse_env_key_values(self, env_content: str) -> list[dict[str, str]]:
+        """Parses .env formatted string into a list of key-value dicts."""
+        if not env_content:
+            return []
+        normalized = str(env_content).replace("\r\n", "\n").replace("\r", "\n")
+        parsed: list[dict[str, str]] = []
+        for raw_line in normalized.split("\n"):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("export "):
+                stripped = stripped[7:].strip()
+            if "=" not in stripped:
+                continue
+            key, val = stripped.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            val = val.strip()
+            if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+                val = val[1:-1].replace(r'\"', '"')
+            elif len(val) >= 2 and val.startswith("'") and val.endswith("'"):
+                val = val[1:-1].replace(r"\'", "'")
+            parsed.append({"name": key, "value": val})
+        return parsed
+
+    def serialize_env_key_values(self, variables: list[dict[str, Any]]) -> str:
+        """Serializes a list of key-value dicts into .env formatted string."""
+        if not variables:
+            return ""
+        lines: list[str] = []
+        for item in variables:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            raw_val = item.get("value")
+            val = str(raw_val) if raw_val is not None else ""
+            if any(ch in val for ch in (" ", "\t", "\n", "\r", "#")):
+                escaped = val.replace('"', '\\"')
+                lines.append(f'{name}="{escaped}"')
+            else:
+                lines.append(f"{name}={val}")
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n"
+
     def format_compose_yaml(
         self, compose_yaml: str, env_content: Optional[str] = None
     ) -> dict[str, Any]:

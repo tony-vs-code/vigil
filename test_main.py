@@ -2904,6 +2904,8 @@ class TestDockerBackend(unittest.TestCase):
             ("GET", "/api/docker/templates"),
             ("POST", "/api/docker/stacks/validate"),
             ("POST", "/api/docker/stacks/format"),
+            ("POST", "/api/docker/stacks/env/parse"),
+            ("POST", "/api/docker/stacks/env/serialize"),
         ]
         for method, path in endpoints:
             resp = asgi_request(api.app, method, path)
@@ -5015,6 +5017,160 @@ class TestDockerBackend(unittest.TestCase):
                 self.assertEqual(row[0], "old_stack")
                 self.assertEqual(row[1], "")
                 m_conn.close()
+
+    def test_docker_stack_env_parse_and_serialize(self):
+        """Verifies parsing and serializing of environment variables for Portainer-style env manager."""
+        # --- parse_env_key_values tests ---
+        # 1. Empty and whitespace
+        self.assertEqual(main.docker_manager.parse_env_key_values(""), [])
+        self.assertEqual(main.docker_manager.parse_env_key_values("   \n\n  "), [])
+
+        # 2. Comments and empty lines
+        comment_env = "# Leading comment\n\n# Second comment\n"
+        self.assertEqual(main.docker_manager.parse_env_key_values(comment_env), [])
+
+        # 3. Unquoted values, spaced keys, values with '='
+        raw_env = (
+            "# Main configuration\n"
+            "APP_ENV=production\n"
+            "   PORT   =   8080   \n"
+            "DEBUG = false\n"
+            "DATABASE_URL=postgres://user:pass@db:5432/mydb?sslmode=disable&timeout=30\n"
+            "export CACHE_HOST=redis://cache:6379\n"
+            "# Quoted strings\n"
+            'DOUBLE_QUOTED="hello world"\n'
+            "SINGLE_QUOTED='single quote text'\n"
+            'WITH_ESCAPED="contains \\"quotes\\" properly"\n'
+            "WITH_HASH=\"secret#token\"\n"
+            "EMPTY_VAR=\n"
+            'EMPTY_QUOTES=""\n'
+            "INVALID_NO_EQUALS\n"
+            "=NO_KEY\n"
+        )
+        parsed = main.docker_manager.parse_env_key_values(raw_env)
+        expected = [
+            {"name": "APP_ENV", "value": "production"},
+            {"name": "PORT", "value": "8080"},
+            {"name": "DEBUG", "value": "false"},
+            {"name": "DATABASE_URL", "value": "postgres://user:pass@db:5432/mydb?sslmode=disable&timeout=30"},
+            {"name": "CACHE_HOST", "value": "redis://cache:6379"},
+            {"name": "DOUBLE_QUOTED", "value": "hello world"},
+            {"name": "SINGLE_QUOTED", "value": "single quote text"},
+            {"name": "WITH_ESCAPED", "value": 'contains "quotes" properly'},
+            {"name": "WITH_HASH", "value": "secret#token"},
+            {"name": "EMPTY_VAR", "value": ""},
+            {"name": "EMPTY_QUOTES", "value": ""},
+        ]
+        self.assertEqual(parsed, expected)
+
+        # Single quote escape
+        single_escape = "MSG='it\\'s fine'\n"
+        self.assertEqual(
+            main.docker_manager.parse_env_key_values(single_escape),
+            [{"name": "MSG", "value": "it's fine"}],
+        )
+
+        # --- serialize_env_key_values tests ---
+        # 1. Empty input
+        self.assertEqual(main.docker_manager.serialize_env_key_values([]), "")
+        self.assertEqual(main.docker_manager.serialize_env_key_values(None), "")
+
+        # 2. Normal values
+        normal_vars = [
+            {"name": "PORT", "value": "8080"},
+            {"name": "DATABASE_URL", "value": "postgres://user:pass@db:5432/mydb?ssl=true"},
+            {"name": "EMPTY_VAL", "value": ""},
+            {"name": "NUMERIC", "value": 100},
+        ]
+        self.assertEqual(
+            main.docker_manager.serialize_env_key_values(normal_vars),
+            "PORT=8080\nDATABASE_URL=postgres://user:pass@db:5432/mydb?ssl=true\nEMPTY_VAL=\nNUMERIC=100\n",
+        )
+
+        # 3. Values needing quotes (spaces, newlines, #, internal quotes)
+        quote_vars = [
+            {"name": "SPACED", "value": "hello world"},
+            {"name": "HASH_VAL", "value": "my#secret"},
+            {"name": "NEWLINE_VAL", "value": "line1\nline2"},
+            {"name": "QUOTE_VAL", "value": 'say "hello"'},
+        ]
+        serialized_quotes = main.docker_manager.serialize_env_key_values(quote_vars)
+        self.assertEqual(
+            serialized_quotes,
+            'SPACED="hello world"\nHASH_VAL="my#secret"\nNEWLINE_VAL="line1\nline2"\nQUOTE_VAL="say \\"hello\\""\n',
+        )
+
+        # 4. Empty and normalized keys
+        dirty_keys = [
+            {"name": "", "value": "skipped"},
+            {"name": "   ", "value": "skipped"},
+            {"name": "  TRIMMED  ", "value": "trimmed_value"},
+        ]
+        self.assertEqual(
+            main.docker_manager.serialize_env_key_values(dirty_keys),
+            "TRIMMED=trimmed_value\n",
+        )
+
+        # --- API Endpoint tests ---
+        # POST /api/docker/stacks/env/parse (401 unauthenticated)
+        unauth_parse = asgi_post(api.app, "/api/docker/stacks/env/parse", json_body={"env_content": "A=B"})
+        self.assertEqual(unauth_parse.status_code, 401)
+
+        # POST /api/docker/stacks/env/parse (200 authenticated)
+        auth_parse = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/parse",
+            cookies=self.auth_cookies,
+            json_body={"env_content": "# Note\nKEY1=value1\nKEY2=\"spaced value\"\n"},
+        )
+        self.assertEqual(auth_parse.status_code, 200)
+        self.assertEqual(
+            auth_parse.json(),
+            {"variables": [{"name": "KEY1", "value": "value1"}, {"name": "KEY2", "value": "spaced value"}]},
+        )
+
+        # POST /api/docker/stacks/env/parse with empty body
+        empty_parse = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/parse",
+            cookies=self.auth_cookies,
+            json_body={},
+        )
+        self.assertEqual(empty_parse.status_code, 200)
+        self.assertEqual(empty_parse.json(), {"variables": []})
+
+        # POST /api/docker/stacks/env/serialize (401 unauthenticated)
+        unauth_ser = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/serialize",
+            json_body={"variables": [{"name": "A", "value": "B"}]},
+        )
+        self.assertEqual(unauth_ser.status_code, 401)
+
+        # POST /api/docker/stacks/env/serialize (200 authenticated)
+        auth_ser = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/serialize",
+            cookies=self.auth_cookies,
+            json_body={
+                "variables": [
+                    {"name": "PORT", "value": "8080"},
+                    {"name": "MSG", "value": "hello world"},
+                ]
+            },
+        )
+        self.assertEqual(auth_ser.status_code, 200)
+        self.assertEqual(auth_ser.json(), {"env_content": 'PORT=8080\nMSG="hello world"\n'})
+
+        # POST /api/docker/stacks/env/serialize with empty body
+        empty_ser = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/serialize",
+            cookies=self.auth_cookies,
+            json_body={},
+        )
+        self.assertEqual(empty_ser.status_code, 200)
+        self.assertEqual(empty_ser.json(), {"env_content": ""})
 
 
 class DirectSystemStreamsTests(unittest.TestCase):
