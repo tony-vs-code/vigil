@@ -2,6 +2,17 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.42] - 2026-11-09
+### Added
+- **Visual Progress Bar Chart Generator**: Built `generate_telemetry_chart_url` constructing high-resolution QuickChart horizontal bar meters for CPU, Memory, Data Pool, and Root Disk with exact used and total capacity labels (`6.7/16 GB`, `8.4/16 TB`, `42/250 GB`).
+- **Dynamic Threshold Color Mapping**: Configured progress bars to automatically adapt colors: `< 75%` Green (`#22c55e`), `75%–89%` Amber (`#f59e0b`), and `≥ 90%` Red (`#ef4444`).
+- **Discord Bot Embed Enhancements**: Upgraded `dict_to_discord_embed` to natively support `thumbnail` and `image` across all alert types and periodic digests.
+- **Dedicated Embed Styling Test Suite**: Added `tests/test_discord_embed_styling.py` with 19 comprehensive unit and integration tests.
+
+### Changed
+- **Icon-Free and Codeblock-Free Notification Formatting**: Upgraded periodic reports (`build_periodic_report_data`) and RAID alerts (`build_raid_embed`) from raw ASCII text dumps and codeblocks to clean typography-driven field cards, author header, and thumbnail.
+- **Eliminated Cluttered Emojis**: Removed noisy emoji clutter from notification embeds in favor of professional status indicators.
+
 ## [1.0.41] - 2026-11-09
 ## Overview
 Vigil v1.0.41 introduces an enhanced **Outbound Notification Delivery Log** and resolves key UI styling and layout constraints across the host observability suite. System administrators now have complete visibility into outbound alert dispatches—including trigger origins, target notification channels, summary payloads, and delivery outcomes—alongside smart deep links from scheduled notifications directly into the Cron Scheduler. In addition, critical UI components (destructive action buttons, socket/process search bars, and user management modals) have been polished for clean visual hierarchy across all display sizes.

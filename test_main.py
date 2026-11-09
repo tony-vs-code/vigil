@@ -7016,11 +7016,52 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
         self.assertEqual(main.format_bytes_human(4.5 * (1024**4)), "4.5 TB")
         self.assertEqual(main.format_bytes_human("bad"), "0 B")
 
+        # Capacity pair formatting
+        self.assertEqual(main._format_capacity_pair(6.7 * 1024**3, 16 * 1024**3), "6.7/16 GB")
+        self.assertEqual(main._format_capacity_pair(8.4 * 1024**4, 16 * 1024**4), "8.4/16 TB")
+        self.assertEqual(main._format_capacity_pair(42 * 1024**3, 250 * 1024**3), "42/250 GB")
+        self.assertEqual(main._format_capacity_pair(0, 0), "0 B / 0 B")
+
+    def test_generate_telemetry_chart_url_threshold_colors_and_schema(self):
+        url = main.generate_telemetry_chart_url(
+            cpu_pct=34.2,
+            ram_pct=78.5,
+            ram_label="6.7/16 GB",
+            pool_pct=92.1,
+            pool_label="8.4/16 TB",
+            root_pct=50.0,
+            root_label="42/250 GB",
+        )
+        self.assertTrue(url.startswith("https://quickchart.io/chart?bkg=%231e1f22"))
+        parsed = main.urlparse(url)
+        qs = main.urllib.parse.parse_qs(parsed.query)
+        self.assertEqual(qs["w"], ["540"])
+        self.assertEqual(qs["h"], ["160"])
+        self.assertEqual(qs["devicePixelRatio"], ["2.0"])
+        self.assertEqual(qs["bkg"], ["#1e1f22"])
+
+        config = json.loads(qs["c"][0])
+        self.assertEqual(config["type"], "horizontalBar")
+        self.assertEqual(config["options"]["legend"]["display"], False)
+        self.assertEqual(config["options"]["scales"]["xAxes"][0]["ticks"]["fontColor"], "#949ba4")
+        self.assertEqual(config["options"]["scales"]["yAxes"][0]["ticks"]["fontColor"], "#f2f3f5")
+
+        dataset = config["data"]["datasets"][0]
+        self.assertEqual(dataset["data"], [34.2, 78.5, 92.1, 50.0])
+        # Dynamic colors: 34.2% -> green, 78.5% -> amber, 92.1% -> red, 50.0% -> green
+        self.assertEqual(dataset["backgroundColor"], ["#22c55e", "#f59e0b", "#ef4444", "#22c55e"])
+
+        labels = config["data"]["labels"]
+        self.assertIn("CPU Usage (34.2%)", labels[0])
+        self.assertIn("Memory (78.5% - 6.7/16 GB)", labels[1])
+        self.assertIn("Data Pool (92.1% - 8.4/16 TB)", labels[2])
+        self.assertIn("Root Disk (50.0% - 42/250 GB)", labels[3])
+
     def test_dict_to_discord_embed_and_provider_delivery(self):
         # Verify alias
         self.assertIs(main.DiscordChannel, main.DiscordProvider)
 
-        # Build embed from dictionary with author, footer, timestamp, and fields
+        # Build embed from dictionary with author, footer, timestamp, thumbnail, image, and fields
         embed_dict = {
             "title": "Embed Title",
             "description": "Embed Description",
@@ -7029,6 +7070,12 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
                 "name": "Vigil System Monitor [myhost]",
                 "icon_url": "https://example.com/icon.png",
                 "url": "https://example.com",
+            },
+            "thumbnail": {
+                "url": "https://example.com/thumb.png",
+            },
+            "image": {
+                "url": "https://example.com/chart.png",
             },
             "footer": {
                 "text": "Vigil v0.9.6 • Linux • myhost",
@@ -7047,6 +7094,8 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
         self.assertEqual(embed.author.name, "Vigil System Monitor [myhost]")
         self.assertEqual(embed.author.icon_url, "https://example.com/icon.png")
         self.assertEqual(embed.author.url, "https://example.com")
+        self.assertEqual(embed.thumbnail.url, "https://example.com/thumb.png")
+        self.assertEqual(embed.image.url, "https://example.com/chart.png")
         self.assertEqual(embed.footer.text, "Vigil v0.9.6 • Linux • myhost")
         self.assertEqual(embed.footer.icon_url, "https://example.com/footer.png")
         self.assertIsNotNone(embed.timestamp)
@@ -7086,46 +7135,50 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
                 "raid_status": True,
             })
             self.assertIn("Periodic Report", title)
-            self.assertIn("🟢 All Systems Operational", desc)
+            self.assertIn("All Systems Operational", desc)
             self.assertEqual(embed_data["color"], 0x2ECC71)
             self.assertIn("vps-node-1", embed_data["author"]["name"])
+            self.assertIn("favicon.ico", embed_data["author"]["icon_url"])
+            self.assertIn("favicon.ico", embed_data["thumbnail"]["url"])
+            self.assertIn("quickchart.io", embed_data["image"]["url"])
             self.assertIn("vps-node-1", embed_data["footer"]["text"])
             self.assertIn("timestamp", embed_data)
 
-            # Check CPU field
+            # Check Host Environment field
             field_map = {f["name"]: f for f in embed_data["fields"]}
-            self.assertIn("System Status • CPU", field_map)
-            cpu_field = field_map["System Status • CPU"]
-            self.assertIn("▰▰▰▱▱▱▱▱▱▱", cpu_field["value"])
-            self.assertIn("34.2%", cpu_field["value"])
-            self.assertIn("4 cores", cpu_field["value"])
-            self.assertTrue(cpu_field["inline"])
+            self.assertIn("System Status • Host Environment", field_map)
+            host_field = field_map["System Status • Host Environment"]
+            self.assertIn("34.2%", host_field["value"])
+            self.assertIn("4 cores", host_field["value"])
+            self.assertIn("0.45, 0.38, 0.32", host_field["value"])
+            self.assertTrue(host_field["inline"])
 
-            # Check Memory field
-            self.assertIn("System Status • Memory", field_map)
-            mem_field = field_map["System Status • Memory"]
-            self.assertIn("▰▰▰▰▰▱▱▱▱▱", mem_field["value"])
-            self.assertIn("51.0%", mem_field["value"])
-            self.assertTrue(mem_field["inline"])
-
-            # Check Uptime & Load field
-            self.assertIn("System Status • Uptime & Load", field_map)
-            uptime_field = field_map["System Status • Uptime & Load"]
-            self.assertIn("Load: `0.45, 0.38, 0.32`", uptime_field["value"])
-            self.assertTrue(uptime_field["inline"])
-
-            # Check Disk Health
-            self.assertIn("Disk Health", field_map)
-            disk_field = field_map["Disk Health"]
+            # Check Storage Infrastructure field
+            self.assertIn("Disk Health • Storage Infrastructure", field_map)
+            disk_field = field_map["Disk Health • Storage Infrastructure"]
             self.assertIn("Root (/)", disk_field["value"])
             self.assertIn("42.0%", disk_field["value"])
+            self.assertTrue(disk_field["inline"])
 
-            # Check RAID Status
-            self.assertIn("RAID Status", field_map)
-            raid_field = field_map["RAID Status"]
-            self.assertIn("🟢 CLEAN", raid_field["value"])
+            # Check RAID field
+            self.assertIn("RAID Status • Array Infrastructure", field_map)
+            raid_field = field_map["RAID Status • Array Infrastructure"]
+            self.assertIn("CLEAN", raid_field["value"])
             self.assertIn("RAID 1", raid_field["value"])
-            self.assertIn("`2` active", raid_field["value"])
+            self.assertIn("2 active", raid_field["value"])
+
+            # Check Services & Monitoring field
+            self.assertIn("Services & Monitoring", field_map)
+            services_field = field_map["Services & Monitoring"]
+            self.assertIn("Docker:", services_field["value"])
+            self.assertIn("Sentinel:", services_field["value"])
+
+            # Verify zero codeblocks and zero emojis in fields
+            for f in embed_data["fields"]:
+                self.assertNotIn("`", f["value"])
+                self.assertNotIn("🟢", f["value"])
+                self.assertNotIn("🔴", f["value"])
+                self.assertNotIn("▰", f["value"])
 
         # Degraded status banner test
         with (
@@ -7137,7 +7190,7 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
                 "disk_health": True,
                 "raid_status": True,
             })
-            self.assertIn("🔴 Attention: RAID Array DEGRADED", desc_deg)
+            self.assertIn("Attention: RAID Array DEGRADED", desc_deg)
             self.assertEqual(embed_deg["color"], 0xEF4444)
 
     def test_modern_threshold_alert_embeds(self):
@@ -7194,14 +7247,24 @@ class DiscordNotificationFormattingTests(unittest.TestCase):
             self.assertEqual(embed.title, "RAID 1 | CLEAN")
             self.assertEqual(embed.color.value, 0x2ECC71)
             self.assertIn("Status", embed.description)
-            self.assertIn("🟢", embed.description)
+            self.assertIn("CLEAN", embed.description)
+            self.assertNotIn("`", embed.description)
+            self.assertNotIn("```", embed.description)
             self.assertIn("vps-node-1", embed.author.name)
+            self.assertIn("favicon.ico", embed.author.icon_url)
             self.assertIn("vps-node-1", embed.footer.text)
             self.assertIsNotNone(embed.timestamp)
+            self.assertIsNotNone(embed.thumbnail.url)
+            self.assertIn("favicon.ico", embed.thumbnail.url)
+            if embed.image and embed.image.url:
+                self.assertIn("quickchart.io", embed.image.url)
 
             field_names = [f.name for f in embed.fields]
             self.assertIn("Array Health", field_names)
             self.assertIn("Device Breakdown", field_names)
+            for f in embed.fields:
+                self.assertNotIn("`", f.value)
+                self.assertNotIn("🟢", f.value)
 
 
 class TestSystemServicesEndpoints(unittest.TestCase):

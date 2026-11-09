@@ -22,6 +22,7 @@ import threading
 import time
 import importlib.metadata
 import urllib.request
+import urllib.parse
 from urllib.parse import urlparse
 import aiohttp
 import discord
@@ -156,6 +157,129 @@ def format_bytes_human(bytes_val: int | float) -> str:
     return f"{val:.1f} PB"
 
 
+def _format_capacity_pair(used_bytes: int | float, total_bytes: int | float) -> str:
+    """Format used and total capacity into clean human-readable pair e.g. '6.7/16 GB' or '42/250 GB'."""
+    try:
+        u_val = float(used_bytes)
+        t_val = float(total_bytes)
+        if t_val <= 0:
+            return "0 B / 0 B"
+        for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+            if abs(t_val) < 1024.0 or unit == "PB":
+                u_str = (
+                    f"{u_val:.1f}".rstrip("0").rstrip(".")
+                    if unit in ["MB", "GB", "TB", "PB"]
+                    else f"{int(u_val)}"
+                )
+                t_str = (
+                    f"{t_val:.1f}".rstrip("0").rstrip(".")
+                    if unit in ["MB", "GB", "TB", "PB"]
+                    else f"{int(t_val)}"
+                )
+                return f"{u_str}/{t_str} {unit}"
+            u_val /= 1024.0
+            t_val /= 1024.0
+        return f"{format_bytes_human(used_bytes)} / {format_bytes_human(total_bytes)}"
+    except Exception:
+        return f"{format_bytes_human(used_bytes)} / {format_bytes_human(total_bytes)}"
+
+
+def _get_metric_bar_color(val: float) -> str:
+    """Dynamic progress bar hex color based on metric threshold."""
+    if val >= 90.0:
+        return "#ef4444"
+    if val >= 75.0:
+        return "#f59e0b"
+    return "#22c55e"
+
+
+def generate_telemetry_chart_url(
+    cpu_pct: float,
+    ram_pct: float,
+    ram_label: str,
+    pool_pct: float,
+    pool_label: str,
+    root_pct: float,
+    root_label: str,
+) -> str:
+    """Build a dark-themed QuickChart horizontal progress bar chart URL displaying
+    telemetry percentages and capacity totals for CPU, RAM, Data Pool, and Root Disk.
+    """
+    cpu_val = max(0.0, float(cpu_pct or 0.0))
+    ram_val = max(0.0, float(ram_pct or 0.0))
+    pool_val = max(0.0, float(pool_pct or 0.0))
+    root_val = max(0.0, float(root_pct or 0.0))
+
+    bar_colors = [
+        _get_metric_bar_color(cpu_val),
+        _get_metric_bar_color(ram_val),
+        _get_metric_bar_color(pool_val),
+        _get_metric_bar_color(root_val),
+    ]
+
+    labels = [
+        f"CPU Usage ({cpu_val:.1f}%)",
+        f"Memory ({ram_val:.1f}% - {ram_label})",
+        f"Data Pool ({pool_val:.1f}% - {pool_label})",
+        f"Root Disk ({root_val:.1f}% - {root_label})",
+    ]
+
+    chart_config = {
+        "type": "horizontalBar",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "data": [
+                        round(cpu_val, 1),
+                        round(ram_val, 1),
+                        round(pool_val, 1),
+                        round(root_val, 1),
+                    ],
+                    "backgroundColor": bar_colors,
+                    "borderWidth": 0,
+                }
+            ],
+        },
+        "options": {
+            "legend": {"display": False},
+            "scales": {
+                "xAxes": [
+                    {
+                        "ticks": {
+                            "min": 0,
+                            "max": 100,
+                            "fontColor": "#949ba4",
+                        },
+                        "gridLines": {
+                            "color": "rgba(255, 255, 255, 0.08)",
+                        },
+                    }
+                ],
+                "yAxes": [
+                    {
+                        "ticks": {
+                            "fontColor": "#f2f3f5",
+                        },
+                        "gridLines": {
+                            "display": False,
+                        },
+                    }
+                ],
+            },
+        },
+    }
+
+    params = {
+        "bkg": "#1e1f22",
+        "w": 540,
+        "h": 160,
+        "devicePixelRatio": 2.0,
+        "c": json.dumps(chart_config, separators=(",", ":")),
+    }
+    return f"https://quickchart.io/chart?{urllib.parse.urlencode(params)}"
+
+
 def dict_to_discord_embed(
     embed_data: Optional[dict[str, Any]] = None,
     default_title: str = "",
@@ -200,6 +324,18 @@ def dict_to_discord_embed(
         embed.set_author(**author_kwargs)
     elif isinstance(author, str) and author:
         embed.set_author(name=author)
+
+    thumbnail = data.get("thumbnail")
+    if isinstance(thumbnail, dict) and thumbnail.get("url"):
+        embed.set_thumbnail(url=str(thumbnail["url"]))
+    elif isinstance(thumbnail, str) and thumbnail:
+        embed.set_thumbnail(url=thumbnail)
+
+    image = data.get("image")
+    if isinstance(image, dict) and image.get("url"):
+        embed.set_image(url=str(image["url"]))
+    elif isinstance(image, str) and image:
+        embed.set_image(url=image)
 
     footer = data.get("footer")
     if isinstance(footer, dict) and footer.get("text"):
@@ -2671,114 +2807,161 @@ def build_periodic_report_data(
             status_for_banner = "error"
 
     if status_for_banner in ("clean", "active"):
-        status_banner = "🟢 All Systems Operational"
+        status_banner = "All Systems Operational\nAll monitored subsystems are currently operating within nominal parameters."
         color = 0x2ECC71
     elif status_for_banner in ("recovering", "resyncing", "rebuilding"):
-        status_banner = f"🟡 RAID Array {status_for_banner.upper()}"
+        status_banner = f"RAID Array {status_for_banner.upper()}\nArray resynchronization or recovery is in progress."
         color = 0xF59E0B
     elif status_for_banner in ("degraded", "failed", "error"):
-        status_banner = f"🔴 Attention: RAID Array {status_for_banner.upper()}"
+        status_banner = f"Attention: RAID Array {status_for_banner.upper()}\nStorage array requires administrative intervention."
         color = 0xEF4444
     else:
-        status_banner = "🔵 System Status Report"
+        status_banner = "System Status Report\nMonitored subsystems telemetry gathered."
         color = 0x3498DB
 
     title = "Vigil - Periodic Report"
-    description = f"**{status_banner}**\nScheduled telemetry, storage health, and RAID diagnostics."
+    description = status_banner
+
+    # System telemetry collection
+    cpu_val = 0.0
+    core_count = 1
+    cores_label = "1 core"
+    try:
+        cpu_pct = psutil.cpu_percent(interval=None)
+        cpu_val = float(cpu_pct) if cpu_pct is not None else 0.0
+        core_count = psutil.cpu_count(logical=True) or 1
+        cores_label = f"{core_count} core" if core_count == 1 else f"{core_count} cores"
+    except Exception as exc:
+        logging.debug(f"CPU metrics query error: {exc}")
+
+    ram_pct = 0.0
+    ram_label = "0 B / 0 B"
+    try:
+        vm = psutil.virtual_memory()
+        ram_pct = float(getattr(vm, "percent", 0.0))
+        ram_used = getattr(vm, "used", 0)
+        ram_total = getattr(vm, "total", 0)
+        ram_label = _format_capacity_pair(ram_used, ram_total)
+    except Exception as exc:
+        logging.debug(f"RAM metrics query error: {exc}")
+
+    uptime_str = "0d 0h 0m"
+    try:
+        boot_time = psutil.boot_time()
+        uptime_sec = max(0, int(time.time() - boot_time))
+        days, rem = divmod(uptime_sec, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes = rem // 60
+        uptime_str = f"{days}d {hours}h {minutes}m"
+    except Exception as exc:
+        logging.debug(f"Uptime metrics query error: {exc}")
+
+    load_str = "N/A"
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+        load_str = f"{load_1:.2f}, {load_5:.2f}, {load_15:.2f}"
+    except (AttributeError, OSError):
+        load_str = "N/A"
+
+    # Disk telemetry
+    root_pct = 0.0
+    root_label = "0 B / 0 B"
+    try:
+        root_st = get_disk_usage_statvfs("/")
+        root_pct_raw = root_st.get("percent")
+        if root_pct_raw is None:
+            m = re.search(r"(\d+(?:\.\d+)?)%", str(root_st.get("storage_info", "")))
+            root_pct = float(m.group(1)) if m else 0.0
+        else:
+            root_pct = float(root_pct_raw)
+
+        if (
+            root_st.get("used") is not None
+            and root_st.get("total") is not None
+            and root_st.get("total", 0) > 0
+        ):
+            root_label = _format_capacity_pair(
+                root_st.get("used", 0), root_st.get("total", 0)
+            )
+        elif root_st.get("storage_info"):
+            root_label = str(root_st.get("storage_info"))
+    except Exception as exc:
+        logging.debug(f"Root disk usage query error: {exc}")
+
+    pool_pct = root_pct
+    pool_label = root_label
+    mount_path = get_app_settings().get("mount_path")
+    if mount_path and Path(mount_path).exists() and mount_path != "/":
+        try:
+            pool_st = get_disk_usage_statvfs(mount_path)
+            pool_pct_raw = pool_st.get("percent")
+            if pool_pct_raw is None:
+                m = re.search(r"(\d+(?:\.\d+)?)%", str(pool_st.get("storage_info", "")))
+                pool_pct = float(m.group(1)) if m else 0.0
+            else:
+                pool_pct = float(pool_pct_raw)
+
+            if (
+                pool_st.get("used") is not None
+                and pool_st.get("total") is not None
+                and pool_st.get("total", 0) > 0
+            ):
+                pool_label = _format_capacity_pair(
+                    pool_st.get("used", 0), pool_st.get("total", 0)
+                )
+            elif pool_st.get("storage_info"):
+                pool_label = str(pool_st.get("storage_info"))
+        except Exception as exc:
+            logging.debug(f"Pool disk usage query error: {exc}")
+
+    chart_url = generate_telemetry_chart_url(
+        cpu_pct=cpu_val,
+        ram_pct=ram_pct,
+        ram_label=ram_label,
+        pool_pct=pool_pct,
+        pool_label=pool_label,
+        root_pct=root_pct,
+        root_label=root_label,
+    )
+
     fields: list[dict[str, Any]] = []
 
-    # 1. System Status
+    # 1. System Status • Host Environment
     if topics.get("system_status", True):
         try:
-            cpu_pct = psutil.cpu_percent(interval=None)
-            cpu_val = float(cpu_pct) if cpu_pct is not None else 0.0
-            core_count = psutil.cpu_count(logical=True) or 1
-            cpu_bar = format_progress_bar(cpu_val)
-            cores_label = f"{core_count} core" if core_count == 1 else f"{core_count} cores"
-
-            vm = psutil.virtual_memory()
-            ram_pct = float(vm.percent) if hasattr(vm, "percent") else 0.0
-            ram_bar = format_progress_bar(ram_pct)
-            ram_used = format_bytes_human(getattr(vm, "used", 0))
-            ram_total = format_bytes_human(getattr(vm, "total", 0))
-
-            boot_time = psutil.boot_time()
-            uptime_sec = max(0, int(time.time() - boot_time))
-            days, rem = divmod(uptime_sec, 86400)
-            hours, rem = divmod(rem, 3600)
-            minutes = rem // 60
-            uptime_str = f"{days}d {hours}h {minutes}m"
-            try:
-                load_1, load_5, load_15 = os.getloadavg()
-                load_str = f"{load_1:.2f}, {load_5:.2f}, {load_15:.2f}"
-            except (AttributeError, OSError):
-                load_str = "N/A"
-
+            os_info = f"{platform.system()} {platform.release()}"
             fields.append({
-                "name": "System Status • CPU",
-                "value": f"`{cpu_bar}` {cpu_val:.1f}% ({cores_label})",
-                "inline": True,
-            })
-            fields.append({
-                "name": "System Status • Memory",
-                "value": f"`{ram_bar}` {ram_pct:.1f}% ({ram_used} / {ram_total})",
-                "inline": True,
-            })
-            fields.append({
-                "name": "System Status • Uptime & Load",
-                "value": f"⏱️ `{uptime_str}`\n📊 Load: `{load_str}`",
+                "name": "System Status • Host Environment",
+                "value": f"OS: {os_info}\nCPU: {cpu_val:.1f}% ({cores_label})\nUptime: {uptime_str}\nLoad: {load_str}",
                 "inline": True,
             })
         except Exception as exc:
             fields.append({
-                "name": "System Status",
+                "name": "System Status • Host Environment",
                 "value": f"Error gathering system metrics: {exc}",
-                "inline": False,
+                "inline": True,
             })
 
-    # 2. Disk Health
+    # 2. Disk Health • Storage Infrastructure
     if topics.get("disk_health", True):
         try:
-            disks_to_check = [("/", "Root (/)")]
-            mount_path = get_app_settings().get("mount_path")
-            if mount_path and Path(mount_path).exists() and mount_path != "/":
-                disks_to_check.append((mount_path, f"Mount ({mount_path})"))
-
-            disk_lines = []
-            for path, label in disks_to_check:
-                st = get_disk_usage_statvfs(path)
-                pct = st.get("percent")
-                if pct is None:
-                    m = re.search(r"(\d+(?:\.\d+)?)%", str(st.get("storage_info", "")))
-                    pct = float(m.group(1)) if m else 0.0
-                else:
-                    pct = float(pct)
-
-                bar = format_progress_bar(pct)
-                total = st.get("total", 0)
-                used = st.get("used", 0)
-                if total > 0 and used > 0:
-                    used_str = format_bytes_human(used)
-                    total_str = format_bytes_human(total)
-                    disk_lines.append(f"• **{label}**: `{bar}` {pct:.1f}% ({used_str} / {total_str})")
-                elif st.get("storage_info"):
-                    disk_lines.append(f"• **{label}**: `{bar}` {st.get('storage_info')}")
-                else:
-                    disk_lines.append(f"• **{label}**: `{bar}` {pct:.1f}%")
-
+            disk_lines = [
+                f"Data Pool: {pool_label} ({pool_pct:.1f}%)",
+                f"Root (/): {root_label} ({root_pct:.1f}%)",
+            ]
             fields.append({
-                "name": "Disk Health",
-                "value": "\n".join(disk_lines) if disk_lines else "No disks configured.",
-                "inline": False,
+                "name": "Disk Health • Storage Infrastructure",
+                "value": "\n".join(disk_lines),
+                "inline": True,
             })
         except Exception as exc:
             fields.append({
-                "name": "Disk Health",
+                "name": "Disk Health • Storage Infrastructure",
                 "value": f"Error gathering disk metrics: {exc}",
-                "inline": False,
+                "inline": True,
             })
 
-    # 3. RAID Status
+    # 3. RAID Status • Array Infrastructure
     if topics.get("raid_status", True):
         try:
             status, details = (
@@ -2786,18 +2969,6 @@ def build_periodic_report_data(
                 if status_for_banner != "unknown"
                 else check_raid_status()
             )
-            status_emojis = {
-                "clean": "🟢 CLEAN",
-                "active": "🟢 ACTIVE",
-                "recovering": "🟡 REBUILDING",
-                "resyncing": "🟡 RESYNCING",
-                "rebuilding": "🟡 REBUILDING",
-                "degraded": "🔴 DEGRADED",
-                "failed": "🔴 FAILED",
-                "error": "❌ ERROR",
-            }
-            status_badge = status_emojis.get(status.lower(), f"⚪ {status.upper()}")
-
             data = _extract_raid_summary_data(status, details, "")
             raw_level = data.get("raid_level", "unknown").strip().upper()
             if raw_level.startswith("RAID") and raw_level[4:].strip().isalnum():
@@ -2813,49 +2984,98 @@ def build_periodic_report_data(
             working_cnt = data.get("working_devices", "0")
             failed_cnt = data.get("failed_devices", "0")
             spare_cnt = data.get("spare_devices", "0")
+            full_state = data.get("full_state", status.upper())
 
             raid_lines = [
-                f"• **Array Health**: {status_badge} ({level_str})",
-                f"• **Devices**: `{active_cnt}` active / `{working_cnt}` working | `{failed_cnt}` failed / `{spare_cnt}` spare",
+                f"Array: {level_str} — {status.upper()}",
+                f"Devices: {active_cnt} active, {working_cnt} working, {failed_cnt} failed, {spare_cnt} spare",
+                f"State: {full_state}",
             ]
             if details and status not in ("clean", "active", "none"):
-                diag_line = details.splitlines()[0][:120]
-                raid_lines.append(f"• **Diagnostics**: `{diag_line}`")
-            elif details and len(details.splitlines()) == 1 and "raid level" not in details.lower():
-                raid_lines.append(f"• **Details**: `{details.strip()}`")
+                diag_line = details.splitlines()[0][:120].strip()
+                if diag_line:
+                    raid_lines.append(f"Diagnostics: {diag_line}")
 
             fields.append({
-                "name": "RAID Status",
+                "name": "RAID Status • Array Infrastructure",
                 "value": "\n".join(raid_lines),
                 "inline": False,
             })
         except Exception as exc:
             fields.append({
-                "name": "RAID Status",
+                "name": "RAID Status • Array Infrastructure",
                 "value": f"Error checking RAID: {exc}",
                 "inline": False,
             })
 
-    fields.append({
-        "name": "Timestamp",
-        "value": format_timestamp(time.time()),
-        "inline": True,
-    })
+    # 4. Services & Monitoring
+    if topics.get("services", True):
+        docker_running = 0
+        docker_stopped = 0
+        docker_updates = 0
+        try:
+            containers = docker_manager.get_containers(all=True)
+            if isinstance(containers, list):
+                for c in containers:
+                    if str(c.get("state", "")).lower() == "running":
+                        docker_running += 1
+                    else:
+                        docker_stopped += 1
+                    if c.get("update_available") or c.get("has_update"):
+                        docker_updates += 1
+        except Exception:
+            pass
+
+        probe_count = 0
+        avg_latencies: list[float] = []
+        try:
+            probes = get_probes_summary()
+            if isinstance(probes, list):
+                probe_count = len(probes)
+                for p in probes:
+                    lat = p.get("avg_response_time_ms") or p.get(
+                        "last_response_time_ms"
+                    )
+                    if lat is not None and float(lat) > 0:
+                        avg_latencies.append(float(lat))
+        except Exception:
+            pass
+        avg_latency_str = (
+            f"{sum(avg_latencies)/len(avg_latencies):.1f} ms"
+            if avg_latencies
+            else "N/A"
+        )
+
+        services_lines = [
+            f"Docker: {docker_running} running, {docker_stopped} stopped, {docker_updates} updates",
+            f"Sentinel: {probe_count} active probes (avg latency {avg_latency_str})",
+        ]
+        fields.append({
+            "name": "Services & Monitoring",
+            "value": "\n".join(services_lines),
+            "inline": False,
+        })
 
     hostname = platform.node() or "localhost"
     version_info = get_current_version_info()
     version = version_info.get("current_version", "0.9.6")
-    os_info = f"{platform.system()} {platform.release()}"
 
     embed_data = {
         "title": title,
         "description": description,
         "color": color,
         "author": {
-            "name": f"Vigil System Monitor [{hostname}]",
+            "name": f"Vigil System Monitor — {hostname}",
+            "icon_url": "https://raw.githubusercontent.com/tony-vs-code/vigil/main/static/favicon.ico",
+        },
+        "thumbnail": {
+            "url": "https://raw.githubusercontent.com/tony-vs-code/vigil/main/static/favicon.ico",
+        },
+        "image": {
+            "url": chart_url,
         },
         "footer": {
-            "text": f"Vigil v{version} • {os_info} • {hostname}",
+            "text": f"Vigil v{version} • Linux • {hostname}",
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "fields": fields,
@@ -4654,57 +4874,119 @@ def build_raid_embed(status: str, details: str, duf_output: str) -> discord.Embe
         "none": 0x95A5A6,
     }.get(status, 0x95A5A6)
 
-    status_emojis = {
-        "clean": "🟢",
-        "active": "🟢",
-        "recovering": "🟡",
-        "resyncing": "🟡",
-        "rebuilding": "🟡",
-        "degraded": "🔴",
-        "failed": "🔴",
-        "error": "❌",
-    }
-    emoji = status_emojis.get(status.lower(), "⚪")
-
-    card = format_raid_summary(status, details, duf_output)
     embed = discord.Embed(
         title=f"RAID {display_raid_level} | {status.upper()}",
         color=color,
     )
-    embed.description = f"**Status:** {emoji} `{data['full_state']}`\n\n```text\n{card}\n```"
+    embed.description = f"Status: {status.upper()} — {data['full_state']}"
 
     hostname = platform.node() or "localhost"
     version_info = get_current_version_info()
     version = version_info.get("current_version", "0.9.6")
-    embed.set_author(name=f"Vigil System Monitor [{hostname}]")
-    embed.set_footer(text=f"Vigil v{version} • {platform.system()} • {hostname}")
+    embed.set_author(
+        name=f"Vigil System Monitor — {hostname}",
+        icon_url="https://raw.githubusercontent.com/tony-vs-code/vigil/main/static/favicon.ico",
+    )
+    embed.set_thumbnail(
+        url="https://raw.githubusercontent.com/tony-vs-code/vigil/main/static/favicon.ico"
+    )
+    embed.set_footer(text=f"Vigil v{version} • Linux • {hostname}")
     embed.timestamp = datetime.now(timezone.utc)
+
+    # Attach storage / telemetry chart image if available
+    try:
+        cpu_val = float(psutil.cpu_percent(interval=None) or 0.0)
+        vm = psutil.virtual_memory()
+        ram_pct = float(getattr(vm, "percent", 0.0))
+        ram_label = _format_capacity_pair(
+            getattr(vm, "used", 0), getattr(vm, "total", 0)
+        )
+
+        root_st = get_disk_usage_statvfs("/")
+        root_pct_raw = root_st.get("percent")
+        if root_pct_raw is None:
+            m = re.search(r"(\d+(?:\.\d+)?)%", str(root_st.get("storage_info", "")))
+            root_pct = float(m.group(1)) if m else 0.0
+        else:
+            root_pct = float(root_pct_raw)
+
+        if (
+            root_st.get("used") is not None
+            and root_st.get("total") is not None
+            and root_st.get("total", 0) > 0
+        ):
+            root_label = _format_capacity_pair(
+                root_st.get("used", 0), root_st.get("total", 0)
+            )
+        elif root_st.get("storage_info"):
+            root_label = str(root_st.get("storage_info"))
+        else:
+            root_label = "0 B / 0 B"
+
+        pool_pct = root_pct
+        pool_label = root_label
+        mount_path = get_app_settings().get("mount_path")
+        if mount_path and Path(mount_path).exists() and mount_path != "/":
+            pool_st = get_disk_usage_statvfs(mount_path)
+            pool_pct_raw = pool_st.get("percent")
+            if pool_pct_raw is None:
+                m = re.search(
+                    r"(\d+(?:\.\d+)?)%", str(pool_st.get("storage_info", ""))
+                )
+                pool_pct = float(m.group(1)) if m else 0.0
+            else:
+                pool_pct = float(pool_pct_raw)
+
+            if (
+                pool_st.get("used") is not None
+                and pool_st.get("total") is not None
+                and pool_st.get("total", 0) > 0
+            ):
+                pool_label = _format_capacity_pair(
+                    pool_st.get("used", 0), pool_st.get("total", 0)
+                )
+            elif pool_st.get("storage_info"):
+                pool_label = str(pool_st.get("storage_info"))
+
+        chart_url = generate_telemetry_chart_url(
+            cpu_pct=cpu_val,
+            ram_pct=ram_pct,
+            ram_label=ram_label,
+            pool_pct=pool_pct,
+            pool_label=pool_label,
+            root_pct=root_pct,
+            root_label=root_label,
+        )
+        embed.set_image(url=chart_url)
+    except Exception as exc:
+        logging.debug(f"Failed to attach telemetry chart to RAID embed: {exc}")
 
     embed.add_field(
         name="Array Health",
-        value=f"{emoji} **{status.upper()}** (`{data['full_state']}`)",
+        value=f"{status.upper()} ({data['full_state']})",
         inline=True,
     )
     embed.add_field(
         name="Device Breakdown",
-        value=f"Active: **{data['active_devices']}** | Failed: **{data['failed_devices']}** | Spare: **{data['spare_devices']}**",
+        value=f"Active: {data['active_devices']} | Failed: {data['failed_devices']} | Spare: {data['spare_devices']}",
         inline=True,
     )
     if data.get("sync_action") and data.get("sync_percent", 0.0) > 0:
         action_name = data["sync_action"].capitalize()
         speed_str = (
-            f" • Speed: `{data['sync_speed']}`" if data.get("sync_speed") else ""
+            f" • Speed: {data['sync_speed']}" if data.get("sync_speed") else ""
         )
-        eta_str = f" • ETA: `{data['sync_eta']}`" if data.get("sync_eta") else ""
+        eta_str = f" • ETA: {data['sync_eta']}" if data.get("sync_eta") else ""
         embed.add_field(
             name=f"{action_name} Progress",
-            value=f"**{data['sync_percent']:.1f}%** complete{speed_str}{eta_str}",
+            value=f"{data['sync_percent']:.1f}% complete{speed_str}{eta_str}",
             inline=True,
         )
     if data.get("storage_info") and data["storage_info"] != "N/A":
+        clean_storage = str(data["storage_info"]).replace("`", "")
         embed.add_field(
             name="Storage Usage",
-            value=f"`{data['storage_info']}`",
+            value=clean_storage,
             inline=True,
         )
 

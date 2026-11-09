@@ -1,27 +1,31 @@
-# Release v1.0.41: Outbound Notification Delivery Log & UI Styling Fixes
+# Release v1.0.42: Visual Progress Chart Discord Notifications & Embed Enhancements
 
 ## Overview
-Vigil v1.0.41 introduces an enhanced **Outbound Notification Delivery Log** and resolves key UI styling and layout constraints across the host observability suite. System administrators now have complete visibility into outbound alert dispatches—including trigger origins, target notification channels, summary payloads, and delivery outcomes—alongside smart deep links from scheduled notifications directly into the Cron Scheduler. In addition, critical UI components (destructive action buttons, socket/process search bars, and user management modals) have been polished for clean visual hierarchy across all display sizes.
+Vigil v1.0.42 introduces an upgraded, professional Discord notification layout. Moving away from cluttered monospace text tables, raw box-drawing dumps, and emojis, Vigil now sends sleek, high-DPI graphical progress bar charts showing live system resource utilization with explicit capacity totals, paired with clean multi-column status cards, author headers, and thumbnails.
 
 ## Highlights & Enhancements
 
-### 1. Outbound Notification Delivery Log
-- **Comprehensive 5-Column Telemetry Table**: Replaced the legacy 3-column table with a modern delivery log featuring `Timestamp`, `Trigger / Source`, `Channel`, `Subject / Summary`, and `Delivery Outcome`.
-- **Smart Trigger Badges & Deep Linking**:
-  - `CRON: NOTIFICATIONS.SUMMARY`: Rendered as an interactive badge linking operators directly to the Cron Scheduler tab (`switchTab('cron')`).
-  - Contextual trigger badges for `THRESHOLD: CPU`, `SENTINEL PROBE`, `MANUAL TEST`, and `RAID MONITOR`.
-- **Channel & Outcome Indicators**: Distinct visual badges for notification channels (Discord, Webhooks, Telegram, Slack, Email) and status outcomes (`✓ Delivered` in green, `✗ Failed` in red).
-- **Resilient Fallbacks**: Clean message summarization with expandable details and backward-compatible inference for legacy notification records.
+### 1. Dynamic Visual Telemetry Progress Bar Chart
+- **Real-Time Graphical Resource Meter**: Renders high-resolution horizontal progress bar charts for **CPU**, **Memory**, **Data Pool**, and **Root Disk**.
+- **Human-Readable Capacity Labels**: Each bar displays exact used and total amounts directly on the axis (e.g., `CPU Usage (24.5%)`, `Memory (42.1% - 6.7/16 GB)`, `Data Pool (52.5% - 8.4/16 TB)`, `Root Disk (16.8% - 42/250 GB)`).
+- **Dynamic Threshold Color Mapping**: Automatically colors bars based on safe limits:
+  - `< 75%`: `#22c55e` (Vibrant Green)
+  - `75% – 89.9%`: `#f59e0b` (Amber Warning)
+  - `≥ 90%`: `#ef4444` (Critical Red)
+- **Dark-Theme Discord Integration**: Charts are generated with `#1e1f22` background, smooth rounded bar corners, and muted gray gridlines matching Discord's native dark interface.
 
-### 2. UI Styling & Visual Refinements
-- **Destructive Button Styling**: Restored top-level `.btn-danger` and `.btn-danger-outline` CSS definitions, fixing unstyled "Prune Unused Volumes" (Docker Volumes) and "Ban IP" (Security & Firewall) buttons.
-- **Unified Dark-Theme Search Boxes**: Added top-level `.search-box` and `.search-box input` rules to ensure listening sockets (`#sec-ports-filter`), process explorer, and user filter inputs match Vigil's dark slate aesthetic with glowing focus states.
-- **Modal Viewport Bounding**: Applied desktop max-width constraints to `.modal-card` (`max-width: 540px`) and `#modal-add-user` (`max-width: 520px`), preventing full-screen stretching of user and group creation modals on wide monitors.
+### 2. Clean Professional Bot Embed Architecture
+- **Zero Codeblocks & Zero Emojis**: Removed noisy backticks and emoji icons in favor of clean, typography-driven field cards.
+- **Author Bar & Thumbnail**: Added `author` header (`Vigil System Monitor — {hostname}`) and top-right `thumbnail` (Vigil shield icon) for instant visual recognition.
+- **Structured Subsystem Cards**:
+  - `Host Environment` (inline): OS, Kernel, Uptime, and Load Averages.
+  - `Storage Infrastructure` (inline): RAID status, array level, pool capacity, and root capacity.
+  - `Services & Monitoring`: Docker containers (running/stopped/updates available) and Sentinel probe health with average response latency.
 
-### 3. Backend SQLite Telemetry Migration
-- **Schema Migration**: Auto-migrates `notification_history` table to include `channel`, `trigger`, `title`, `details`, and `outcome` columns.
-- **Backward-Compatible Queries & Fallback Inference**: Automatically infers trigger origins and delivery outcomes for legacy rows lacking discrete telemetry columns.
+### 3. Streamlined RAID Diagnostics & Embed Engine
+- **Cleaner RAID Alerts**: Eliminated legacy ASCII box-drawing text dumps in favor of clean diagnostic cards accompanied by storage progress charts.
+- **Engine Upgrades**: Enhanced `dict_to_discord_embed` to natively support `thumbnail` and `image` across all alert types (periodic reports, RAID degradation alerts, thermal warnings, and test dispatches).
 
 ## Reliability & Fixes
-- **Dedicated UI & Styling Test Suite**: Added `tests/test_ui_styling_fixes.py` validating button classes, search box styling, modal card width rules, DOM integrity, and Node VM notification table rendering.
-- **100% QA Quality Gate Pass**: Full automated test suite passes cleanly with **365 passed, 0 failed** across all backend routes, unit tests, and cross-tier UI contracts (63 API routes, 718 DOM elements).
+- **Dedicated Embed Styling Test Suite**: Added `tests/test_discord_embed_styling.py` with 19 comprehensive tests validating QuickChart URL generation, threshold color selection, capacity label formatting, embed image/thumbnail bindings, and zero-codeblock constraints.
+- **100% Quality Gate Pass**: Full automated test suite passes cleanly with **385 passed, 0 failed** across all backend routes, unit tests, and cross-tier UI contracts (63 API routes, 718 DOM elements).
