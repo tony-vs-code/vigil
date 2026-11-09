@@ -45,9 +45,9 @@ class TestPythonPackageManagerBackend(unittest.TestCase):
         """Verify PyPI version checking, update_available, major_held flags, and role separation."""
         def mock_fetch(pkg_name, timeout=4.0):
             if pkg_name == "aiohttp":
-                return ["3.10.5", "3.11.0", "4.0.0"]
+                return ["3.10.5", "3.99.0", "4.0.0"]
             elif pkg_name == "fastapi":
-                return ["0.112.0", "0.115.0"]
+                return ["0.112.0", "0.199.0"]
             return ["1.0.0"]
 
         with patch.object(self.pm, "_fetch_pypi_versions", side_effect=mock_fetch):
@@ -63,7 +63,7 @@ class TestPythonPackageManagerBackend(unittest.TestCase):
         aio = pkgs["aiohttp"]
         self.assertEqual(aio["role"], "direct")
         self.assertEqual(aio["latest_version"], "4.0.0")
-        self.assertEqual(aio["latest_compatible_version"], "3.11.0")
+        self.assertEqual(aio["latest_compatible_version"], "3.99.0")
         self.assertTrue(aio["major_held"])
         self.assertTrue(aio["update_available"])
 

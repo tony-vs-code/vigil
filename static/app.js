@@ -7626,6 +7626,7 @@ let envAceEditor = null;
 let isSyncingStackEditor = false;
 let lastSyncedComposeAceValue = null;
 let lastSyncedEnvAceValue = null;
+let activeStackEnvMode = "kv";
 
 /**
  * Update the Stack Editor footer status bar cursor position.
@@ -7830,9 +7831,525 @@ function setStackYamlValue(val) {
 }
 
 /**
- * Get current .env content from synced textarea / Ace editor.
+ * Parse raw .env file text into an array of { name: string, value: string }.
+ * Ignores empty lines and comments (#). Strips surrounding quotes.
+ */
+function parseEnvTextToVariables(envText) {
+  if (!envText || typeof envText !== "string") {
+    return [{ name: "", value: "" }];
+  }
+
+  const lines = envText.split(/\r?\n/);
+  const vars = [];
+
+  for (let rawLine of lines) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+
+    if (line.startsWith("export ")) {
+      line = line.slice(7).trim();
+    }
+
+    const eqIdx = line.indexOf("=");
+    if (eqIdx === -1) {
+      if (line) {
+        vars.push({ name: line, value: "" });
+      }
+    } else {
+      const name = line.slice(0, eqIdx).trim();
+      let value = line.slice(eqIdx + 1).trim();
+
+      if (
+        (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+        (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      vars.push({ name, value });
+    }
+  }
+
+  return vars.length > 0 ? vars : [{ name: "", value: "" }];
+}
+
+/**
+ * Serialize an array of { name, value } back to canonical .env text.
+ * Quotes values containing spaces, newlines, or quotes.
+ */
+function serializeVariablesToEnvText(vars) {
+  if (!Array.isArray(vars)) return "";
+
+  const lines = [];
+  for (const item of vars) {
+    if (!item) continue;
+    const name = (item.name || "").trim();
+    if (!name) continue;
+
+    let val = item.value !== undefined && item.value !== null ? String(item.value) : "";
+    if (val.includes(" ") || val.includes("\n") || val.includes("\t") || val.includes('"')) {
+      val = `"${val.replace(/"/g, '\\"')}"`;
+    }
+    lines.push(`${name}=${val}`);
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Read current key-value pairs directly from the DOM table rows.
+ */
+function readVariablesFromKvTable() {
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  if (!tbody || typeof tbody.querySelectorAll !== "function") return [];
+
+  const rows = tbody.querySelectorAll(".env-kv-row");
+  const vars = [];
+  if (rows && typeof rows.forEach === "function") {
+    rows.forEach((row) => {
+      const keyInput = row.querySelector ? row.querySelector(".env-kv-key-input") : null;
+      const valInput = row.querySelector ? row.querySelector(".env-kv-val-input") : null;
+      if (keyInput && valInput) {
+        vars.push({
+          name: keyInput.value,
+          value: valInput.value,
+        });
+      }
+    });
+  }
+  return vars;
+}
+
+/**
+ * Update the badge counter in the toolbar (e.g. "3 variables" or "1 of 3 variables").
+ */
+function updateEnvVariableCountBadge() {
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  const searchInput = document.getElementById("stack-env-search");
+  const query = (searchInput?.value || "").toLowerCase().trim();
+  if (query) {
+    handleEnvSearchInput({ target: searchInput });
+    return;
+  }
+  const badge = document.getElementById("stack-env-count-badge");
+  if (!tbody || !badge || typeof tbody.querySelectorAll !== "function") return;
+  const rows = tbody.querySelectorAll(".env-kv-row");
+  let count = 0;
+  if (rows && typeof rows.forEach === "function") {
+    rows.forEach((row) => {
+      const key = row.querySelector ? row.querySelector(".env-kv-key-input")?.value?.trim() : null;
+      if (key) count++;
+    });
+  }
+  badge.textContent = `${count} variable${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Update eye button icon and title for password mask toggle.
+ */
+function updateEyeIcon(btn, isPassword) {
+  if (isPassword) {
+    btn.title = "Show value";
+    btn.setAttribute("aria-label", "Show value");
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+        <circle cx="12" cy="12" r="3"></circle>
+      </svg>
+    `;
+  } else {
+    btn.title = "Hide value";
+    btn.setAttribute("aria-label", "Hide value");
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path>
+        <line x1="1" y1="21" x2="23" y2="3"></line>
+      </svg>
+    `;
+  }
+}
+
+/**
+ * Create a single table row element for the Key-Value editor.
+ */
+function createEnvVariableRowElement(name = "", value = "") {
+  const tr = document.createElement("tr");
+  tr.className = "env-kv-row";
+
+  // Key td
+  const tdKey = document.createElement("td");
+  const keyInput = document.createElement("input");
+  keyInput.type = "text";
+  keyInput.className = "env-kv-key-input";
+  keyInput.placeholder = "VARIABLE_NAME";
+  keyInput.value = name;
+  keyInput.autocomplete = "off";
+  keyInput.spellcheck = false;
+  keyInput.addEventListener("input", () => {
+    updateEnvVariableCountBadge();
+  });
+  tdKey.appendChild(keyInput);
+
+  // Value td with secret eye toggle
+  const tdVal = document.createElement("td");
+  const valGroup = document.createElement("div");
+  valGroup.className = "env-val-input-group";
+
+  const valInput = document.createElement("input");
+  valInput.type = "text";
+  valInput.className = "env-kv-val-input";
+  valInput.placeholder = "value";
+  valInput.value = value;
+  valInput.autocomplete = "off";
+  valInput.spellcheck = false;
+  valInput.addEventListener("input", () => {
+    updateEnvVariableCountBadge();
+  });
+
+  const toggleBtn = document.createElement("button");
+  toggleBtn.type = "button";
+  toggleBtn.className = "btn-icon-subtle btn-toggle-secret";
+  updateEyeIcon(toggleBtn, false);
+
+  toggleBtn.addEventListener("click", () => {
+    const isPw = valInput.type === "password";
+    valInput.type = isPw ? "text" : "password";
+    updateEyeIcon(toggleBtn, valInput.type === "password");
+  });
+
+  valGroup.appendChild(valInput);
+  valGroup.appendChild(toggleBtn);
+  tdVal.appendChild(valGroup);
+
+  // Action td
+  const tdAction = document.createElement("td");
+  tdAction.style.textAlign = "right";
+
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "btn-remove-var";
+  removeBtn.title = "Remove variable";
+  removeBtn.setAttribute("aria-label", "Remove variable");
+  removeBtn.textContent = "✕";
+  removeBtn.addEventListener("click", () => {
+    const tbody = tr.parentElement;
+    tr.remove();
+    updateEnvVariableCountBadge();
+    if (tbody && tbody.querySelectorAll(".env-kv-row").length === 0) {
+      addEnvVariableRow("", "");
+    }
+  });
+
+  tdAction.appendChild(removeBtn);
+
+  tr.appendChild(tdKey);
+  tr.appendChild(tdVal);
+  tr.appendChild(tdAction);
+
+  return tr;
+}
+
+/**
+ * Render Key-Value rows into #stack-env-kv-tbody.
+ */
+function renderEnvKeyValueTable(vars) {
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  if (!tbody) return;
+
+  tbody.innerHTML = "";
+  const list = Array.isArray(vars) && vars.length > 0 ? vars : [{ name: "", value: "" }];
+
+  for (const item of list) {
+    const tr = createEnvVariableRowElement(item.name || "", item.value || "");
+    tbody.appendChild(tr);
+  }
+
+  updateEnvVariableCountBadge();
+}
+
+/**
+ * Add a new blank or pre-filled row to the visual Key-Value table.
+ */
+function addEnvVariableRow(name = "", value = "") {
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  if (!tbody) return;
+
+  const tr = createEnvVariableRowElement(name, value);
+  tbody.appendChild(tr);
+  updateEnvVariableCountBadge();
+
+  const keyInput = tr.querySelector(".env-kv-key-input");
+  keyInput?.focus();
+}
+
+/**
+ * Filter variables in the Key-Value table by search query.
+ */
+function handleEnvSearchInput(e) {
+  const query = (e?.target?.value || "").toLowerCase().trim();
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  if (!tbody || typeof tbody.querySelectorAll !== "function") return;
+
+  const rows = tbody.querySelectorAll(".env-kv-row");
+  let visibleCount = 0;
+  let totalCount = 0;
+
+  if (rows && typeof rows.forEach === "function") {
+    rows.forEach((row) => {
+      const keyInput = row.querySelector ? row.querySelector(".env-kv-key-input") : null;
+      const valInput = row.querySelector ? row.querySelector(".env-kv-val-input") : null;
+      const key = (keyInput?.value || "").toLowerCase();
+      const val = (valInput?.value || "").toLowerCase();
+      const hasName = Boolean(keyInput?.value?.trim());
+
+      if (hasName) {
+        totalCount++;
+      }
+
+      if (!query || key.includes(query) || val.includes(query)) {
+        if (row.style) row.style.display = "";
+        if (hasName) visibleCount++;
+      } else {
+        if (row.style) row.style.display = "none";
+      }
+    });
+  }
+
+  const badge = document.getElementById("stack-env-count-badge");
+  if (badge) {
+    if (query) {
+      badge.textContent = `${visibleCount} of ${totalCount} variables`;
+    } else {
+      badge.textContent = `${totalCount} variable${totalCount === 1 ? "" : "s"}`;
+    }
+  }
+}
+
+/**
+ * Switch Stack Environment Variable Editor Mode: 'kv' or 'raw'.
+ */
+function switchStackEnvMode(mode) {
+  activeStackEnvMode = mode === "raw" ? "raw" : "kv";
+
+  const kvBtn = document.getElementById("stack-env-mode-kv-btn");
+  const rawBtn = document.getElementById("stack-env-mode-raw-btn");
+  const kvContainer = document.getElementById("stack-env-kv-container");
+  const rawContainer = document.getElementById("stack-env-raw-container");
+
+  if (activeStackEnvMode === "raw") {
+    kvBtn?.classList.remove("active");
+    kvBtn?.setAttribute("aria-selected", "false");
+    rawBtn?.classList.add("active");
+    rawBtn?.setAttribute("aria-selected", "true");
+
+    // Sync KV rows -> Ace Editor
+    const vars = readVariablesFromKvTable();
+    const serialized = serializeVariablesToEnvText(vars);
+    const envInput = document.getElementById("stack-env-input");
+    if (envInput) envInput.value = serialized;
+    if (envAceEditor && typeof envAceEditor.setValue === "function") {
+      isSyncingStackEditor = true;
+      try {
+        envAceEditor.setValue(serialized, -1);
+        lastSyncedEnvAceValue = serialized;
+      } finally {
+        isSyncingStackEditor = false;
+      }
+    }
+
+    kvContainer?.classList.add("hidden");
+    rawContainer?.classList.remove("hidden");
+    if (envAceEditor && typeof envAceEditor.resize === "function") {
+      envAceEditor.resize(true);
+    }
+  } else {
+    rawBtn?.classList.remove("active");
+    rawBtn?.setAttribute("aria-selected", "false");
+    kvBtn?.classList.add("active");
+    kvBtn?.setAttribute("aria-selected", "true");
+
+    // Sync Ace Editor -> KV rows
+    let currentRaw = "";
+    if (envAceEditor && typeof envAceEditor.getValue === "function") {
+      currentRaw = envAceEditor.getValue();
+    } else {
+      currentRaw = document.getElementById("stack-env-input")?.value || "";
+    }
+    const parsed = parseEnvTextToVariables(currentRaw);
+    renderEnvKeyValueTable(parsed);
+
+    rawContainer?.classList.add("hidden");
+    kvContainer?.classList.remove("hidden");
+  }
+}
+
+/**
+ * Import environment variables from a local .env file.
+ */
+function handleImportEnvFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    try {
+      const fileContent = event.target?.result || "";
+      const importedVars = parseEnvTextToVariables(fileContent);
+      const currentRaw = getStackEnvValue();
+      const currentVars = parseEnvTextToVariables(currentRaw);
+      const hasExisting = currentVars.some((v) => v.name && v.name.trim());
+
+      let finalVars = [];
+      if (hasExisting) {
+        const shouldMerge = window.confirm(
+          "Importing will merge with existing variables. Choose OK to merge or Cancel to replace."
+        );
+        if (shouldMerge) {
+          const mergedMap = new Map();
+          for (const item of currentVars) {
+            if (item.name && item.name.trim()) {
+              mergedMap.set(item.name.trim(), item.value);
+            }
+          }
+          for (const item of importedVars) {
+            if (item.name && item.name.trim()) {
+              mergedMap.set(item.name.trim(), item.value);
+            }
+          }
+          finalVars = Array.from(mergedMap.entries()).map(([name, value]) => ({ name, value }));
+        } else {
+          finalVars = importedVars.filter((v) => v.name && v.name.trim());
+        }
+      } else {
+        finalVars = importedVars.filter((v) => v.name && v.name.trim());
+      }
+
+      if (finalVars.length === 0) {
+        finalVars = [{ name: "", value: "" }];
+      }
+
+      const serialized = serializeVariablesToEnvText(finalVars);
+      setStackEnvValue(serialized);
+
+      showToast({
+        title: "Environment Imported",
+        message: `Successfully loaded ${finalVars.filter((v) => v.name && v.name.trim()).length} variable(s).`,
+        type: "success",
+      });
+    } catch (err) {
+      showToast({
+        title: "Import Error",
+        message: `Failed to import .env file: ${err.message}`,
+        type: "error",
+      });
+    } finally {
+      e.target.value = "";
+    }
+  };
+  reader.onerror = () => {
+    showToast({
+      title: "File Read Error",
+      message: "Could not read the selected file.",
+      type: "error",
+    });
+    e.target.value = "";
+  };
+  reader.readAsText(file);
+}
+
+/**
+ * Export current environment variables as a downloadable .env file.
+ */
+function exportStackEnvFile() {
+  const envContent = getStackEnvValue();
+  const stackNameInput = document.getElementById("stack-name-input");
+  const stackName = stackNameInput?.value?.trim() || "stack";
+  const filename = `${stackName}.env`;
+
+  const blob = new Blob([envContent], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  showToast({
+    title: "Environment Exported",
+    message: `Exported variables to ${filename}`,
+    type: "success",
+  });
+}
+
+/**
+ * Copy current environment variables to system clipboard.
+ */
+async function copyStackEnvToClipboard() {
+  const envContent = getStackEnvValue();
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(envContent);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = envContent;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+    }
+    showToast({
+      title: "Copied to Clipboard",
+      message: "Environment variables copied to clipboard.",
+      type: "success",
+    });
+  } catch (err) {
+    showToast({
+      title: "Copy Failed",
+      message: `Failed to copy: ${err.message}`,
+      type: "error",
+    });
+  }
+}
+
+/**
+ * Get current .env content from synced textarea / Ace editor or visual Key-Value table.
  */
 function getStackEnvValue() {
+  const kvTbody = document.getElementById("stack-env-kv-tbody");
+  if (
+    activeStackEnvMode === "kv" &&
+    kvTbody &&
+    typeof kvTbody.querySelectorAll === "function"
+  ) {
+    const rows = kvTbody.querySelectorAll(".env-kv-row");
+    if (rows && rows.length > 0) {
+      const vars = readVariablesFromKvTable();
+      const serialized = serializeVariablesToEnvText(vars);
+      const envInput = document.getElementById("stack-env-input");
+      if (envInput && envInput.value !== serialized) {
+        envInput.value = serialized;
+      }
+      if (envAceEditor && typeof envAceEditor.setValue === "function") {
+        if (envAceEditor.getValue() !== serialized) {
+          isSyncingStackEditor = true;
+          try {
+            envAceEditor.setValue(serialized, -1);
+            lastSyncedEnvAceValue = serialized;
+          } finally {
+            isSyncingStackEditor = false;
+          }
+        }
+      }
+      return serialized;
+    }
+  }
+
   const envInput = document.getElementById("stack-env-input");
   if (envAceEditor && typeof envAceEditor.getValue === "function") {
     if (envInput && envInput.value !== lastSyncedEnvAceValue) {
@@ -7855,7 +8372,7 @@ function getStackEnvValue() {
 }
 
 /**
- * Set .env content in both #stack-env-input and Ace editor.
+ * Set .env content in both #stack-env-input, Ace editor, and visual Key-Value table.
  */
 function setStackEnvValue(val) {
   const strVal = val ?? "";
@@ -7872,6 +8389,10 @@ function setStackEnvValue(val) {
     } finally {
       isSyncingStackEditor = false;
     }
+  }
+  const tbody = document.getElementById("stack-env-kv-tbody");
+  if (tbody && typeof tbody.appendChild === "function") {
+    renderEnvKeyValueTable(parseEnvTextToVariables(strVal));
   }
 }
 
@@ -7907,7 +8428,7 @@ function switchStackEditorTab(tabName) {
     panelCompose?.classList.add("hidden");
     panelEnv?.classList.remove("hidden");
     if (modeInfo) modeInfo.textContent = "UTF-8 / .ENV";
-    if (envAceEditor && typeof envAceEditor.resize === "function") {
+    if (activeStackEnvMode === "raw" && envAceEditor && typeof envAceEditor.resize === "function") {
       envAceEditor.resize();
     }
   } else {
@@ -8557,6 +9078,7 @@ async function openStackEditor(stackName = null, prefill = null) {
   initStackCodeEditors();
   setStackEditorAnnotations([]);
   switchStackEditorTab("compose");
+  switchStackEnvMode("kv");
 
   if (stackName) {
     if (title) title.textContent = `Edit Compose Stack: ${stackName}`;
@@ -14956,6 +15478,40 @@ function initDashboard() {
   document
     .getElementById("stack-env-format-btn")
     ?.addEventListener("click", () => formatStackYaml());
+
+  document
+    .getElementById("stack-env-mode-kv-btn")
+    ?.addEventListener("click", () => switchStackEnvMode("kv"));
+
+  document
+    .getElementById("stack-env-mode-raw-btn")
+    ?.addEventListener("click", () => switchStackEnvMode("raw"));
+
+  document
+    .getElementById("stack-env-import-btn")
+    ?.addEventListener("click", () => {
+      document.getElementById("stack-env-file-input")?.click();
+    });
+
+  document
+    .getElementById("stack-env-file-input")
+    ?.addEventListener("change", handleImportEnvFile);
+
+  document
+    .getElementById("stack-env-export-btn")
+    ?.addEventListener("click", exportStackEnvFile);
+
+  document
+    .getElementById("stack-env-copy-btn")
+    ?.addEventListener("click", copyStackEnvToClipboard);
+
+  document
+    .getElementById("stack-env-add-var-btn")
+    ?.addEventListener("click", () => addEnvVariableRow("", ""));
+
+  document
+    .getElementById("stack-env-search")
+    ?.addEventListener("input", handleEnvSearchInput);
 
   const snippetToolbar = document.getElementById("stack-snippet-toolbar");
   snippetToolbar?.addEventListener("click", (e) => {

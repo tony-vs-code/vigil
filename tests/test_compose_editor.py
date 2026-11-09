@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -211,6 +212,123 @@ version: '3.9'
         self.assertEqual(env_only_data["formatted_yaml"], "")
         self.assertEqual(env_only_data["formatted_env"], "API_KEY=abcdef123\n")
 
+    def test_docker_manager_parse_and_serialize_env_key_values(self):
+        # 1. Parsing with comments, blank lines, export keyword, whitespace, and quoted values
+        raw_env = (
+            "# This is a top-level comment\n"
+            "   \n"
+            "   APP_PORT = 8080   \n"
+            "# Another comment\n"
+            "export DB_HOST = db.internal.local\n"
+            'export DB_PASS = "p@ss=word#123" \n'
+            "SINGLE_QUOTED = 'single quoted value' \n"
+            "ESCAPED_QUOTES = \"hello \\\"world\\\"\" \n"
+            "EQUALS_IN_VAL = key=val=foo=bar \n"
+            "EMPTY_VAL = \n"
+        )
+        parsed = self.dm.parse_env_key_values(raw_env)
+        self.assertEqual(
+            parsed,
+            [
+                {"name": "APP_PORT", "value": "8080"},
+                {"name": "DB_HOST", "value": "db.internal.local"},
+                {"name": "DB_PASS", "value": "p@ss=word#123"},
+                {"name": "SINGLE_QUOTED", "value": "single quoted value"},
+                {"name": "ESCAPED_QUOTES", "value": 'hello "world"'},
+                {"name": "EQUALS_IN_VAL", "value": "key=val=foo=bar"},
+                {"name": "EMPTY_VAL", "value": ""},
+            ],
+        )
+
+        # 2. Serialization: quotes strings with spaces/tabs/newlines/#, leaves simple strings unquoted
+        serialized = self.dm.serialize_env_key_values(parsed)
+        expected_serialized = (
+            "APP_PORT=8080\n"
+            "DB_HOST=db.internal.local\n"
+            'DB_PASS="p@ss=word#123"\n'
+            'SINGLE_QUOTED="single quoted value"\n'
+            'ESCAPED_QUOTES="hello \\"world\\""\n'
+            "EQUALS_IN_VAL=key=val=foo=bar\n"
+            "EMPTY_VAL=\n"
+        )
+        self.assertEqual(serialized, expected_serialized)
+
+        # 3. Roundtrip parsing
+        roundtrip_parsed = self.dm.parse_env_key_values(serialized)
+        self.assertEqual(roundtrip_parsed, parsed)
+
+        # 4. Edge cases
+        self.assertEqual(self.dm.parse_env_key_values(""), [])
+        self.assertEqual(self.dm.parse_env_key_values("   \n# only comments\n"), [])
+        self.assertEqual(self.dm.serialize_env_key_values([]), "")
+        self.assertEqual(
+            self.dm.serialize_env_key_values([{"name": "", "value": "ignored"}, {"name": "VALID", "value": "1"}]),
+            "VALID=1\n",
+        )
+
+    def test_api_env_parse_and_serialize_endpoints(self):
+        # 1. Unauthenticated requests return 401
+        parse_unauth = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/parse",
+            json_body={"env_content": "FOO=bar\n"},
+        )
+        self.assertEqual(parse_unauth.status_code, 401)
+
+        serialize_unauth = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/serialize",
+            json_body={"variables": [{"name": "FOO", "value": "bar"}]},
+        )
+        self.assertEqual(serialize_unauth.status_code, 401)
+
+        # 2. Authenticated parse
+        parse_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/parse",
+            cookies=self.auth_cookies,
+            json_body={
+                "env_content": (
+                    "# Config\n"
+                    "export PORT=3000\n"
+                    "GREETING=\"Hello World\"\n"
+                    "URL=postgres://user:p=w@localhost:5432/db\n"
+                )
+            },
+        )
+        self.assertEqual(parse_resp.status_code, 200)
+        parse_data = parse_resp.json()
+        self.assertIn("variables", parse_data)
+        self.assertEqual(
+            parse_data["variables"],
+            [
+                {"name": "PORT", "value": "3000"},
+                {"name": "GREETING", "value": "Hello World"},
+                {"name": "URL", "value": "postgres://user:p=w@localhost:5432/db"},
+            ],
+        )
+
+        # 3. Authenticated serialize
+        serialize_resp = asgi_post(
+            api.app,
+            "/api/docker/stacks/env/serialize",
+            cookies=self.auth_cookies,
+            json_body={
+                "variables": [
+                    {"name": "PORT", "value": "3000"},
+                    {"name": "GREETING", "value": "Hello World"},
+                    {"name": "EMPTY", "value": ""},
+                ]
+            },
+        )
+        self.assertEqual(serialize_resp.status_code, 200)
+        serialize_data = serialize_resp.json()
+        self.assertIn("env_content", serialize_data)
+        self.assertEqual(
+            serialize_data["env_content"],
+            'PORT=3000\nGREETING="Hello World"\nEMPTY=\n',
+        )
+
 
 class TestComposeEditorFrontendContractsAndNodeVM(unittest.TestCase):
     """Frontend DOM, CSS, and Node VM execution tests for Ace Code Editor & Compose Formatter."""
@@ -242,6 +360,19 @@ class TestComposeEditorFrontendContractsAndNodeVM(unittest.TestCase):
             "stack-editor-cursor-pos",
             "stack-editor-indent-info",
             "stack-editor-mode-info",
+            "stack-env-mode-kv-btn",
+            "stack-env-mode-raw-btn",
+            "stack-env-import-btn",
+            "stack-env-export-btn",
+            "stack-env-copy-btn",
+            "stack-env-file-input",
+            "stack-env-kv-container",
+            "stack-env-kv-table",
+            "stack-env-kv-tbody",
+            "stack-env-add-var-btn",
+            "stack-env-search",
+            "stack-env-count-badge",
+            "stack-env-raw-container",
         ]
         for dom_id in required_ids:
             self.assertIn(f'id="{dom_id}"', self.index_html, f"Missing #{dom_id} in index.html")
@@ -962,6 +1093,371 @@ rl.on('line', async (line) => {{
         finally:
             proc.kill()
             proc.wait()
+
+    def test_stack_env_key_value_manager_in_node_vm(self):
+        node_script = """
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(tag, id = '') {
+  const classes = new Set();
+  const attributes = {};
+  const listeners = {};
+  const children = [];
+  let _innerHTML = '';
+  let _value = '';
+
+  const el = {
+    tagName: (tag || 'div').toUpperCase(),
+    id: id || '',
+    parentElement: null,
+    children: children,
+    style: {},
+    disabled: false,
+    checked: true,
+    type: 'text',
+    placeholder: '',
+    title: '',
+    autocomplete: '',
+    spellcheck: false,
+
+    get className() { return Array.from(classes).join(' '); },
+    set className(val) {
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    },
+
+    classList: {
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {
+        if (force === undefined) {
+          if (classes.has(cls)) classes.delete(cls);
+          else classes.add(cls);
+        } else if (force) classes.add(cls);
+        else classes.delete(cls);
+      }
+    },
+
+    get value() { return _value; },
+    set value(v) { _value = v !== undefined && v !== null ? String(v) : ''; },
+
+    get innerHTML() { return _innerHTML; },
+    set innerHTML(val) {
+      _innerHTML = val;
+      if (val === '') {
+        while (children.length > 0) {
+          const removed = children.pop();
+          removed.parentElement = null;
+        }
+      }
+    },
+
+    textContent: '',
+
+    setAttribute: (name, val) => { attributes[name] = String(val); },
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+
+    appendChild: (child) => {
+      if (child.parentElement) {
+        child.parentElement.removeChild(child);
+      }
+      child.parentElement = el;
+      children.push(child);
+      return child;
+    },
+
+    removeChild: (child) => {
+      const idx = children.indexOf(child);
+      if (idx !== -1) {
+        children.splice(idx, 1);
+        child.parentElement = null;
+      }
+      return child;
+    },
+
+    remove: () => {
+      if (el.parentElement) {
+        el.parentElement.removeChild(el);
+      }
+    },
+
+    addEventListener: (evt, cb) => {
+      if (!listeners[evt]) listeners[evt] = [];
+      listeners[evt].push(cb);
+    },
+
+    dispatchEvent: (evt) => {
+      const ev = typeof evt === 'string' ? { type: evt, target: el } : evt;
+      if (!ev.target) ev.target = el;
+      if (listeners[ev.type]) {
+        for (const cb of listeners[ev.type]) {
+          cb(ev);
+        }
+      }
+    },
+
+    click: () => {
+      el.dispatchEvent({ type: 'click', target: el });
+    },
+
+    focus: () => {},
+
+    querySelector: (sel) => {
+      function find(node) {
+        for (const ch of node.children) {
+          if (sel.startsWith('.') && ch.classList.contains(sel.slice(1))) return ch;
+          if (sel.startsWith('#') && ch.id === sel.slice(1)) return ch;
+          if (ch.tagName === sel.toUpperCase()) return ch;
+          const found = find(ch);
+          if (found) return found;
+        }
+        return null;
+      }
+      return find(el);
+    },
+
+    querySelectorAll: (sel) => {
+      const results = [];
+      function collect(node) {
+        for (const ch of node.children) {
+          if (sel.startsWith('.') && ch.classList.contains(sel.slice(1))) results.push(ch);
+          else if (sel.startsWith('#') && ch.id === sel.slice(1)) results.push(ch);
+          else if (ch.tagName === sel.toUpperCase()) results.push(ch);
+          collect(ch);
+        }
+      }
+      collect(el);
+      return results;
+    }
+  };
+
+  return el;
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) elements[id] = createMockElement('div', id);
+  return elements[id];
+}
+
+const aceInstances = {};
+function createMockAceInstance(id) {
+  let val = '';
+  let theme = '';
+  let mode = '';
+  let options = {};
+  let annotations = [];
+  let cursor = { row: 0, column: 0 };
+  const sessionListeners = {};
+  const selectionListeners = {};
+  const commands = [];
+
+  const instance = {
+    id,
+    setTheme: (t) => { theme = t; },
+    getTheme: () => theme,
+    setOptions: (opts) => { Object.assign(options, opts); },
+    getOptions: () => options,
+    getValue: () => val,
+    setValue: (v) => {
+      val = String(v ?? '');
+      if (sessionListeners.change) sessionListeners.change();
+    },
+    resize: () => {},
+    focus: () => {},
+    getCursorPosition: () => cursor,
+    setCursorPosition: (r, c) => {
+      cursor = { row: r, column: c };
+      if (selectionListeners.changeCursor) selectionListeners.changeCursor();
+    },
+    session: {
+      setMode: (m) => { mode = m; },
+      getMode: () => mode,
+      on: (evt, cb) => { sessionListeners[evt] = cb; },
+      setAnnotations: (ann) => { annotations = ann; },
+      getAnnotations: () => annotations,
+    },
+    selection: {
+      on: (evt, cb) => { selectionListeners[evt] = cb; },
+    },
+    commands: {
+      addCommand: (cmd) => { commands.push(cmd); },
+      getCommands: () => commands,
+    }
+  };
+  aceInstances[id] = instance;
+  return instance;
+}
+
+const mockDoc = {
+  getElementById: getEl,
+  createElement: (tag) => createMockElement(tag),
+  querySelectorAll: () => [],
+  addEventListener: () => {},
+};
+
+const mockWindow = {
+  addEventListener: () => {},
+  clearTimeout: clearTimeout,
+  setTimeout: setTimeout,
+  confirm: () => true,
+  prompt: () => '',
+  alert: () => {},
+  ace: {
+    edit: (id) => createMockAceInstance(id),
+  },
+};
+
+const appJs = fs.readFileSync(__APP_JS_PATH__, 'utf-8');
+const ctx = vm.createContext({
+  document: mockDoc,
+  window: mockWindow,
+  localStorage: { getItem: () => null, setItem: () => {} },
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: () => 0,
+  clearInterval: () => {},
+  WebSocket: class MockWS {},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams,
+  Headers: typeof Headers !== 'undefined' ? Headers : class MockHeaders {},
+  fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
+});
+
+vm.runInContext(appJs, ctx);
+
+// Step 1: Unit test parseEnvTextToVariables
+const parsedSample = ctx.parseEnvTextToVariables(
+  "# Comment line\\n\\nexport FOO=bar\\n  SPACED_KEY  =  spaced_value  \\nQUOTED=\\"hello world\\"\\nSINGLE='single val'\\nEQUALS=a=b=c\\n"
+);
+if (parsedSample.length !== 5) throw new Error('Expected 5 parsed vars, got ' + parsedSample.length);
+if (parsedSample[0].name !== 'FOO' || parsedSample[0].value !== 'bar') throw new Error('Failed parsing FOO=bar');
+if (parsedSample[1].name !== 'SPACED_KEY' || parsedSample[1].value !== 'spaced_value') throw new Error('Failed parsing spaced');
+if (parsedSample[2].name !== 'QUOTED' || parsedSample[2].value !== 'hello world') throw new Error('Failed unquoting double quotes');
+if (parsedSample[3].name !== 'SINGLE' || parsedSample[3].value !== 'single val') throw new Error('Failed unquoting single quotes');
+if (parsedSample[4].name !== 'EQUALS' || parsedSample[4].value !== 'a=b=c') throw new Error('Failed parsing key with multiple equals');
+
+const emptyParsed = ctx.parseEnvTextToVariables('');
+if (emptyParsed.length !== 1 || emptyParsed[0].name !== '' || emptyParsed[0].value !== '') {
+  throw new Error('Expected empty input to return [{ name: "", value: "" }]');
+}
+
+// Step 2: Unit test serializeVariablesToEnvText
+const serializedSample = ctx.serializeVariablesToEnvText([
+  { name: 'PORT', value: '8080' },
+  { name: 'TITLE', value: 'System Alerts' },
+  { name: 'EMPTY', value: '' },
+  { name: '', value: 'ignored' }
+]);
+if (!serializedSample.includes('PORT=8080')) throw new Error('Missing PORT=8080 in serialized');
+if (!serializedSample.includes('TITLE="System Alerts"')) throw new Error('Expected quoted TITLE="System Alerts"');
+if (!serializedSample.includes('EMPTY=')) throw new Error('Missing EMPTY=');
+if (serializedSample.includes('ignored')) throw new Error('Empty variable name should be skipped');
+
+// Step 3: Initialize Stack Code Editors & test renderEnvKeyValueTable
+ctx.initStackCodeEditors();
+const initialVars = [
+  { name: 'DATABASE_URL', value: 'postgres://localhost/db' },
+  { name: 'SECRET_KEY', value: 'supersecretpass' }
+];
+ctx.renderEnvKeyValueTable(initialVars);
+
+const tbody = getEl('stack-env-kv-tbody');
+let rows = tbody.querySelectorAll('.env-kv-row');
+if (rows.length !== 2) throw new Error('Expected 2 rows rendered, got ' + rows.length);
+
+const key0 = rows[0].querySelector('.env-kv-key-input').value;
+const val0 = rows[0].querySelector('.env-kv-val-input').value;
+if (key0 !== 'DATABASE_URL' || val0 !== 'postgres://localhost/db') {
+  throw new Error('Row 0 inputs mismatch: ' + key0 + '=' + val0);
+}
+
+const badge = getEl('stack-env-count-badge');
+if (badge.textContent !== '2 variables') throw new Error('Expected badge to be "2 variables", got ' + badge.textContent);
+
+// Step 4: Test adding variable rows with addEnvVariableRow
+ctx.addEnvVariableRow('DEBUG', 'true');
+rows = tbody.querySelectorAll('.env-kv-row');
+if (rows.length !== 3) throw new Error('Expected 3 rows after addEnvVariableRow, got ' + rows.length);
+if (badge.textContent !== '3 variables') throw new Error('Expected badge "3 variables", got ' + badge.textContent);
+
+// Step 5: Test toggling secret mask
+const row1ValInput = rows[1].querySelector('.env-kv-val-input');
+const row1ToggleBtn = rows[1].querySelector('.btn-toggle-secret');
+if (!row1ValInput || !row1ToggleBtn) throw new Error('Missing secret input or toggle button on row 1');
+if (row1ValInput.type !== 'text') throw new Error('Expected initial valInput.type === "text"');
+
+// Toggle to password
+row1ToggleBtn.click();
+if (row1ValInput.type !== 'password') throw new Error('Expected valInput.type === "password" after toggle click');
+if (row1ToggleBtn.title !== 'Show value') throw new Error('Expected toggle button title "Show value"');
+if (row1ToggleBtn.getAttribute('aria-label') !== 'Show value') throw new Error('Expected aria-label "Show value"');
+
+// Toggle back to text
+row1ToggleBtn.click();
+if (row1ValInput.type !== 'text') throw new Error('Expected valInput.type === "text" after second toggle click');
+if (row1ToggleBtn.title !== 'Hide value') throw new Error('Expected toggle button title "Hide value"');
+if (row1ToggleBtn.getAttribute('aria-label') !== 'Hide value') throw new Error('Expected aria-label "Hide value"');
+
+// Step 6: Test switchStackEnvMode("raw") and switchStackEnvMode("kv")
+const kvBtn = getEl('stack-env-mode-kv-btn');
+const rawBtn = getEl('stack-env-mode-raw-btn');
+const kvContainer = getEl('stack-env-kv-container');
+const rawContainer = getEl('stack-env-raw-container');
+
+// Switch to raw
+ctx.switchStackEnvMode('raw');
+if (kvBtn.classList.contains('active')) throw new Error('kvBtn should not have active class in raw mode');
+if (kvBtn.getAttribute('aria-selected') !== 'false') throw new Error('kvBtn aria-selected should be false in raw mode');
+if (!rawBtn.classList.contains('active')) throw new Error('rawBtn should have active class in raw mode');
+if (rawBtn.getAttribute('aria-selected') !== 'true') throw new Error('rawBtn aria-selected should be true in raw mode');
+if (!kvContainer.classList.contains('hidden')) throw new Error('kvContainer should have hidden class in raw mode');
+if (rawContainer.classList.contains('hidden')) throw new Error('rawContainer should not have hidden class in raw mode');
+
+const envInput = getEl('stack-env-input');
+if (!envInput.value.includes('DATABASE_URL=') || !envInput.value.includes('SECRET_KEY=')) {
+  throw new Error('Raw editor input missing synced KV content: ' + envInput.value);
+}
+
+// Switch back to kv mode
+ctx.switchStackEnvMode('kv');
+if (!kvBtn.classList.contains('active')) throw new Error('kvBtn should have active class in kv mode');
+if (kvBtn.getAttribute('aria-selected') !== 'true') throw new Error('kvBtn aria-selected should be true in kv mode');
+if (rawBtn.classList.contains('active')) throw new Error('rawBtn should not have active class in kv mode');
+if (rawBtn.getAttribute('aria-selected') !== 'false') throw new Error('rawBtn aria-selected should be false in kv mode');
+if (kvContainer.classList.contains('hidden')) throw new Error('kvContainer should not have hidden class in kv mode');
+if (!rawContainer.classList.contains('hidden')) throw new Error('rawContainer should have hidden class in kv mode');
+
+// Step 7: Verify bidirectional sync with setStackEnvValue and getStackEnvValue
+ctx.setStackEnvValue('SERVER_PORT=3000\\nAPP_ENV=production\\n');
+rows = tbody.querySelectorAll('.env-kv-row');
+if (rows.length !== 2) throw new Error('Expected 2 rows after setStackEnvValue, got ' + rows.length);
+if (rows[0].querySelector('.env-kv-key-input').value !== 'SERVER_PORT') throw new Error('Expected SERVER_PORT');
+if (rows[1].querySelector('.env-kv-key-input').value !== 'APP_ENV') throw new Error('Expected APP_ENV');
+
+// Modify row in table and verify getStackEnvValue reflects table in KV mode
+rows[0].querySelector('.env-kv-key-input').value = 'HTTP_PORT';
+rows[0].querySelector('.env-kv-val-input').value = '4000';
+const retrievedEnv = ctx.getStackEnvValue();
+if (!retrievedEnv.includes('HTTP_PORT=4000') || !retrievedEnv.includes('APP_ENV=production')) {
+  throw new Error('getStackEnvValue() did not reflect updated table inputs: ' + retrievedEnv);
+}
+
+console.log('STACK_ENV_MANAGER_PASSED');
+""".replace("__APP_JS_PATH__", json.dumps(str(self.app_js_path)))
+        proc = subprocess.run(
+            ["node", "-e", node_script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            self.fail(f"Node VM stack env manager test failed with code {proc.returncode}:\n{proc.stderr}\n{proc.stdout}")
+        self.assertIn("STACK_ENV_MANAGER_PASSED", proc.stdout)
 
 
 if __name__ == "__main__":
