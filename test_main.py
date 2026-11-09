@@ -14868,5 +14868,164 @@ ctx.apiFetch = async function(url, options = {{}}) {{
         self.assertIn("ALL_NODE_CHANNEL_PAYLOAD_AND_TARGET_DISPATCH_VM_CHECKS_PASSED", res.stdout)
 
 
+class PythonPackageManagerTests(unittest.TestCase):
+    """Tests for Python package management, SemVer bounds, PyPI check, and safe upgrade/rollback."""
+
+    def setUp(self):
+        self.pm = main.PackageManager()
+
+    def test_parse_pyproject_dependencies_and_semver_bounds(self):
+        deps = self.pm.parse_pyproject_dependencies()
+        self.assertIn("aiohttp", deps)
+        self.assertIn("fastapi", deps)
+        self.assertIn("discord-py", deps)
+
+        aiohttp_dep = deps["aiohttp"]
+        self.assertEqual(aiohttp_dep["min_version"], "3.10.5")
+        self.assertEqual(aiohttp_dep["upper_bound"], "4.0.0")
+        self.assertEqual(aiohttp_dep["constraint"], ">=3.10.5,<4.0.0")
+
+        # Test version satisfaction
+        self.assertTrue(self.pm._version_satisfies_constraint("3.10.5", ">=3.10.5,<4.0.0"))
+        self.assertTrue(self.pm._version_satisfies_constraint("3.11.2", ">=3.10.5,<4.0.0"))
+        self.assertFalse(self.pm._version_satisfies_constraint("4.0.0", ">=3.10.5,<4.0.0"))
+        self.assertFalse(self.pm._version_satisfies_constraint("3.10.4", ">=3.10.5,<4.0.0"))
+
+        # Test with other operators
+        self.assertTrue(self.pm._version_satisfies_constraint("2.4.0", ">=2.4.0,<3.0.0"))
+        self.assertFalse(self.pm._version_satisfies_constraint("3.0.0", ">=2.4.0,<3.0.0"))
+        self.assertTrue(self.pm._version_satisfies_constraint("1.0.0", "==1.0.0"))
+        self.assertFalse(self.pm._version_satisfies_constraint("1.0.1", "==1.0.0"))
+
+    def test_get_python_packages_with_pypi_and_major_held(self):
+        def mock_fetch(pkg_name, timeout=4.0):
+            if pkg_name == "aiohttp":
+                return ["3.10.5", "3.11.0", "4.0.0"]
+            elif pkg_name == "fastapi":
+                return ["0.112.0", "0.115.0"]
+            return ["1.0.0"]
+
+        with patch.object(self.pm, "_fetch_pypi_versions", side_effect=mock_fetch):
+            result = self.pm.get_python_packages(check_pypi=True)
+
+        self.assertIn("python_version", result)
+        self.assertIn("packages", result)
+        self.assertIn("summary", result)
+        self.assertTrue(result["uv_available"])
+
+        pkgs = {p["normalized_name"]: p for p in result["packages"]}
+        self.assertIn("aiohttp", pkgs)
+        aio = pkgs["aiohttp"]
+        self.assertEqual(aio["role"], "direct")
+        self.assertEqual(aio["latest_version"], "4.0.0")
+        self.assertEqual(aio["latest_compatible_version"], "3.11.0")
+        self.assertTrue(aio["major_held"])
+        self.assertEqual(aio["status"], "update_available" if aio["update_available"] else "major_held")
+
+        # Verify ordering: direct before transitive
+        seen_transitive = False
+        for p in result["packages"]:
+            if p["role"] == "transitive":
+                seen_transitive = True
+            elif p["role"] == "direct":
+                self.assertFalse(seen_transitive, "Direct package found after transitive package")
+
+        self.assertEqual(result["summary"]["total"], len(result["packages"]))
+        self.assertGreater(result["summary"]["direct"], 0)
+        self.assertGreaterEqual(result["summary"]["major_held"], 1)
+
+    def test_upgrade_python_packages_validation_and_dry_run(self):
+        with self.assertRaises(ValueError):
+            self.pm.upgrade_python_packages(packages=["invalid name; rm -rf /"])
+        with self.assertRaises(ValueError):
+            self.pm.upgrade_python_packages(packages=["--bad-option"])
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = "Would upgrade aiohttp to 3.11.0\n"
+        mock_proc.stderr = ""
+
+        with patch("subprocess.run", return_value=mock_proc) as mock_run:
+            res = self.pm.upgrade_python_packages(packages=["aiohttp"], dry_run=True)
+            self.assertTrue(res["success"])
+            self.assertTrue(res["dry_run"])
+            self.assertFalse(res["rolled_back"])
+            self.assertIn("Would upgrade aiohttp", res["output"])
+            mock_run.assert_called_once()
+            called_cmd = mock_run.call_args[0][0]
+            self.assertIn("lock", called_cmd)
+            self.assertIn("--upgrade-package", called_cmd)
+            self.assertIn("aiohttp", called_cmd)
+            self.assertIn("--dry-run", called_cmd)
+
+    def test_upgrade_python_packages_success_and_smoke_rollback(self):
+        # 1. Success path
+        mock_run_proc = MagicMock(returncode=0, stdout="Success", stderr="")
+        with patch("subprocess.run", return_value=mock_run_proc), \
+             patch.object(self.pm, "run_python_smoke_test", return_value={"passed": True, "output": "PASS", "error": "", "returncode": 0}):
+            res = self.pm.upgrade_python_packages(packages=["aiohttp"], dry_run=False, restart_service=False)
+            self.assertTrue(res["success"])
+            self.assertFalse(res["dry_run"])
+            self.assertFalse(res["rolled_back"])
+            self.assertTrue(res["smoke_test"]["passed"])
+
+        # 2. Rollback path when smoke test fails
+        with tempfile.TemporaryDirectory() as td:
+            fake_lock = Path(td) / "uv.lock"
+            fake_lock.write_text("lockfile-content-v1", encoding="utf-8")
+            with patch("main.REPO_DIR", Path(td)), \
+                 patch("subprocess.run", return_value=mock_run_proc) as mock_subproc, \
+                 patch.object(self.pm, "run_python_smoke_test", return_value={"passed": False, "output": "", "error": "Diagnostics assertion failed", "returncode": 1}):
+                res = self.pm.upgrade_python_packages(packages=["aiohttp"], dry_run=False, restart_service=False)
+                self.assertFalse(res["success"])
+                self.assertFalse(res["dry_run"])
+                self.assertTrue(res["rolled_back"])
+                self.assertIn("Pre-restart smoke test failed", res["error"])
+                self.assertEqual(fake_lock.read_text(encoding="utf-8"), "lockfile-content-v1")
+                rollback_calls = [
+                    call[0][0] for call in mock_subproc.call_args_list
+                    if isinstance(call[0][0], list) and "--frozen" in call[0][0]
+                ]
+                self.assertTrue(len(rollback_calls) > 0)
+
+    def test_api_python_packages_auth_guard_and_endpoints(self):
+        # 1. Auth Guard (401 without auth)
+        get_resp = asgi_get(api.app, "/api/packages/python")
+        self.assertEqual(get_resp.status_code, 401)
+
+        check_resp = asgi_post(api.app, "/api/packages/python/check")
+        self.assertEqual(check_resp.status_code, 401)
+
+        upgrade_resp = asgi_post(api.app, "/api/packages/python/upgrade", json_body={"dry_run": True})
+        self.assertEqual(upgrade_resp.status_code, 401)
+
+        # 2. Authenticated Endpoints
+        api.app.dependency_overrides[api.require_auth] = lambda: "admin"
+        try:
+            # GET /api/packages/python
+            with patch.object(main.package_manager, "get_python_packages", return_value={"python_version": "3.11", "packages": [], "summary": {}}) as mock_get:
+                resp = asgi_get(api.app, "/api/packages/python?check_pypi=false")
+                self.assertEqual(resp.status_code, 200)
+                mock_get.assert_called_once_with(False)
+
+            # POST /api/packages/python/check
+            with patch.object(main.package_manager, "get_python_packages", return_value={"python_version": "3.11", "packages": [], "summary": {}}) as mock_check:
+                resp = asgi_post(api.app, "/api/packages/python/check")
+                self.assertEqual(resp.status_code, 200)
+                mock_check.assert_called_once_with(True)
+
+            # POST /api/packages/python/upgrade invalid name -> 400
+            resp = asgi_post(api.app, "/api/packages/python/upgrade", json_body={"packages": ["bad;rm -rf /"]})
+            self.assertEqual(resp.status_code, 400)
+
+            # POST /api/packages/python/upgrade valid
+            with patch.object(main.package_manager, "upgrade_python_packages", return_value={"success": True, "dry_run": True, "rolled_back": False}):
+                resp = asgi_post(api.app, "/api/packages/python/upgrade", json_body={"packages": ["aiohttp"], "dry_run": True})
+                self.assertEqual(resp.status_code, 200)
+                self.assertTrue(resp.json()["success"])
+        finally:
+            api.app.dependency_overrides.pop(api.require_auth, None)
+
+
 if __name__ == "__main__":
     unittest.main()

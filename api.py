@@ -2141,6 +2141,65 @@ def api_packages_upgrade(
         raise HTTPException(status_code=500, detail=f"Error executing package upgrade: {exc}")
 
 
+class PythonPackageUpgradeRequest(BaseModel):
+    packages: Optional[list[str]] = None
+    dry_run: bool = False
+    restart_service: bool = False
+
+
+@app.get("/api/packages/python")
+async def api_packages_python(
+    check_pypi: bool = Query(default=False),
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(main.package_manager.get_python_packages, check_pypi)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error checking Python packages: {exc}")
+
+
+@app.post("/api/packages/python/check")
+async def api_packages_python_check(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        return await asyncio.to_thread(main.package_manager.get_python_packages, True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error checking Python package updates: {exc}")
+
+
+@app.post("/api/packages/python/upgrade")
+async def api_packages_python_upgrade(
+    req: PythonPackageUpgradeRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        res = await asyncio.to_thread(
+            main.package_manager.upgrade_python_packages,
+            req.packages,
+            req.dry_run,
+            req.restart_service,
+        )
+        if not req.dry_run:
+            target_desc = (
+                f"packages ({', '.join(req.packages)})"
+                if req.packages
+                else "all packages"
+            )
+            status_desc = "succeeded" if res.get("success") else "failed"
+            main.record_audit_event(
+                "packages.python.upgrade",
+                f"Python upgrade of {target_desc} {status_desc}",
+                actor=_user,
+                severity="info" if res.get("success") else "warning",
+            )
+        return res
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error executing Python package upgrade: {exc}")
+
+
 # ============================================================================
 # Process Explorer Routes
 # ============================================================================

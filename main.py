@@ -20,6 +20,8 @@ import sys
 import tarfile
 import threading
 import time
+import importlib.metadata
+import urllib.request
 from urllib.parse import urlparse
 import aiohttp
 import discord
@@ -7715,6 +7717,8 @@ class PackageManager:
         self._installed_cache_ttl: float = 60.0
         self._updates_cache: Optional[tuple[float, dict[str, Any]]] = None
         self._updates_cache_ttl: float = 120.0
+        self._python_cache: Optional[tuple[float, dict[str, Any]]] = None
+        self._python_cache_ttl: float = 120.0
 
     def is_supported(self) -> bool:
         """Check if Debian/Ubuntu packaging tools (dpkg/dpkg-query/apt) are present."""
@@ -7724,6 +7728,7 @@ class PackageManager:
         with self._cache_lock:
             self._installed_cache = None
             self._updates_cache = None
+            self._python_cache = None
 
     def get_reboot_status(self) -> dict[str, Any]:
         """Detect whether a system reboot is required on Debian/Ubuntu systems."""
@@ -8222,6 +8227,505 @@ class PackageManager:
                 "output": "",
                 "error": str(exc),
                 "returncode": -1,
+            }
+
+    @staticmethod
+    def _normalize_py_pkg_name(name: str) -> str:
+        """Normalize Python distribution names per PEP 503."""
+        return re.sub(r"[-_.]+", "-", name.strip().lower())
+
+    @staticmethod
+    def _parse_pyproject_dependencies() -> dict[str, dict[str, Any]]:
+        pyproject_path = REPO_DIR / "pyproject.toml"
+        deps: dict[str, dict[str, Any]] = {}
+        if not pyproject_path.is_file():
+            return deps
+
+        raw_dep_strings: list[str] = []
+        try:
+            try:
+                import tomllib
+                with open(pyproject_path, "rb") as f:
+                    data = tomllib.load(f)
+                raw_dep_strings = data.get("project", {}).get("dependencies", [])
+            except Exception:
+                raw_dep_strings = []
+        except Exception:
+            raw_dep_strings = []
+
+        if not raw_dep_strings:
+            try:
+                content = pyproject_path.read_text(encoding="utf-8")
+                m = re.search(r"dependencies\s*=\s*\[(.*?)\]", content, re.DOTALL)
+                if m:
+                    for line in m.group(1).splitlines():
+                        cleaned = line.strip().rstrip(",").strip().strip('"\'')
+                        if cleaned and not cleaned.startswith("#"):
+                            raw_dep_strings.append(cleaned)
+            except Exception:
+                pass
+
+        for dep_str in raw_dep_strings:
+            m = re.match(r"^([a-zA-Z0-9_\-\.]+)(.*)$", dep_str.strip())
+            if not m:
+                continue
+            raw_name = m.group(1).strip()
+            constraint = m.group(2).strip()
+            norm_name = PackageManager._normalize_py_pkg_name(raw_name)
+
+            min_m = re.search(r">=\s*([0-9a-zA-Z\.\-]+)", constraint)
+            min_ver = min_m.group(1).strip() if min_m else ""
+            if not min_ver:
+                eq_m = re.search(r"==\s*([0-9a-zA-Z\.\-]+)", constraint)
+                min_ver = eq_m.group(1).strip() if eq_m else ""
+
+            upper_m = re.search(r"<\s*([0-9a-zA-Z\.\-]+)", constraint)
+            upper_bound = upper_m.group(1).strip() if upper_m else ""
+
+            dep_info = {
+                "name": raw_name,
+                "normalized_name": norm_name,
+                "constraint": constraint,
+                "min_version": min_ver,
+                "upper_bound": upper_bound,
+            }
+            deps[norm_name] = dep_info
+            deps[raw_name] = dep_info
+
+        return deps
+
+    def parse_pyproject_dependencies(self) -> dict[str, dict[str, Any]]:
+        return self._parse_pyproject_dependencies()
+
+    @staticmethod
+    def _version_satisfies_constraint(version_str: str, constraint_str: str) -> bool:
+        if not constraint_str or not constraint_str.strip():
+            return True
+        v_parsed = _parse_semver(version_str)
+        clauses = [c.strip() for c in constraint_str.split(",") if c.strip()]
+        for clause in clauses:
+            m = re.match(r"^(>=|<=|>|<|==|!=)\s*([0-9a-zA-Z\.\-]+)$", clause)
+            if not m:
+                continue
+            op, target_str = m.group(1), m.group(2)
+            t_parsed = _parse_semver(target_str)
+            max_len = max(len(v_parsed), len(t_parsed), 3)
+            v_pad = v_parsed + (0,) * (max_len - len(v_parsed))
+            t_pad = t_parsed + (0,) * (max_len - len(t_parsed))
+            if op == ">=" and not (v_pad >= t_pad):
+                return False
+            elif op == "<=" and not (v_pad <= t_pad):
+                return False
+            elif op == ">" and not (v_pad > t_pad):
+                return False
+            elif op == "<" and not (v_pad < t_pad):
+                return False
+            elif op == "==" and not (v_pad == t_pad):
+                return False
+            elif op == "!=" and not (v_pad != t_pad):
+                return False
+        return True
+
+    @staticmethod
+    def _is_newer_semver(v1: str, v2: str) -> bool:
+        p1 = _parse_semver(v1)
+        p2 = _parse_semver(v2)
+        ml = max(len(p1), len(p2), 3)
+        return (p1 + (0,) * (ml - len(p1))) > (p2 + (0,) * (ml - len(p2)))
+
+    @staticmethod
+    def _fetch_pypi_versions(pkg_name: str, timeout: float = 4.0) -> list[str]:
+        url = f"https://pypi.org/pypi/{pkg_name}/json"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "vigil-systemalerts/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return []
+
+        releases = data.get("releases", {})
+        if not isinstance(releases, dict):
+            return []
+
+        prerelease_patterns = ("a", "b", "rc", "dev", "alpha", "beta")
+        stable_versions: list[str] = []
+
+        for ver_str, files in releases.items():
+            if not isinstance(ver_str, str) or not ver_str.strip():
+                continue
+            ver_clean = ver_str.strip()
+            ver_lower = ver_clean.lower()
+
+            is_prerelease = any(
+                re.search(rf"(?:^|[-._\d]){re.escape(tok)}(?:\d+|$|[-._])", ver_lower)
+                for tok in prerelease_patterns
+            )
+            if is_prerelease:
+                continue
+
+            is_yanked = False
+            if isinstance(files, list):
+                if files and all(isinstance(f, dict) and f.get("yanked", False) for f in files):
+                    is_yanked = True
+                elif any(isinstance(f, dict) and f.get("yanked", False) for f in files):
+                    is_yanked = True
+            elif isinstance(files, dict) and files.get("yanked", False):
+                is_yanked = True
+
+            if is_yanked:
+                continue
+
+            stable_versions.append(ver_clean)
+
+        stable_versions.sort(key=_parse_semver)
+        return stable_versions
+
+    def get_python_packages(self, check_pypi: bool = False) -> dict[str, Any]:
+        dists = list(importlib.metadata.distributions())
+        seen: set[str] = set()
+        raw_pkgs: list[dict[str, Any]] = []
+
+        for d in dists:
+            name = d.metadata.get("Name") or getattr(d, "name", "") or ""
+            if not name:
+                continue
+            norm = self._normalize_py_pkg_name(name)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            version = d.version or "0.0.0"
+            summary = d.metadata.get("Summary", "") or ""
+            if summary.lower() == "unknown":
+                summary = ""
+            raw_pkgs.append({
+                "name": name,
+                "normalized_name": norm,
+                "installed_version": version,
+                "summary": summary,
+            })
+        raw_pkgs.sort(key=lambda x: x["name"].lower())
+
+        deps = self.parse_pyproject_dependencies()
+        for pkg in raw_pkgs:
+            norm = pkg["normalized_name"]
+            raw = pkg["name"]
+            dep_meta = deps.get(norm) or deps.get(raw)
+            if dep_meta is not None:
+                pkg["role"] = "direct"
+                pkg["constraint"] = dep_meta.get("constraint", "")
+            else:
+                pkg["role"] = "transitive"
+                pkg["constraint"] = ""
+
+        cached_pkgs: dict[str, dict[str, Any]] = {}
+        with self._cache_lock:
+            if self._python_cache is not None:
+                cached_ts, cached_payload = self._python_cache
+                if (time.time() - cached_ts) < self._python_cache_ttl:
+                    for p in cached_payload.get("packages", []):
+                        cached_pkgs[p["normalized_name"]] = p
+
+        pypi_versions_map: dict[str, list[str]] = {}
+        if check_pypi:
+            if len(raw_pkgs) <= 40:
+                pkgs_to_check = raw_pkgs
+            else:
+                pkgs_to_check = [p for p in raw_pkgs if p["role"] == "direct"]
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                future_to_norm = {
+                    executor.submit(self._fetch_pypi_versions, p["name"]): p["normalized_name"]
+                    for p in pkgs_to_check
+                }
+                for future in concurrent.futures.as_completed(future_to_norm):
+                    norm = future_to_norm[future]
+                    try:
+                        pypi_versions_map[norm] = future.result()
+                    except Exception:
+                        pypi_versions_map[norm] = []
+
+        packages_list: list[dict[str, Any]] = []
+        for pkg in raw_pkgs:
+            norm = pkg["normalized_name"]
+            inst_ver = pkg["installed_version"]
+            constraint = pkg["constraint"]
+
+            if check_pypi:
+                pypi_versions = pypi_versions_map.get(norm, [])
+                if pypi_versions:
+                    latest_version = pypi_versions[-1]
+                    if constraint:
+                        compat = [
+                            v for v in pypi_versions
+                            if self._version_satisfies_constraint(v, constraint)
+                        ]
+                        latest_compatible_version = compat[-1] if compat else inst_ver
+                    else:
+                        latest_compatible_version = latest_version
+                else:
+                    latest_version = inst_ver
+                    latest_compatible_version = inst_ver
+            elif norm in cached_pkgs:
+                cached_p = cached_pkgs[norm]
+                latest_version = cached_p.get("latest_version", inst_ver)
+                latest_compatible_version = cached_p.get("latest_compatible_version", inst_ver)
+            else:
+                latest_version = inst_ver
+                latest_compatible_version = inst_ver
+
+            update_available = self._is_newer_semver(latest_compatible_version, inst_ver)
+            major_held = self._is_newer_semver(latest_version, latest_compatible_version)
+            if update_available:
+                status = "update_available"
+            elif major_held:
+                status = "major_held"
+            else:
+                status = "up_to_date"
+
+            packages_list.append({
+                "name": pkg["name"],
+                "normalized_name": norm,
+                "installed_version": inst_ver,
+                "latest_version": latest_version,
+                "latest_compatible_version": latest_compatible_version,
+                "role": pkg["role"],
+                "constraint": constraint,
+                "update_available": update_available,
+                "major_held": major_held,
+                "status": status,
+                "summary": pkg["summary"],
+            })
+
+        packages_list.sort(key=lambda p: (0 if p["role"] == "direct" else 1, p["name"].lower()))
+
+        result = {
+            "python_version": platform.python_version(),
+            "venv_path": sys.prefix,
+            "uv_available": bool(_resolve_uv_binary()),
+            "packages": packages_list,
+            "summary": {
+                "total": len(packages_list),
+                "direct": sum(1 for p in packages_list if p["role"] == "direct"),
+                "transitive": sum(1 for p in packages_list if p["role"] == "transitive"),
+                "updates_available": sum(1 for p in packages_list if p["update_available"]),
+                "major_held": sum(1 for p in packages_list if p["major_held"]),
+            },
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if check_pypi:
+            with self._cache_lock:
+                self._python_cache = (time.time(), result)
+
+        return result
+
+    def run_python_smoke_test(self) -> dict[str, Any]:
+        cmd = [
+            sys.executable,
+            "-c",
+            "import main, api; diag = main.run_system_diagnostics(); assert diag.get('overall_status') in ('PASS', 'WARN'), f'Diagnostics failed: {diag}'",
+        ]
+        try:
+            res = subprocess.run(
+                cmd,
+                cwd=str(REPO_DIR),
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return {
+                "passed": res.returncode == 0,
+                "output": res.stdout.strip(),
+                "error": res.stderr.strip(),
+                "returncode": res.returncode,
+            }
+        except Exception as exc:
+            return {
+                "passed": False,
+                "output": "",
+                "error": str(exc),
+                "returncode": -1,
+            }
+
+    def upgrade_python_packages(
+        self,
+        packages: Optional[list[str]] = None,
+        dry_run: bool = False,
+        restart_service: bool = False,
+    ) -> dict[str, Any]:
+        clean_pkgs: list[str] = []
+        if packages is not None:
+            for pkg in packages:
+                p_str = str(pkg).strip()
+                if not p_str or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$", p_str):
+                    raise ValueError(f"Invalid package name: '{pkg}'")
+                clean_pkgs.append(p_str)
+
+        uv_bin = _resolve_uv_binary()
+        if clean_pkgs:
+            lock_cmd = [uv_bin, "lock"] + [arg for p in clean_pkgs for arg in ("--upgrade-package", p)]
+        else:
+            lock_cmd = [uv_bin, "lock", "--upgrade"]
+
+        if dry_run:
+            try:
+                res = subprocess.run(
+                    lock_cmd + ["--dry-run"],
+                    cwd=str(REPO_DIR),
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                return {
+                    "success": res.returncode == 0,
+                    "dry_run": True,
+                    "rolled_back": False,
+                    "output": (res.stdout or "") + (res.stderr or ""),
+                    "error": res.stderr.strip() if res.returncode != 0 else "",
+                    "returncode": res.returncode,
+                }
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "dry_run": True,
+                    "rolled_back": False,
+                    "output": "",
+                    "error": str(exc),
+                    "returncode": -1,
+                }
+
+        uv_lock_path = REPO_DIR / "uv.lock"
+        lock_snapshot: Optional[bytes] = None
+        if uv_lock_path.is_file():
+            try:
+                lock_snapshot = uv_lock_path.read_bytes()
+            except Exception:
+                lock_snapshot = None
+
+        try:
+            lock_res = subprocess.run(
+                lock_cmd,
+                cwd=str(REPO_DIR),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if lock_res.returncode != 0:
+                if lock_snapshot is not None:
+                    uv_lock_path.write_bytes(lock_snapshot)
+                return {
+                    "success": False,
+                    "dry_run": False,
+                    "rolled_back": True,
+                    "output": (lock_res.stdout or "") + (lock_res.stderr or ""),
+                    "error": lock_res.stderr.strip() or "uv lock failed",
+                    "returncode": lock_res.returncode,
+                }
+
+            sync_res = subprocess.run(
+                [uv_bin, "sync"],
+                cwd=str(REPO_DIR),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if sync_res.returncode != 0:
+                if lock_snapshot is not None:
+                    uv_lock_path.write_bytes(lock_snapshot)
+                    try:
+                        subprocess.run(
+                            [uv_bin, "sync", "--frozen"],
+                            cwd=str(REPO_DIR),
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                    except Exception:
+                        pass
+                return {
+                    "success": False,
+                    "dry_run": False,
+                    "rolled_back": True,
+                    "output": (sync_res.stdout or "") + (sync_res.stderr or ""),
+                    "error": sync_res.stderr.strip() or "uv sync failed",
+                    "returncode": sync_res.returncode,
+                }
+
+            smoke = self.run_python_smoke_test()
+            if not smoke.get("passed"):
+                if lock_snapshot is not None:
+                    uv_lock_path.write_bytes(lock_snapshot)
+                    try:
+                        subprocess.run(
+                            [uv_bin, "sync", "--frozen"],
+                            cwd=str(REPO_DIR),
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                    except Exception:
+                        pass
+                return {
+                    "success": False,
+                    "dry_run": False,
+                    "rolled_back": True,
+                    "smoke_test": smoke,
+                    "output": (lock_res.stdout or "") + (sync_res.stdout or ""),
+                    "error": f"Pre-restart smoke test failed; environment automatically rolled back: {smoke.get('error') or smoke.get('output')}",
+                    "returncode": 1,
+                }
+
+            self.invalidate_cache()
+
+            if restart_service:
+                try:
+                    subprocess.Popen(
+                        [
+                            "bash",
+                            "-c",
+                            "sleep 2 && (systemctl restart vigil 2>/dev/null || systemctl restart raidcheck raidcheck-web)",
+                        ],
+                        cwd=str(REPO_DIR),
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except OSError as e:
+                    logging.warning(f"Could not spawn delayed service restart: {e}")
+
+            return {
+                "success": True,
+                "dry_run": False,
+                "rolled_back": False,
+                "smoke_test": smoke,
+                "restarting": bool(restart_service),
+                "output": (lock_res.stdout or "") + (sync_res.stdout or ""),
+                "error": "",
+                "returncode": 0,
+            }
+        except Exception as exc:
+            if lock_snapshot is not None:
+                try:
+                    uv_lock_path.write_bytes(lock_snapshot)
+                    subprocess.run(
+                        [uv_bin, "sync", "--frozen"],
+                        cwd=str(REPO_DIR),
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "dry_run": False,
+                "rolled_back": True,
+                "output": "",
+                "error": str(exc),
+                "returncode": 1,
             }
 
 
@@ -13192,6 +13696,7 @@ def run_system_diagnostics(db_path: Optional[Path] = None) -> dict[str, Any]:
 
     return {
         "status": overall_status,
+        "overall_status": "PASS" if passed_count == total_count else ("WARN" if passed_count > 0 else "FAIL"),
         "duration_ms": duration_ms,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checks_passed": passed_count,
