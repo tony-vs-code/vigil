@@ -83,6 +83,7 @@
   </div>
 
   <div id="sidebar-backdrop" class="sidebar-backdrop" aria-hidden="true"></div>
+  <div id="mobile-nav-backdrop" class="mobile-nav-backdrop" aria-hidden="true"></div>
 
   <!-- Authenticated Application Shell -->
   <div id="app-shell" class="app-layout">
@@ -389,37 +390,46 @@
     <!-- Main Content Area (#app-main-content) -->
     <main id="app-main-content" class="app-main-content">
       <header class="main-topbar">
-        <div class="topbar-left">
-          <button id="sidebar-toggle-btn" class="btn-sidebar-toggle" type="button" aria-label="Toggle Navigation Sidebar">
-            <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <line x1="3" y1="12" x2="21" y2="12"></line>
-              <line x1="3" y1="6" x2="21" y2="6"></line>
-              <line x1="3" y1="18" x2="21" y2="18"></line>
-            </svg>
-          </button>
-          <h2 id="page-title" class="topbar-page-title">System Overview</h2>
-        </div>
+        <div id="app-topbar" class="app-topbar">
+          <div class="topbar-left">
+            <button id="btn-mobile-nav-toggle" class="btn-mobile-nav-toggle" type="button" aria-label="Toggle Navigation Drawer">
+              <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
+            <button id="sidebar-toggle-btn" class="btn-sidebar-toggle" type="button" aria-label="Toggle Navigation Sidebar">
+              <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
+            <h2 id="page-title" class="topbar-page-title">System Overview</h2>
+          </div>
 
-        <div class="topbar-right">
-          <span id="last-updated" class="last-updated">Never updated</span>
+          <div class="topbar-right">
+            <span id="last-updated" class="last-updated">Never updated</span>
 
-          <button id="btn-topbar-notifications" class="btn-topbar-notif" type="button" title="View Notifications &amp; Alerts" aria-label="Open notifications and alerts drawer">
-            <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
-              <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
-            </svg>
-            <span>Alerts</span>
-            <span id="notif-drawer-badge" class="notif-drawer-badge hidden">0</span>
-          </button>
+            <button id="btn-topbar-notifications" class="btn-topbar-notif" type="button" title="View Notifications &amp; Alerts" aria-label="Open notifications and alerts drawer">
+              <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
+              </svg>
+              <span>Alerts</span>
+              <span id="notif-drawer-badge" class="notif-drawer-badge hidden">0</span>
+            </button>
 
-          <button id="refresh-btn" class="btn-refresh" type="button" aria-label="Refresh dashboard data">
-            <svg class="refresh-icon" viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="23 4 23 10 17 10"></polyline>
-              <polyline points="1 20 1 14 7 14"></polyline>
-              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
-            </svg>
-            <span>Refresh</span>
-          </button>
+            <button id="refresh-btn" class="btn-refresh" type="button" aria-label="Refresh dashboard data">
+              <svg class="refresh-icon" viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"></polyline>
+                <polyline points="1 20 1 14 7 14"></polyline>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+              </svg>
+              <span>Refresh</span>
+            </button>
+          </div>
         </div>
       </header>
 

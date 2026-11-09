@@ -594,6 +594,16 @@ body {
   z-index: 50;
 }
 
+.app-topbar,
+#app-topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
 .topbar-left {
   display: flex;
   align-items: center;
@@ -641,7 +651,7 @@ body {
   margin: 0 auto;
 }
 
-/* Sidebar Backdrop (Mobile) */
+/* Sidebar & Mobile Navigation Backdrop */
 .sidebar-backdrop {
   position: fixed;
   inset: 0;
@@ -653,6 +663,30 @@ body {
 
 .sidebar-backdrop.active {
   display: block;
+}
+
+#mobile-nav-backdrop,
+.mobile-nav-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 999;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease-in-out;
+}
+
+#mobile-nav-backdrop.active,
+.mobile-nav-backdrop.active,
+#app-sidebar.mobile-open ~ #mobile-nav-backdrop,
+.app-sidebar.mobile-open ~ .mobile-nav-backdrop {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+#btn-mobile-nav-toggle,
+.btn-mobile-nav-toggle {
+  display: none;
 }
 
 /* Legacy Header & Top Nav compatibility styles */
@@ -1952,6 +1986,15 @@ hr.overview-flow-divider {
   border: none;
   padding: 0;
   margin-bottom: 20px;
+  width: 100%;
+}
+
+.status-ribbon-compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
 }
 
 /* Flat ribbon variant for overview flow layout — no container chrome */
@@ -1967,6 +2010,22 @@ hr.overview-flow-divider {
   flex-wrap: wrap;
   align-items: stretch;
   gap: 10px;
+  width: 100%;
+}
+
+.status-ribbon-compact.overview-ribbon-flat {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0 0 16px 0;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 10px;
+  width: 100%;
 }
 
 .overview-ribbon-flat .status-ribbon-item {
@@ -2065,15 +2124,21 @@ hr.overview-flow-divider {
 
 @media (max-width: 900px) {
   .overview-status-ribbon,
-  .overview-status-ribbon.overview-ribbon-flat {
-    flex-direction: column;
+  .overview-status-ribbon.overview-ribbon-flat,
+  .status-ribbon-compact {
+    display: flex;
+    flex-wrap: wrap;
     align-items: stretch;
-    gap: 12px;
+    gap: 10px;
+  }
+  .status-ribbon-item,
+  .overview-ribbon-flat .status-ribbon-item {
+    flex: 1 1 140px;
+    min-width: 130px;
   }
   .status-ribbon-divider,
   .overview-ribbon-flat .status-ribbon-divider {
-    width: 100%;
-    height: 1px;
+    display: none;
   }
 }
 
@@ -2789,11 +2854,18 @@ hr.overview-flow-divider {
 
 /* Tables */
 .table-container {
+  max-width: 100%;
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
 }
 
-.data-table {
+.data-table,
+.table-container > table {
   width: 100%;
+  min-width: 580px;
   border-collapse: collapse;
   font-size: 0.88rem;
 }
@@ -4019,16 +4091,21 @@ hr.overview-flow-divider {
   display: none;
 }
 
-.snippet-toolbar {
+.snippet-toolbar,
+#stack-snippet-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  overflow-x: auto;
+  white-space: nowrap;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 6px;
   gap: 6px;
   margin: 8px 0;
-  padding: 6px 10px;
+  padding: 6px 10px 8px;
   background: var(--bg-card-elevated, #0f172a);
   border: 1px solid var(--border-subtle, #1e293b);
   border-radius: 6px;
+  scrollbar-width: thin;
 }
 
 .snippet-toolbar-label {
@@ -4535,11 +4612,16 @@ hr.overview-flow-divider {
 
 .env-kv-table-wrapper {
   max-height: 380px;
+  max-width: 100%;
   overflow-y: auto;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
-.env-kv-table {
+.env-kv-table,
+#stack-env-kv-table {
   width: 100%;
+  min-width: 440px;
   border-collapse: collapse;
 }
 
@@ -5094,6 +5176,166 @@ hr.overview-flow-divider {
   }
 }
 
+@media (max-width: 768px) {
+  /* 1. Mobile Navigation Drawer & Topbar */
+  #app-sidebar,
+  .app-sidebar {
+    position: fixed !important;
+    top: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    z-index: 1000 !important;
+    transform: translateX(-100%) !important;
+    transition: transform 0.25s ease-in-out !important;
+    width: 280px !important;
+    max-width: 85vw !important;
+    box-shadow: 10px 0 30px rgba(0, 0, 0, 0.7) !important;
+  }
+
+  #app-sidebar.mobile-open,
+  .app-sidebar.mobile-open,
+  #app-sidebar.open,
+  .app-sidebar.open {
+    transform: translateX(0) !important;
+  }
+
+  #btn-mobile-nav-toggle,
+  .btn-mobile-nav-toggle {
+    display: flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-primary);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+  }
+
+  #btn-mobile-nav-toggle:hover,
+  .btn-mobile-nav-toggle:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: var(--accent-primary);
+  }
+
+  #app-topbar,
+  .main-topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 14px;
+    min-width: 0;
+  }
+
+  #app-topbar .topbar-left,
+  .main-topbar .topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  #app-topbar .topbar-right,
+  .main-topbar .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  #page-title,
+  .topbar-page-title {
+    font-size: 1.05rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+
+  .last-updated {
+    font-size: 0.72rem;
+  }
+
+  /* 2. Responsive Content Padding & Grids */
+  .app-main-content {
+    padding: 12px 14px !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box;
+  }
+
+  .main-content-scroll {
+    padding: 10px 4px 32px !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+    box-sizing: border-box;
+  }
+
+  .metrics-grid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .memory-chunks-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+
+  /* 4. Modals & Dialog Overhaul */
+  .modal-overlay {
+    padding: 8px !important;
+  }
+
+  .modal-card,
+  .stack-modal-card,
+  .app-catalog-modal-card,
+  .terminal-modal-card,
+  .settings-modal-card,
+  .confirm-modal-card,
+  .settings-card,
+  .logs-modal-card,
+  .volume-modal-card,
+  .update-modal-card,
+  .notif-modal-card,
+  .probe-modal-card,
+  .smart-modal-card,
+  .firewall-modal-card {
+    width: 95vw !important;
+    max-width: 95vw !important;
+    max-height: 92vh !important;
+    margin: 10px auto !important;
+    padding: 14px !important;
+    box-sizing: border-box !important;
+    overflow-y: auto !important;
+  }
+
+  .modal-header,
+  .terminal-modal-header,
+  .modal-body,
+  .modal-actions,
+  .terminal-footer-bar {
+    flex-wrap: wrap !important;
+    gap: 8px;
+  }
+
+  .modal-actions {
+    justify-content: flex-end;
+  }
+
+  .modal-actions button,
+  .modal-actions .btn-primary,
+  .modal-actions .btn-secondary,
+  .modal-actions .btn-danger {
+    flex-grow: 1;
+    min-width: 100px;
+  }
+}
+
 @media (max-width: 640px) {
   .metrics-grid,
   .settings-grid,
@@ -5143,6 +5385,59 @@ hr.overview-flow-divider {
     margin-left: 0;
     flex-direction: column;
     align-items: flex-start;
+  }
+}
+
+@media (max-width: 600px) {
+  /* 3. Table Controls & Filter Bar Stacking */
+  .table-controls-bar,
+  .view-controls {
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 8px !important;
+    width: 100% !important;
+  }
+
+  .table-controls-bar .search-box,
+  .table-controls-bar .filter-actions,
+  .search-box,
+  .filter-actions {
+    max-width: 100% !important;
+    min-width: 100% !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    flex-wrap: wrap !important;
+  }
+
+  .table-controls-bar .search-box input {
+    width: 100% !important;
+  }
+
+  /* 5. Env KV table inputs adapt on small screens */
+  #stack-env-kv-table {
+    min-width: 360px !important;
+  }
+
+  #stack-env-kv-table th,
+  #stack-env-kv-table td {
+    padding: 5px 4px !important;
+  }
+
+  .env-kv-key-input,
+  .env-kv-val-input {
+    font-size: 0.78rem !important;
+    padding: 5px 6px !important;
+    min-width: 80px !important;
+  }
+}
+
+@media (max-width: 420px) {
+  .memory-chunks-grid {
+    grid-template-columns: 1fr !important;
+  }
+  #page-title,
+  .topbar-page-title {
+    max-width: 120px !important;
   }
 }
 
