@@ -722,6 +722,247 @@ const appJs = fs.readFileSync({str(self.app_js_path)!r}, 'utf-8');
         self.assertEqual(res.returncode, 0, f"Node VM failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
         self.assertIn("FORMAT_SNIPPETS_AND_KEYDOWN_PASSED", res.stdout)
 
+    def test_sequential_and_repeated_snippet_insertions_roundtrip_with_backend_formatter(self):
+        """Verify repeated and sequential snippet clicks round-trip cleanly with DockerManager.format_compose_yaml
+        and openStackEditor() unhides #stack-editor-modal before initializing Ace editors."""
+        import json
+
+        dm = main.DockerManager()
+
+        node_driver = f"""
+const fs = require('fs');
+const vm = require('vm');
+const readline = require('readline');
+
+function createMockElement(id) {{
+  const classes = new Set();
+  const attributes = {{}};
+  return {{
+    id: id,
+    style: {{}},
+    children: [],
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    appendChild: (c) => c,
+    removeChild: (c) => c,
+    addEventListener: () => {{}},
+    focus: () => {{}},
+    classList: {{
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    setAttribute: (name, val) => {{ attributes[name] = String(val); }},
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+    value: '',
+    disabled: false,
+    checked: true,
+    innerHTML: '',
+    textContent: ''
+  }};
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) elements[id] = createMockElement(id);
+  return elements[id];
+}}
+
+// Start with modal hidden to verify openStackEditor() unhides it before initStackCodeEditors()
+getEl('stack-editor-modal').classList.add('hidden');
+let modalWasHiddenDuringAceInit = null;
+
+function createMockAceInstance(id) {{
+  if (modalWasHiddenDuringAceInit === null) {{
+    modalWasHiddenDuringAceInit = getEl('stack-editor-modal').classList.contains('hidden');
+  }}
+  let val = '';
+  const sessionListeners = {{}};
+  return {{
+    id,
+    setTheme: () => {{}},
+    setOptions: () => {{}},
+    getValue: () => val,
+    setValue: (v) => {{
+      val = String(v ?? '');
+      if (sessionListeners.change) sessionListeners.change();
+    }},
+    resize: () => {{}},
+    focus: () => {{}},
+    getCursorPosition: () => ({{ row: 0, column: 0 }}),
+    session: {{
+      setMode: () => {{}},
+      on: (evt, cb) => {{ sessionListeners[evt] = cb; }},
+      setAnnotations: () => {{}},
+    }},
+    selection: {{ on: () => {{}} }},
+    commands: {{ addCommand: () => {{}} }}
+  }};
+}}
+
+const ctx = vm.createContext({{
+  document: {{
+    getElementById: getEl,
+    createElement: (tag) => createMockElement(tag),
+    querySelectorAll: () => [],
+    addEventListener: () => {{}},
+  }},
+  window: {{
+    addEventListener: () => {{}},
+    clearTimeout: clearTimeout,
+    setTimeout: setTimeout,
+    ace: {{ edit: (id) => createMockAceInstance(id) }},
+  }},
+  localStorage: {{ getItem: () => null, setItem: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: () => 0,
+  clearInterval: () => {{}},
+  WebSocket: class MockWS {{}},
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  URLSearchParams: URLSearchParams,
+  Headers: typeof Headers !== 'undefined' ? Headers : class MockHeaders {{}},
+  fetch: async () => ({{ ok: true, status: 200, json: async () => ({{ valid: true }}) }}),
+}});
+
+const appJs = fs.readFileSync({str(self.app_js_path)!r}, 'utf-8');
+vm.runInContext(appJs, ctx);
+
+const rl = readline.createInterface({{ input: process.stdin, output: process.stdout, terminal: false }});
+rl.on('line', async (line) => {{
+  if (!line.trim()) return;
+  const req = JSON.parse(line);
+  if (req.cmd === 'openStackEditor') {{
+    await ctx.openStackEditor();
+    process.stdout.write(JSON.stringify({{
+      modalWasHiddenDuringAceInit,
+      modalHiddenNow: getEl('stack-editor-modal').classList.contains('hidden'),
+    }}) + '\\n');
+  }} else if (req.cmd === 'applySnippet') {{
+    const out = ctx.applySnippetToComposeYaml(req.yaml, req.snippetType);
+    process.stdout.write(JSON.stringify({{ yaml: out }}) + '\\n');
+  }}
+}});
+"""
+        proc = subprocess.Popen(
+            ["node", "-e", node_driver],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            def send_cmd(payload: dict) -> dict:
+                assert proc.stdin is not None and proc.stdout is not None
+                proc.stdin.write(json.dumps(payload) + "\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    err = proc.stderr.read() if proc.stderr else ""
+                    self.fail(f"Node VM exited unexpectedly. STDERR:\n{err}")
+                return json.loads(line)
+
+            # Verify openStackEditor() unhides #stack-editor-modal BEFORE initStackCodeEditors()
+            open_res = send_cmd({"cmd": "openStackEditor"})
+            self.assertFalse(
+                open_res["modalWasHiddenDuringAceInit"],
+                "Expected #stack-editor-modal to be unhidden before initStackCodeEditors() calls ace.edit()",
+            )
+            self.assertFalse(open_res["modalHiddenNow"])
+
+            def click_snippet_and_format(current_yaml: str, snippet_type: str) -> tuple[str, dict, dict]:
+                step = send_cmd({"cmd": "applySnippet", "yaml": current_yaml, "snippetType": snippet_type})
+                raw_updated = step["yaml"]
+                fmt_res = dm.format_compose_yaml(raw_updated)
+                self.assertTrue(
+                    fmt_res.get("valid"),
+                    f"Snippet {snippet_type!r} produced invalid YAML:\n{raw_updated}\nErrors: {fmt_res.get('errors')}",
+                )
+                formatted_yaml = fmt_res["formatted_yaml"]
+                parsed_doc = yaml.safe_load(formatted_yaml)
+                return formatted_yaml, fmt_res, parsed_doc
+
+            yaml_text = ""
+
+            # 1. Click + Service -> creates `app` with 8080:80
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "service")
+            self.assertEqual(fmt["services"], ["app"])
+            self.assertEqual(fmt["ports"], ["8080:80"])
+
+            # 2. Click + Port on service that already has ports: -> adds 8081:80 without overwriting 8080:80
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "ports")
+            self.assertEqual(fmt["ports"], ["8080:80", "8081:80"])
+            self.assertEqual(parsed["services"]["app"]["ports"], ["8080:80", "8081:80"])
+
+            # 3. Click + Port again -> adds 8082:80
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "ports")
+            self.assertEqual(fmt["ports"], ["8080:80", "8081:80", "8082:80"])
+
+            # 4. Click + Volume twice -> adds ./data:/data and ./config:/config
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "volumes")
+            self.assertEqual(parsed["services"]["app"]["volumes"], ["./data:/data"])
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "volumes")
+            self.assertEqual(parsed["services"]["app"]["volumes"], ["./data:/data", "./config:/config"])
+
+            # 5. Click + Env twice -> adds TZ=UTC, NODE_ENV=production, and PUID=1000
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "environment")
+            self.assertEqual(parsed["services"]["app"]["environment"], ["TZ=UTC", "NODE_ENV=production"])
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "environment")
+            self.assertEqual(
+                parsed["services"]["app"]["environment"],
+                ["TZ=UTC", "NODE_ENV=production", "PUID=1000"],
+            )
+
+            # 6. Click + Network twice -> creates top-level networks: (app-net, app-net-2) and attaches to service
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "network")
+            self.assertEqual(list(parsed["networks"].keys()), ["app-net"])
+            self.assertEqual(parsed["services"]["app"]["networks"], ["app-net"])
+
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "network")
+            self.assertEqual(list(parsed["networks"].keys()), ["app-net", "app-net-2"])
+            self.assertEqual(parsed["services"]["app"]["networks"], ["app-net", "app-net-2"])
+            # Confirm top-level networks: is at the bottom of the file
+            self.assertLess(yaml_text.index("services:"), yaml_text.index("networks:"))
+
+            # 7. Click + Service again AFTER networks: is at the bottom -> inserts app-service inside services:
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "service")
+            self.assertEqual(fmt["services"], ["app", "app-service"])
+            self.assertEqual(list(parsed["networks"].keys()), ["app-net", "app-net-2"])
+            self.assertNotIn("app-service", parsed["networks"])
+            self.assertEqual(parsed["services"]["app-service"]["ports"], ["8083:80"])
+
+            # 8. Click + Port, + Volume, + Env, + Healthcheck after networks: is at the bottom -> targets app-service
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "ports")
+            self.assertEqual(parsed["services"]["app-service"]["ports"], ["8083:80", "8084:80"])
+
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "volumes")
+            self.assertEqual(parsed["services"]["app-service"]["volumes"], ["./data:/data"])
+
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "environment")
+            self.assertEqual(
+                parsed["services"]["app-service"]["environment"],
+                ["TZ=UTC", "NODE_ENV=production"],
+            )
+
+            yaml_text, fmt, parsed = click_snippet_and_format(yaml_text, "healthcheck")
+            self.assertIn("healthcheck", parsed["services"]["app-service"])
+            self.assertEqual(
+                parsed["services"]["app-service"]["healthcheck"]["test"],
+                ["CMD", "curl", "-f", "http://localhost"],
+            )
+            self.assertEqual(fmt["services"], ["app", "app-service"])
+            self.assertEqual(list(parsed["networks"].keys()), ["app-net", "app-net-2"])
+        finally:
+            proc.kill()
+            proc.wait()
+
 
 if __name__ == "__main__":
     unittest.main()

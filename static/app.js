@@ -7822,7 +7822,7 @@ function setStackYamlValue(val) {
     try {
       composeAceEditor.setValue(strVal, -1);
       lastSyncedComposeAceValue = strVal;
-      composeAceEditor.resize();
+      composeAceEditor.resize(true);
     } finally {
       isSyncingStackEditor = false;
     }
@@ -7868,7 +7868,7 @@ function setStackEnvValue(val) {
     try {
       envAceEditor.setValue(strVal, -1);
       lastSyncedEnvAceValue = strVal;
-      envAceEditor.resize();
+      envAceEditor.resize(true);
     } finally {
       isSyncingStackEditor = false;
     }
@@ -8103,48 +8103,350 @@ async function formatStackYaml() {
 }
 
 /**
- * Insert a 1-click Compose YAML snippet block into the editor.
+ * Structure-aware helper that merges a 1-click Compose snippet into existing YAML
+ * without producing duplicate keys or placing service keys inside top-level networks/volumes.
  */
-function insertComposeSnippet(snippetType) {
-  let current = getStackYamlValue();
-  const hasServicesRoot = /(?:^|\n)services\s*:/m.test(current);
+function applySnippetToComposeYaml(yamlText, snippetType) {
+  const validTypes = new Set(["service", "ports", "volumes", "environment", "healthcheck", "network"]);
+  if (!validTypes.has(snippetType)) return yamlText;
 
-  const snippets = {
-    service: hasServicesRoot
-      ? `  app-service:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "8080:80"\n`
-      : `services:\n  app:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "8080:80"\n`,
-    ports: hasServicesRoot
-      ? `    ports:\n      - "8080:80"\n`
-      : `services:\n  app:\n    image: nginx:alpine\n    ports:\n      - "8080:80"\n`,
-    volumes: hasServicesRoot
-      ? `    volumes:\n      - ./data:/data\n`
-      : `services:\n  app:\n    image: nginx:alpine\n    volumes:\n      - ./data:/data\n`,
-    environment: hasServicesRoot
-      ? `    environment:\n      - TZ=UTC\n      - NODE_ENV=production\n`
-      : `services:\n  app:\n    image: nginx:alpine\n    environment:\n      - TZ=UTC\n      - NODE_ENV=production\n`,
-    healthcheck: hasServicesRoot
-      ? `    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`
-      : `services:\n  app:\n    image: nginx:alpine\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`,
-    network: /(?:^|\n)networks\s*:/m.test(current)
-      ? `  app-net:\n    driver: bridge\n`
-      : `${hasServicesRoot ? "" : "services:\n  app:\n    image: nginx:alpine\n\n"}networks:\n  app-net:\n    driver: bridge\n`,
-  };
+  const raw = (yamlText || "").replace(/\r\n/g, "\n");
 
-  const snippet = snippets[snippetType];
-  if (!snippet) return;
-
-  let updated = current;
-  if (!updated.trim()) {
-    updated = snippet;
-  } else {
-    if (!updated.endsWith("\n")) {
-      updated += "\n";
+  // Collect all host ports already referenced in the YAML
+  const usedPorts = new Set();
+  const portRegex = /(\d+):(\d+)(?::(\d+))?/g;
+  let portMatch;
+  while ((portMatch = portRegex.exec(raw)) !== null) {
+    const hostPort = portMatch[3] !== undefined ? Number(portMatch[2]) : Number(portMatch[1]);
+    if (Number.isFinite(hostPort) && hostPort > 0) {
+      usedPorts.add(hostPort);
     }
-    updated += snippet;
   }
 
+  const getNextAvailablePort = (startPort = 8080) => {
+    let p = startPort;
+    while (usedPorts.has(p)) {
+      p += 1;
+    }
+    usedPorts.add(p);
+    return p;
+  };
+
+  // Handle completely empty editor
+  if (!raw.trim()) {
+    const port = getNextAvailablePort(8080);
+    switch (snippetType) {
+      case "service":
+        return `services:\n  app:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "${port}:80"\n`;
+      case "ports":
+        return `services:\n  app:\n    image: nginx:alpine\n    ports:\n      - "${port}:80"\n`;
+      case "volumes":
+        return `services:\n  app:\n    image: nginx:alpine\n    volumes:\n      - ./data:/data\n`;
+      case "environment":
+        return `services:\n  app:\n    image: nginx:alpine\n    environment:\n      - TZ=UTC\n      - NODE_ENV=production\n`;
+      case "healthcheck":
+        return `services:\n  app:\n    image: nginx:alpine\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`;
+      case "network":
+        return `services:\n  app:\n    image: nginx:alpine\n    networks:\n      - app-net\n\nnetworks:\n  app-net:\n    driver: bridge\n`;
+      default:
+        return raw;
+    }
+  }
+
+  let working = raw;
+  // Ensure a top-level services: section exists
+  if (!/(?:^|\n)services\s*:/m.test(working)) {
+    const port = snippetType === "service" ? getNextAvailablePort(8080) : null;
+    const baseService =
+      snippetType === "service"
+        ? `services:\n  app:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "${port}:80"\n\n`
+        : `services:\n  app:\n    image: nginx:alpine\n    restart: unless-stopped\n\n`;
+    working = baseService + working.trimStart();
+    if (snippetType === "service") {
+      return working.endsWith("\n") ? working : `${working}\n`;
+    }
+  }
+
+  let lines = working.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  const parseStructure = (lineArr) => {
+    const topSections = [];
+    for (let i = 0; i < lineArr.length; i += 1) {
+      const m = lineArr[i].match(/^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:/);
+      if (m) {
+        if (topSections.length > 0) {
+          topSections[topSections.length - 1].endLine = i;
+        }
+        topSections.push({ key: m[1], startLine: i, endLine: lineArr.length });
+      }
+    }
+
+    const servicesSec = topSections.find((s) => s.key === "services") || null;
+    const networksSec = topSections.find((s) => s.key === "networks") || null;
+    const services = [];
+
+    if (servicesSec) {
+      for (let i = servicesSec.startLine + 1; i < servicesSec.endLine; i += 1) {
+        const sm = lineArr[i].match(/^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:(?:\s*#.*|\s*)$/);
+        if (sm) {
+          if (services.length > 0) {
+            services[services.length - 1].endLine = i;
+          }
+          services.push({
+            name: sm[1],
+            startLine: i,
+            endLine: servicesSec.endLine,
+            props: [],
+          });
+        }
+      }
+
+      for (const svc of services) {
+        for (let i = svc.startLine + 1; i < svc.endLine; i += 1) {
+          const pm = lineArr[i].match(/^    ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:/);
+          if (pm) {
+            if (svc.props.length > 0) {
+              svc.props[svc.props.length - 1].endLine = i;
+            }
+            svc.props.push({
+              key: pm[1],
+              startLine: i,
+              endLine: svc.endLine,
+            });
+          }
+        }
+      }
+    }
+
+    return { topSections, servicesSec, networksSec, services };
+  };
+
+  const getInsertLine = (lineArr, startLine, endLine) => {
+    let idx = endLine;
+    while (idx > startLine + 1 && lineArr[idx - 1].trim() === "") {
+      idx -= 1;
+    }
+    return idx;
+  };
+
+  const getSequenceIndent = (lineArr, startLine, endLine, fallback = "      ") => {
+    for (let i = startLine + 1; i < endLine; i += 1) {
+      const m = lineArr[i].match(/^(\s*)-\s+/);
+      if (m) return m[1];
+    }
+    return fallback;
+  };
+
+  let struct = parseStructure(lines);
+
+  // If services: exists but has no service entries yet, seed `app` for non-service snippets
+  if (struct.servicesSec && struct.services.length === 0 && snippetType !== "service") {
+    const insertIdx = getInsertLine(lines, struct.servicesSec.startLine, struct.servicesSec.endLine);
+    lines.splice(insertIdx, 0, "  app:", "    image: nginx:alpine", "    restart: unless-stopped");
+    struct = parseStructure(lines);
+  }
+
+  if (snippetType === "service") {
+    const existingNames = new Set(struct.services.map((s) => s.name));
+    let svcName = "app";
+    if (existingNames.has("app")) {
+      if (!existingNames.has("app-service")) {
+        svcName = "app-service";
+      } else {
+        let n = 2;
+        while (existingNames.has(`app-${n}`)) {
+          n += 1;
+        }
+        svcName = `app-${n}`;
+      }
+    }
+    const port = getNextAvailablePort(8080);
+    const insertIdx = getInsertLine(lines, struct.servicesSec.startLine, struct.servicesSec.endLine);
+    lines.splice(
+      insertIdx,
+      0,
+      `  ${svcName}:`,
+      "    image: nginx:alpine",
+      "    restart: unless-stopped",
+      "    ports:",
+      `      - "${port}:80"`
+    );
+    return `${lines.join("\n")}\n`;
+  }
+
+  const targetSvc = struct.services[struct.services.length - 1];
+  if (!targetSvc) return `${lines.join("\n")}\n`;
+
+  if (snippetType === "ports") {
+    const nextPort = getNextAvailablePort(8080);
+    const portsProp = targetSvc.props.find((p) => p.key === "ports");
+    if (portsProp) {
+      const indent = getSequenceIndent(lines, portsProp.startLine, portsProp.endLine);
+      const insertIdx = getInsertLine(lines, portsProp.startLine, portsProp.endLine);
+      lines.splice(insertIdx, 0, `${indent}- "${nextPort}:80"`);
+    } else {
+      const insertIdx = getInsertLine(lines, targetSvc.startLine, targetSvc.endLine);
+      lines.splice(insertIdx, 0, "    ports:", `      - "${nextPort}:80"`);
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  if (snippetType === "volumes") {
+    const svcText = lines.slice(targetSvc.startLine, targetSvc.endLine).join("\n");
+    const candidates = ["./data:/data", "./config:/config"];
+    let nextVol = candidates.find((c) => !svcText.includes(c));
+    if (!nextVol) {
+      let n = 2;
+      while (svcText.includes(`./data-${n}:/data-${n}`)) {
+        n += 1;
+      }
+      nextVol = `./data-${n}:/data-${n}`;
+    }
+
+    const volProp = targetSvc.props.find((p) => p.key === "volumes");
+    if (volProp) {
+      const indent = getSequenceIndent(lines, volProp.startLine, volProp.endLine);
+      const insertIdx = getInsertLine(lines, volProp.startLine, volProp.endLine);
+      lines.splice(insertIdx, 0, `${indent}- ${nextVol}`);
+    } else {
+      const insertIdx = getInsertLine(lines, targetSvc.startLine, targetSvc.endLine);
+      lines.splice(insertIdx, 0, "    volumes:", `      - ${nextVol}`);
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  if (snippetType === "environment") {
+    const envProp = targetSvc.props.find((p) => p.key === "environment");
+    if (envProp) {
+      const envLines = lines.slice(envProp.startLine + 1, envProp.endLine);
+      const envPresets = [
+        ["TZ", "UTC"],
+        ["NODE_ENV", "production"],
+        ["PUID", "1000"],
+        ["PGID", "1000"],
+        ["LOG_LEVEL", "info"],
+      ];
+      const hasEnvKey = (k) => {
+        const re = new RegExp(`^\\s*(?:-\\s*)?["']?${k}["']?\\s*[=:]`);
+        return envLines.some((l) => re.test(l));
+      };
+      let chosen = envPresets.find(([k]) => !hasEnvKey(k));
+      if (!chosen) {
+        let n = 1;
+        while (hasEnvKey(`APP_VAR_${n}`)) {
+          n += 1;
+        }
+        chosen = [`APP_VAR_${n}`, "value"];
+      }
+      const [key, val] = chosen;
+      const isMapSyntax =
+        !envLines.some((l) => /^\s*-\s+/.test(l)) &&
+        envLines.some((l) => /^\s+[A-Za-z0-9_.-]+\s*:/.test(l));
+      const insertIdx = getInsertLine(lines, envProp.startLine, envProp.endLine);
+      if (isMapSyntax) {
+        const mapMatch = envLines.find((l) => /^(\s+)[A-Za-z0-9_.-]+\s*:/.test(l))?.match(/^(\s+)/);
+        const mapIndent = mapMatch ? mapMatch[1] : "      ";
+        lines.splice(insertIdx, 0, `${mapIndent}${key}: ${val}`);
+      } else {
+        const indent = getSequenceIndent(lines, envProp.startLine, envProp.endLine);
+        lines.splice(insertIdx, 0, `${indent}- ${key}=${val}`);
+      }
+    } else {
+      const insertIdx = getInsertLine(lines, targetSvc.startLine, targetSvc.endLine);
+      lines.splice(
+        insertIdx,
+        0,
+        "    environment:",
+        "      - TZ=UTC",
+        "      - NODE_ENV=production"
+      );
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  if (snippetType === "healthcheck") {
+    const hcTarget =
+      [...struct.services]
+        .reverse()
+        .find((s) => !s.props.some((p) => p.key === "healthcheck")) || targetSvc;
+    const hasHc = hcTarget.props.some((p) => p.key === "healthcheck");
+    if (!hasHc) {
+      const insertIdx = getInsertLine(lines, hcTarget.startLine, hcTarget.endLine);
+      lines.splice(
+        insertIdx,
+        0,
+        "    healthcheck:",
+        '      test: ["CMD", "curl", "-f", "http://localhost"]',
+        "      interval: 30s",
+        "      timeout: 5s",
+        "      retries: 3"
+      );
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  if (snippetType === "network") {
+    const existingNets = new Set();
+    if (struct.networksSec) {
+      for (let i = struct.networksSec.startLine + 1; i < struct.networksSec.endLine; i += 1) {
+        const nm = lines[i].match(/^  ([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:/);
+        if (nm) existingNets.add(nm[1]);
+      }
+    }
+    let netName = "app-net";
+    if (existingNets.has("app-net")) {
+      let n = 2;
+      while (existingNets.has(`app-net-${n}`)) {
+        n += 1;
+      }
+      netName = `app-net-${n}`;
+    }
+
+    // Attach network to target service first
+    const svcNetProp = targetSvc.props.find((p) => p.key === "networks");
+    if (svcNetProp) {
+      const propSlice = lines.slice(svcNetProp.startLine + 1, svcNetProp.endLine).join("\n");
+      if (!propSlice.includes(netName)) {
+        const indent = getSequenceIndent(lines, svcNetProp.startLine, svcNetProp.endLine);
+        const insertIdx = getInsertLine(lines, svcNetProp.startLine, svcNetProp.endLine);
+        lines.splice(insertIdx, 0, `${indent}- ${netName}`);
+      }
+    } else {
+      const insertIdx = getInsertLine(lines, targetSvc.startLine, targetSvc.endLine);
+      lines.splice(insertIdx, 0, "    networks:", `      - ${netName}`);
+    }
+
+    // Re-parse structure after modifying target service so top-level networks: line indices are exact
+    struct = parseStructure(lines);
+    if (struct.networksSec) {
+      const insertIdx = getInsertLine(lines, struct.networksSec.startLine, struct.networksSec.endLine);
+      lines.splice(insertIdx, 0, `  ${netName}:`, "    driver: bridge");
+    } else {
+      if (lines.length > 0 && lines[lines.length - 1].trim() !== "") {
+        lines.push("");
+      }
+      lines.push("networks:", `  ${netName}:`, "    driver: bridge");
+    }
+    return `${lines.join("\n")}\n`;
+  }
+
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Insert a 1-click Compose YAML snippet block into the editor.
+ */
+async function insertComposeSnippet(snippetType) {
+  if (!snippetType) return;
+  switchStackEditorTab("compose");
+  const current = getStackYamlValue();
+  const updated = applySnippetToComposeYaml(current, snippetType);
+  if (typeof updated !== "string") return;
   setStackYamlValue(updated);
-  formatStackYaml();
+  await formatStackYaml();
 }
 
 /**
@@ -8251,6 +8553,7 @@ async function openStackEditor(stackName = null, prefill = null) {
   if (feedback) feedback.classList.add("hidden");
   if (statusBox) statusBox.classList.add("hidden");
 
+  modal?.classList.remove("hidden");
   initStackCodeEditors();
   setStackEditorAnnotations([]);
   switchStackEditorTab("compose");
@@ -8314,7 +8617,7 @@ async function openStackEditor(stackName = null, prefill = null) {
 
   modal?.classList.remove("hidden");
   if (composeAceEditor && typeof composeAceEditor.resize === "function") {
-    composeAceEditor.resize();
+    composeAceEditor.resize(true);
   }
 }
 
@@ -14250,6 +14553,7 @@ function initDashboard() {
   snippetToolbar?.addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-snippet]");
     if (!btn) return;
+    e.preventDefault();
     const snippetType = btn.getAttribute("data-snippet");
     if (snippetType) {
       insertComposeSnippet(snippetType);
