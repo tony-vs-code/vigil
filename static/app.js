@@ -2393,7 +2393,7 @@ function renderNotificationHistory(historyPayload) {
   if (records.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 3;
+    td.colSpan = 5;
     td.className = "empty-state";
     td.textContent = "No notifications recorded yet";
     tr.appendChild(td);
@@ -2404,46 +2404,107 @@ function renderNotificationHistory(historyPayload) {
   records.forEach((entry) => {
     const tr = document.createElement("tr");
 
-    // Timestamp
+    // 1. Timestamp (tdTime)
     const tdTime = document.createElement("td");
     tdTime.className = "mono-text";
     tdTime.textContent =
       entry.sent_at_formatted || formatTimestampLocal(entry.sent_at);
 
-    // Kind / Weekly / Test
-    const tdKind = document.createElement("td");
-    const kindSpan = document.createElement("span");
-    const isWeekly = Boolean(entry.weekly) || entry.kind === "weekly summary";
-    const isTest = entry.kind === "test notification" || entry.status === "test";
+    // 2. Trigger / Source (tdTrigger)
+    const tdTrigger = document.createElement("td");
+    const triggerBadge = document.createElement("span");
+    const triggerStr = String(entry.trigger || "");
+    const statusStr = String(entry.status || "").trim();
+    const statusLower = statusStr.toLowerCase();
 
-    let badgeClass = "kind-alert";
-    if (isTest) {
-      badgeClass = "kind-test";
-    } else if (isWeekly) {
-      badgeClass = "kind-weekly";
-    }
-
-    kindSpan.className = `kind-badge ${badgeClass}`;
-    kindSpan.textContent =
-      entry.kind ||
-      (isTest ? "test notification" : (isWeekly ? "weekly summary" : "alert"));
-    tdKind.appendChild(kindSpan);
-
-    // Status
-    const tdStatus = document.createElement("td");
-    const statusBadge = document.createElement("span");
-    statusBadge.className = "status-badge";
-    if (entry.status === "test") {
-      statusBadge.classList.add("status-test");
-      statusBadge.textContent = "TEST";
+    if (entry.trigger?.includes("cron:") || entry.status === "scheduled_report") {
+      triggerBadge.className = "trigger-badge trigger-cron";
+      triggerBadge.setAttribute("role", "button");
+      triggerBadge.setAttribute("tabindex", "0");
+      triggerBadge.setAttribute(
+        "title",
+        "Managed in Backups & Cron Scheduler (click to view)"
+      );
+      triggerBadge.textContent = "CRON: NOTIFICATIONS.SUMMARY";
+      triggerBadge.addEventListener("click", () => switchViewTab("backups"));
+      triggerBadge.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          switchViewTab("backups");
+        }
+      });
+    } else if (
+      entry.trigger?.startsWith("threshold:") ||
+      entry.status?.startsWith("alert_")
+    ) {
+      const metric =
+        entry.trigger?.replace("threshold:", "").toUpperCase() ||
+        entry.status?.replace("alert_", "").toUpperCase() ||
+        "METRIC";
+      triggerBadge.className = "trigger-badge trigger-threshold";
+      triggerBadge.textContent = `THRESHOLD: ${metric}`;
+    } else if (
+      entry.trigger?.startsWith("sentinel") ||
+      entry.status?.startsWith("sentinel_")
+    ) {
+      triggerBadge.className = "trigger-badge trigger-sentinel";
+      triggerBadge.textContent = "SENTINEL PROBE";
+    } else if (entry.trigger === "manual_test" || entry.status === "test") {
+      triggerBadge.className = "trigger-badge trigger-test";
+      triggerBadge.textContent = "MANUAL TEST";
+    } else if (
+      entry.trigger === "raid_monitor" ||
+      VALID_RAID_STATES.has(entry.status?.toLowerCase())
+    ) {
+      triggerBadge.className = "trigger-badge trigger-raid";
+      triggerBadge.textContent = "RAID MONITOR";
     } else {
-      applyStatusBadge(statusBadge, null, entry.status);
+      triggerBadge.className = "trigger-badge trigger-neutral";
+      triggerBadge.textContent = entry.trigger || entry.status || "SYSTEM";
     }
-    tdStatus.appendChild(statusBadge);
+    tdTrigger.appendChild(triggerBadge);
+
+    // 3. Channel (tdChannel)
+    const tdChannel = document.createElement("td");
+    const channelBadge = document.createElement("span");
+    const channelName = (entry.channel || "all").toLowerCase();
+    channelBadge.className = `channel-badge channel-${channelName}`;
+    channelBadge.textContent = (entry.channel || "all").toUpperCase();
+    tdChannel.appendChild(channelBadge);
+
+    // 4. Subject / Summary (tdSummary)
+    const tdSummary = document.createElement("td");
+    const titleDiv = document.createElement("div");
+    titleDiv.className = "delivery-title";
+    titleDiv.textContent = entry.title || entry.kind || "Alert Dispatch";
+
+    const detailsDiv = document.createElement("div");
+    detailsDiv.className = "delivery-details";
+    detailsDiv.textContent = entry.details || "";
+
+    tdSummary.appendChild(titleDiv);
+    tdSummary.appendChild(detailsDiv);
+
+    // 5. Delivery Outcome (tdOutcome)
+    const tdOutcome = document.createElement("td");
+    const outcomeBadge = document.createElement("span");
+    if (entry.outcome === "delivered") {
+      outcomeBadge.className = "status-badge status-ok";
+      outcomeBadge.textContent = "✓ Delivered";
+    } else if (entry.outcome === "failed") {
+      outcomeBadge.className = "status-badge status-danger";
+      outcomeBadge.textContent = "✗ Failed";
+    } else {
+      outcomeBadge.className = "status-badge status-info";
+      outcomeBadge.textContent = entry.outcome || "DISPATCHED";
+    }
+    tdOutcome.appendChild(outcomeBadge);
 
     tr.appendChild(tdTime);
-    tr.appendChild(tdKind);
-    tr.appendChild(tdStatus);
+    tr.appendChild(tdTrigger);
+    tr.appendChild(tdChannel);
+    tr.appendChild(tdSummary);
+    tr.appendChild(tdOutcome);
     tbody.appendChild(tr);
   });
 }

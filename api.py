@@ -483,24 +483,37 @@ def _get_formatted_notification_state() -> Optional[dict[str, Any]]:
 
 def _get_formatted_history(limit: int = 20) -> list[dict[str, Any]]:
     try:
-        rows = main.get_notification_history(limit)
+        rows = main.get_notification_history(limit, detailed=True)
     except (OSError, sqlite3.Error):
         rows = []
 
-    return [
-        {
-            "status": status,
-            "sent_at": float(sent_at),
-            "sent_at_formatted": main.format_timestamp(float(sent_at)),
-            "weekly": bool(weekly),
-            "kind": (
-                "test notification"
-                if status == "test"
-                else ("weekly summary" if weekly else "alert")
-            ),
-        }
-        for status, sent_at, weekly in rows
-    ]
+    result = []
+    for row in rows:
+        if len(row) >= 8:
+            status, sent_at, weekly, channel, trigger, title, details, outcome = row[:8]
+        else:
+            status, sent_at, weekly = row[:3]
+            channel, trigger, title, details, outcome = "all", status, "", "", "delivered"
+
+        result.append(
+            {
+                "status": status,
+                "sent_at": float(sent_at),
+                "sent_at_formatted": main.format_timestamp(float(sent_at)),
+                "weekly": bool(weekly),
+                "kind": (
+                    "test notification"
+                    if status == "test"
+                    else ("weekly summary" if weekly else "alert")
+                ),
+                "channel": channel or "all",
+                "trigger": trigger or status,
+                "title": title or "",
+                "details": details or "",
+                "outcome": outcome or "delivered",
+            }
+        )
+    return result
 
 
 def _get_raid_summary() -> dict[str, Any]:

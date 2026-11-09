@@ -15183,5 +15183,239 @@ class PythonPackageManagerTests(unittest.TestCase):
             api.app.dependency_overrides.pop(api.require_auth, None)
 
 
+class TestOutboundNotificationDeliveryLog(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_notification_log.sqlite3"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+        main.STATE_DB_PATH = self.db_path
+        main.DEFAULT_STATE_DB_PATH = self.db_path
+        main.init_db(self.db_path)
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_init_db_migration_adds_missing_columns(self):
+        # Create an isolated DB with legacy schema (missing the 5 new columns)
+        legacy_db_path = Path(self.temp_dir.name) / "legacy_history.sqlite3"
+        conn = sqlite3.connect(str(legacy_db_path))
+        conn.execute(
+            "CREATE TABLE notification_history "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, "
+            "sent_at REAL NOT NULL, weekly INTEGER NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO notification_history (status, sent_at, weekly) "
+            "VALUES ('clean', 1700000000.0, 1)"
+        )
+        conn.commit()
+
+        # Run init_db on the open connection
+        main.init_db(connection=conn)
+
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(notification_history)")}
+        for expected in ("channel", "trigger", "title", "details", "outcome"):
+            self.assertIn(expected, cols)
+
+        # Verify existing row received defaults
+        row = conn.execute(
+            "SELECT status, sent_at, weekly, channel, trigger, title, details, outcome "
+            "FROM notification_history WHERE status = 'clean'"
+        ).fetchone()
+        self.assertEqual(row, ("clean", 1700000000.0, 1, "all", "", "", "", "delivered"))
+        conn.close()
+
+    def test_record_notification_smart_inference(self):
+        t0 = 1700000000.0
+        # 1. scheduled_report
+        main.record_notification("scheduled_report", t0, weekly=True)
+        # 2. test
+        main.record_notification("test", t0 + 10, weekly=False)
+        # 3. alert_cpu
+        main.record_notification("alert_cpu", t0 + 20, weekly=False)
+        # 4. sentinel_probe
+        main.record_notification("sentinel_nginx_down", t0 + 30, weekly=False)
+        # 5. clean RAID
+        main.record_notification("clean", t0 + 40, weekly=True)
+        # 6. degraded RAID
+        main.record_notification("degraded", t0 + 50, weekly=False)
+        # 7. fallback
+        main.record_notification("custom_ping", t0 + 60, weekly=False)
+
+        history = main.get_notification_history(10, detailed=True)
+        self.assertEqual(len(history), 7)
+
+        # Inspect latest first (custom_ping)
+        self.assertEqual(history[0][0], "custom_ping")
+        self.assertEqual(history[0][4], "custom_ping")  # trigger
+        self.assertEqual(history[0][5], "Custom_Ping")  # title
+        self.assertEqual(history[0][6], "custom_ping")  # details
+        self.assertEqual(history[0][7], "delivered")    # outcome
+
+        # degraded RAID
+        self.assertEqual(history[1][0], "degraded")
+        self.assertEqual(history[1][4], "raid_monitor")
+        self.assertEqual(history[1][5], "RAID Status Check (DEGRADED)")
+        self.assertEqual(history[1][6], "RAID array reported state: degraded")
+
+        # clean RAID
+        self.assertEqual(history[2][0], "clean")
+        self.assertEqual(history[2][4], "raid_monitor")
+        self.assertEqual(history[2][5], "RAID Status Check (CLEAN)")
+        self.assertEqual(history[2][6], "RAID array reported state: clean")
+
+        # sentinel alert
+        self.assertEqual(history[3][0], "sentinel_nginx_down")
+        self.assertEqual(history[3][4], "sentinel_probe")
+        self.assertEqual(history[3][5], "Sentinel Probe Alert")
+        self.assertEqual(history[3][6], "Probe status transition: sentinel_nginx_down")
+
+        # alert_cpu
+        self.assertEqual(history[4][0], "alert_cpu")
+        self.assertEqual(history[4][4], "threshold:cpu")
+        self.assertEqual(history[4][5], "Threshold Alert: CPU")
+        self.assertEqual(history[4][6], "System metric breached configured threshold")
+
+        # test
+        self.assertEqual(history[5][0], "test")
+        self.assertEqual(history[5][4], "manual_test")
+        self.assertEqual(history[5][5], "Test Notification")
+        self.assertEqual(history[5][6], "Operational test dispatch to external channel")
+
+        # scheduled_report
+        self.assertEqual(history[6][0], "scheduled_report")
+        self.assertEqual(history[6][4], "cron:notifications.summary")
+        self.assertEqual(history[6][5], "System Health Digest")
+        self.assertEqual(history[6][6], "Periodic digest of system metrics and container health")
+
+    def test_record_notification_explicit_fields(self):
+        t0 = 1700000000.0
+        main.record_notification(
+            status="test",
+            timestamp=t0,
+            weekly=False,
+            channel="pushover",
+            trigger="manual_test",
+            title="Custom Test Title",
+            details="Custom message payload",
+            outcome="failed",
+        )
+        row = main.get_notification_history(1, detailed=True)[0]
+        self.assertEqual(
+            row,
+            ("test", t0, 0, "pushover", "manual_test", "Custom Test Title", "Custom message payload", "failed")
+        )
+
+    def test_get_notification_history_backward_compatibility(self):
+        t0 = 1700000000.0
+        main.record_notification("clean", t0, weekly=True)
+
+        # detailed=False must return exact 3-tuple
+        simple = main.get_notification_history(1, detailed=False)
+        self.assertEqual(simple, [("clean", t0, 1)])
+
+        # detailed=True must return 8-tuple
+        detailed = main.get_notification_history(1, detailed=True)
+        self.assertEqual(len(detailed[0]), 8)
+        self.assertEqual(detailed[0][0], "clean")
+        self.assertEqual(detailed[0][3], "all")
+        self.assertEqual(detailed[0][4], "raid_monitor")
+
+    def test_api_formatted_history_and_endpoint(self):
+        t0 = 1700000000.0
+        main.record_notification(
+            status="alert_memory",
+            timestamp=t0,
+            weekly=False,
+            channel="telegram",
+            trigger="threshold:memory",
+            title="High Memory Usage",
+            details="RAM exceeded 90%",
+            outcome="delivered",
+        )
+
+        formatted = api._get_formatted_history(limit=5)
+        self.assertEqual(len(formatted), 1)
+        item = formatted[0]
+        self.assertEqual(item["status"], "alert_memory")
+        self.assertEqual(item["sent_at"], t0)
+        self.assertIn("2023", item["sent_at_formatted"])
+        self.assertFalse(item["weekly"])
+        self.assertEqual(item["kind"], "alert")
+        self.assertEqual(item["channel"], "telegram")
+        self.assertEqual(item["trigger"], "threshold:memory")
+        self.assertEqual(item["title"], "High Memory Usage")
+        self.assertEqual(item["details"], "RAM exceeded 90%")
+        self.assertEqual(item["outcome"], "delivered")
+
+        # Fallback test: if mock returns only 3-tuple
+        with patch.object(main, "get_notification_history", return_value=[("test", t0, 0)]):
+            fallback_res = api._get_formatted_history(limit=1)
+            self.assertEqual(len(fallback_res), 1)
+            self.assertEqual(fallback_res[0]["channel"], "all")
+            self.assertEqual(fallback_res[0]["trigger"], "test")
+            self.assertEqual(fallback_res[0]["outcome"], "delivered")
+
+    def test_dispatch_site_send_test_notification(self):
+        mock_settings = {
+            "discord_enabled": "true",
+            "discord_token": "valid_token",
+            "channel_id": "1234567890",
+        }
+        with (
+            patch.object(main, "get_app_settings", return_value=mock_settings),
+            patch.object(main, "send_message", AsyncMock(return_value=True)),
+        ):
+            ok, msg = asyncio.run(main.send_test_notification(channel="discord"))
+            self.assertTrue(ok)
+            rows = main.get_notification_history(1, detailed=True)
+            self.assertEqual(rows[0][0], "test")
+            self.assertEqual(rows[0][3], "discord")
+            self.assertEqual(rows[0][4], "manual_test")
+            self.assertEqual(rows[0][5], "Operational Test Dispatch")
+            self.assertEqual(rows[0][7], "delivered")
+
+    def test_dispatch_site_evaluate_scheduled_reports(self):
+        with (
+            patch.object(main.NotificationManager, "send_all", AsyncMock(return_value={"discord": (True, "ok")})),
+            patch.object(main, "get_weekly_notification_state", return_value=(1000.0, 1000.0, "clean")),
+        ):
+            ok_sched = asyncio.run(main.evaluate_scheduled_reports(now=2000.0))
+            self.assertTrue(ok_sched)
+            latest = main.get_notification_history(1, detailed=True)[0]
+            self.assertEqual(latest[0], "scheduled_report")
+            self.assertEqual(latest[3], "all")
+            self.assertEqual(latest[4], "cron:notifications.summary")
+            self.assertEqual(latest[5], "System Health Digest")
+
+    def test_dispatch_site_execute_cron_task(self):
+        with patch.object(main.NotificationManager, "send_all", AsyncMock(return_value={"telegram": (True, "ok"), "discord": (True, "ok")})):
+            out = main._execute_cron_task("notifications.summary", {}, db_path=self.db_path)
+            self.assertIn("telegram", out)
+            latest_cron = main.get_notification_history(1, detailed=True)[0]
+            self.assertEqual(latest_cron[0], "scheduled_report")
+            self.assertIn("telegram", latest_cron[3])
+            self.assertIn("discord", latest_cron[3])
+            self.assertEqual(latest_cron[4], "cron:notifications.summary")
+            self.assertEqual(latest_cron[7], "delivered")
+
+    def test_dispatch_site_run_raid_check(self):
+        with (
+            patch.object(main, "check_raid_status", return_value=("degraded", SAMPLE_DETAILS)),
+            patch.object(main, "get_duf_output", return_value=SAMPLE_DUF),
+            patch.object(main, "get_app_settings", return_value={"discord_enabled": "true", "discord_token": "token", "channel_id": "123"}),
+            patch.object(main, "send_message", AsyncMock(return_value=True)),
+        ):
+            asyncio.run(main.run_raid_check(force=True))
+            latest_raid = main.get_notification_history(1, detailed=True)[0]
+            self.assertEqual(latest_raid[0], "degraded")
+            self.assertEqual(latest_raid[3], "discord")
+            self.assertEqual(latest_raid[4], "raid_monitor")
+            self.assertEqual(latest_raid[5], "RAID Array Degraded")
+            self.assertEqual(latest_raid[6], "RAID check status: degraded")
+
+
 if __name__ == "__main__":
     unittest.main()
