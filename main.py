@@ -349,6 +349,21 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, status TEXT NOT NULL, "
         "sent_at REAL NOT NULL, weekly INTEGER NOT NULL)"
     )
+    cols = {
+        row[1] for row in connection.execute("PRAGMA table_info(notification_history)")
+    }
+    new_cols = [
+        ("channel", "TEXT DEFAULT 'all'"),
+        ("trigger", "TEXT DEFAULT ''"),
+        ("title", "TEXT DEFAULT ''"),
+        ("details", "TEXT DEFAULT ''"),
+        ("outcome", "TEXT DEFAULT 'delivered'"),
+    ]
+    for col_name, col_def in new_cols:
+        if col_name not in cols:
+            connection.execute(
+                f"ALTER TABLE notification_history ADD COLUMN {col_name} {col_def}"
+            )
     connection.execute(
         "CREATE TABLE IF NOT EXISTS users "
         "(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, "
@@ -505,9 +520,43 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return connection
 
 
-def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
-    conn = _connect_state_db(db_path)
+def init_db(
+    connection: Optional[Any] = None, db_path: Optional[Path] = None
+) -> None:
+    close_after = False
+    if isinstance(connection, (Path, str)):
+        conn = _connect_state_db(Path(connection))
+        close_after = True
+    elif connection is None:
+        conn = _connect_state_db(db_path or STATE_DB_PATH)
+        close_after = True
+    else:
+        conn = connection
+
     try:
+        cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(notification_history)")
+        }
+        new_cols = [
+            ("channel", "TEXT DEFAULT 'all'"),
+            ("trigger", "TEXT DEFAULT ''"),
+            ("title", "TEXT DEFAULT ''"),
+            ("details", "TEXT DEFAULT ''"),
+            ("outcome", "TEXT DEFAULT 'delivered'"),
+        ]
+        for col_name, col_def in new_cols:
+            if col_name not in cols:
+                conn.execute(
+                    f"ALTER TABLE notification_history ADD COLUMN {col_name} {col_def}"
+                )
+        conn.commit()
+
+        cron_table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cron_jobs'"
+        ).fetchone()
+        if not cron_table_exists:
+            return
+
         row = conn.execute(
             "SELECT id FROM cron_jobs WHERE task_type = 'notifications.summary'"
         ).fetchone()
@@ -617,10 +666,11 @@ def init_state_db(db_path: Path = STATE_DB_PATH) -> None:
             )
             conn.commit()
     finally:
-        conn.close()
+        if close_after:
+            conn.close()
 
 
-init_db = init_state_db
+init_state_db = init_db
 
 
 def _hash_password(password: str, salt_hex: str) -> str:
@@ -1494,7 +1544,42 @@ def record_notification(
     timestamp: float,
     weekly: bool,
     due_at: Optional[float] = None,
+    channel: str = "all",
+    trigger: str = "",
+    title: str = "",
+    details: str = "",
+    outcome: str = "delivered",
 ) -> None:
+    if not trigger:
+        if status == "scheduled_report":
+            trigger = "cron:notifications.summary"
+            title = title or "System Health Digest"
+            details = details or "Periodic digest of system metrics and container health"
+        elif status == "test":
+            trigger = "manual_test"
+            title = title or "Test Notification"
+            details = details or "Operational test dispatch to external channel"
+        elif status.startswith("alert_"):
+            metric = status.replace("alert_", "")
+            trigger = f"threshold:{metric}"
+            title = title or f"Threshold Alert: {metric.upper()}"
+            details = details or "System metric breached configured threshold"
+        elif status.startswith("sentinel_"):
+            trigger = "sentinel_probe"
+            title = title or "Sentinel Probe Alert"
+            details = details or f"Probe status transition: {status}"
+        elif status in ("clean", "degraded", "recovering", "resyncing", "failed", "none"):
+            trigger = "raid_monitor"
+            title = title or f"RAID Status Check ({status.upper()})"
+            details = details or f"RAID array reported state: {status}"
+        else:
+            trigger = trigger or status
+            title = title or status.title()
+            details = details or status
+    else:
+        title = title or status.title()
+        details = details or status
+
     connection = _connect_state_db()
     try:
         if weekly:
@@ -1512,18 +1597,25 @@ def record_notification(
                 ("periodic_report", timestamp, computed_due, status),
             )
         connection.execute(
-            "INSERT INTO notification_history (status, sent_at, weekly) "
-            "VALUES (?, ?, ?)",
-            (status, timestamp, int(weekly)),
+            "INSERT INTO notification_history (status, sent_at, weekly, channel, trigger, title, details, outcome) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (status, timestamp, int(weekly), channel, trigger, title, details, outcome),
         )
         connection.commit()
     finally:
         connection.close()
 
 
-def get_notification_history(limit: int) -> list:
+def get_notification_history(limit: int, detailed: bool = False) -> list:
     connection = _connect_state_db()
     try:
+        if detailed:
+            return connection.execute(
+                "SELECT status, sent_at, weekly, channel, trigger, title, details, outcome "
+                "FROM notification_history "
+                "ORDER BY sent_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return connection.execute(
             "SELECT status, sent_at, weekly FROM notification_history "
             "ORDER BY sent_at DESC LIMIT ?",
@@ -3113,7 +3205,16 @@ async def evaluate_scheduled_reports(
     next_due = compute_next_scheduled_run(schedule_cfg, from_time=current_time, timezone_str=tz_str)
     set_notification_state_entry("raid_summary", current_time, next_due, "scheduled_report")
     set_notification_state_entry("periodic_report", current_time, next_due, "scheduled_report")
-    record_notification("scheduled_report", current_time, weekly=True, due_at=next_due)
+    record_notification(
+        "scheduled_report",
+        current_time,
+        weekly=True,
+        due_at=next_due,
+        channel="all",
+        trigger="cron:notifications.summary",
+        title="System Health Digest",
+        details="Periodic system health & telemetry digest",
+    )
     return True
 
 
@@ -3185,11 +3286,25 @@ async def send_test_notification(
         )
 
         success = await send_message(embed)
+        details_msg = (
+            "Test notification sent successfully."
+            if success
+            else (_last_send_error or "Failed to send test notification to Discord.")
+        )
+        try:
+            record_notification(
+                "test",
+                time.time(),
+                weekly=False,
+                channel=channel or "all",
+                trigger="manual_test",
+                title="Operational Test Dispatch",
+                details=details_msg,
+                outcome="delivered" if success else "failed",
+            )
+        except (OSError, sqlite3.Error) as exc:
+            logging.warning(f"Could not record test notification in SQLite: {exc}")
         if success:
-            try:
-                record_notification("test", time.time(), weekly=False)
-            except (OSError, sqlite3.Error) as exc:
-                logging.warning(f"Could not record test notification in SQLite: {exc}")
             return True, "Test notification sent successfully."
         else:
             err = _last_send_error or "Failed to send test notification to Discord."
@@ -3201,11 +3316,19 @@ async def send_test_notification(
         test_desc,
         embed_data=embed_data,
     )
-    if success:
-        try:
-            record_notification("test", time.time(), weekly=False)
-        except (OSError, sqlite3.Error) as exc:
-            logging.warning(f"Could not record test notification in SQLite: {exc}")
+    try:
+        record_notification(
+            "test",
+            time.time(),
+            weekly=False,
+            channel=channel or "all",
+            trigger="manual_test",
+            title="Operational Test Dispatch",
+            details=message,
+            outcome="delivered" if success else "failed",
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logging.warning(f"Could not record test notification in SQLite: {exc}")
     return success, message
 
 
@@ -4661,7 +4784,15 @@ async def run_raid_check(force: bool = False) -> None:
             logging.info(f"RAID Array {status.capitalize()} Sending Message")
             if await send_message(message_content):
                 try:
-                    record_notification(status, time.time(), weekly=True)
+                    record_notification(
+                        status,
+                        time.time(),
+                        weekly=True,
+                        channel="discord",
+                        trigger="raid_monitor",
+                        title=f"RAID Array {status.capitalize()}",
+                        details=f"RAID check status: {status}",
+                    )
                 except (OSError, sqlite3.Error):
                     logging.exception(
                         "Could not save RAID notification state to SQLite."
@@ -4670,7 +4801,15 @@ async def run_raid_check(force: bool = False) -> None:
         logging.info(f"RAID Array {status.capitalize()} Sending Message")
         if await send_message(message_content):
             try:
-                record_notification(status, time.time(), weekly=False)
+                record_notification(
+                    status,
+                    time.time(),
+                    weekly=False,
+                    channel="discord",
+                    trigger="raid_monitor",
+                    title=f"RAID Array {status.capitalize()}",
+                    details=f"RAID check status: {status}",
+                )
             except (OSError, sqlite3.Error):
                 logging.exception("Could not save RAID notification history to SQLite.")
 
@@ -13191,10 +13330,19 @@ def _execute_cron_task(
         mgr = NotificationManager(config_dict)
         results = _dispatch_async_coro_sync(mgr.send_all(title, desc, embed_data))
         current_time = time.time()
-        record_notification("scheduled_report", current_time, weekly=True)
+        ok_channels = [ch for ch, (ok, _) in results.items() if ok]
+        record_notification(
+            "scheduled_report",
+            current_time,
+            weekly=True,
+            channel=', '.join(ok_channels) or 'all',
+            trigger='cron:notifications.summary',
+            title=title,
+            details=f"Sent via {', '.join(ok_channels)}",
+            outcome='delivered' if ok_channels else 'failed',
+        )
         set_notification_state_entry("raid_summary", current_time, current_time + WEEK_SECONDS, "scheduled_report")
         set_notification_state_entry("periodic_report", current_time, current_time + WEEK_SECONDS, "scheduled_report")
-        ok_channels = [ch for ch, (ok, _) in results.items() if ok]
         if ok_channels:
             return f"System health digest sent via {', '.join(ok_channels)}."
         return f"System health digest generated ({title})."
