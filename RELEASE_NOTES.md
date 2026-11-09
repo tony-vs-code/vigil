@@ -1,34 +1,30 @@
-# Release v1.0.39: Portainer-Style Environment Variable Manager & Safe Package Upgrades
+# Release v1.0.40: Mobile-First Responsive UI Overhaul
 
 ## Overview
-Vigil v1.0.39 delivers a comprehensive **Portainer-Style Environment Variable Manager** for the Docker Compose Stack Editor and upgrades Vigil's core Python dependencies within safe SemVer bounds in `uv.lock`. Operators can now seamlessly toggle between a dynamic Key-Value visual grid and the advanced raw Ace Editor, import `.env` files with 1-click parsing, export or copy environment variables, mask sensitive secrets, and rely on cross-tier bidirectional synchronization between visual and raw modes.
+Vigil v1.0.40 introduces a comprehensive **Mobile-First Responsive UI Overhaul**, ensuring full mobile, tablet, and desktop viewport compatibility across the entire observability suite. Operators can now manage system telemetry, Docker containers, compose stacks, and system services seamlessly from mobile devices without layout distortion, broken modals, or viewport clipping.
 
 ## Highlights & Enhancements
 
-### 1. Portainer-Style Environment Variable Manager (`#stack-env-panel`)
-- **Dual-Mode Visual Grid & Raw Ace Editor**: Integrated mode switcher (`#stack-env-mode-visual-btn` / `#stack-env-mode-raw-btn`) allowing operators to edit environment variables via structured key-value inputs or direct raw text with instantaneous bidirectional synchronization.
-- **Dynamic Row Management & Search**: Add new key-value pairs with `#stack-env-add-row-btn`, remove rows with per-row delete buttons, and quickly filter large `.env` sets using the instant search filter input (`#stack-env-search-input`).
-- **Secret Masking Toggle**: Easily mask or reveal sensitive credentials using the per-row secret toggle eye button (`👁️`), switching between password-masked and clear-text views.
-- **One-Click Import, Export & Copy**:
-  - **Import `.env` (`#stack-env-import-file-btn` / `#stack-env-file-input`)**: Instantly upload `.env` files via client-side `FileReader` and populate both visual grid and raw editor.
-  - **Export / Download `.env` (`#stack-env-export-btn`)**: Download current environment variables as a standard `.env` file.
-  - **Copy to Clipboard (`#stack-env-copy-btn`)**: 1-click clipboard copy with immediate visual badge confirmation.
+### 1. Mobile Navigation Off-Canvas Drawer
+- **Drawer & Backdrop**: Introduced `#btn-mobile-nav-toggle` hamburger toggle button and `#mobile-nav-backdrop` for modern mobile drawer navigation (`#sidebar-nav`).
+- **Smooth Transitions**: Integrated touch-friendly slide transitions, accessible aria controls, and automatic drawer dismissal upon navigation link selection or backdrop clicks.
 
-### 2. Backend `.env` Parsing & Serialization Endpoints
-- **`POST /api/docker/stacks/env/parse`**: Robust parsing of raw `.env` content into structured key-value arrays via `DockerManager.parse_env_key_values`, safely handling quoted values, comments, and empty lines.
-- **`POST /api/docker/stacks/env/serialize`**: High-fidelity serialization of structured key-value pairs into standardized `.env` strings via `DockerManager.serialize_env_key_values`.
+### 2. Adaptive Fluid Grids & Metric Cards
+- **Responsive Layout**: Replaced rigid desktop grid constraints in `.overview-status-ribbon` and `.metrics-grid` with fluid wrapping and `minmax()` responsive CSS grids.
+- **Compact Viewport Optimizations**: Optimized padding, typography, and card headers to prevent overflow and visual clipping on narrow screens.
 
-### 3. Vigil Core Python Dependency Upgrades
-- **Safe SemVer Upgrades in `uv.lock`**: Applied compatible upgrades to core dependencies within their declared SemVer bounds, including:
-  - `aiohttp` 3.10.5 → 3.14.5
-  - `discord-py` 2.4.0 → 2.7.1
-  - `fastapi` 0.112.0 → 0.162.2
-  - `multidict` 6.0.5 → 6.9.1
-  - `yarl` 1.9.6 → 1.25.1
-  - `websockets` 12.0 → 15.0.1
-  - `pydantic` 2.8.2 → 2.14.3
-- **Protected Stability**: Preserves rock-solid runtime stability with zero breaking API changes while leveraging up-to-date security patches and performance improvements.
+### 3. Touch-Optimized Tables & Horizontal Scrolling
+- **Scroll Container Protection**: Enhanced `.table-container` with smooth horizontal touch scrolling (`-webkit-overflow-scrolling: touch`) while preserving minimum readable column widths.
+- **Responsive Table Controls**: Stacked search filters, pagination controls, and action buttons cleanly on viewports under 768px.
+
+### 4. Mobile Viewport Bounding for Modal Dialogs
+- **Dynamic Bounding**: Scaled `.modal-card`, `.stack-modal-card`, and modal dialogs to `width: 95vw` and `max-height: 92vh` with flexible scrolling interiors.
+- **Header & Footer Alignment**: Pinned modal headers and action buttons to ensure confirm/cancel triggers remain accessible on small mobile displays.
+
+### 5. Touch-Scrollable Compose Snippet Toolbar & Env Var Manager
+- **Docker Compose Enhancements**: Fitted the snippet toolbar with smooth horizontal touch scrolling.
+- **Portainer-Style Env Grid**: Made Key-Value row inputs responsive with flexible wrapping and touch-friendly icon buttons.
 
 ## Reliability & Fixes
-- **Cross-Tier Verification Suite**: Added comprehensive backend unit and Node VM contract tests in `tests/test_compose_editor.py` and `test_main.py` validating `.env` parsing, serialization edge cases, UI grid synchronization, search filtering, import/export helpers, and DOM contracts.
-- **100% Automated Test Pass Rate**: Full automated test suite passes cleanly with **327 passed, 0 failed** across all unit, integration, and UI contract tests (`check_contracts.py` — 63 routes, 716 DOM IDs; `node --check static/app.js`).
+- **Dedicated Responsive Test Suite**: Added `tests/test_mobile_responsive.py` with 21 automated tests validating DOM element presence, CSS media query rules, and Node VM drawer interaction logic.
+- **100% Quality Gate Pass**: Full automated test suite passes cleanly with **348 passed, 0 failed** across all backend routes, unit tests, and cross-tier UI contracts (63 API routes, 718 DOM elements).

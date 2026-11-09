@@ -5709,7 +5709,9 @@ function switchViewTab(tabName, updateHash = true) {
 
   // Automatically close mobile sidebar if opened
   document.getElementById("app-sidebar")?.classList.remove("open");
+  document.getElementById("app-sidebar")?.classList.remove("mobile-open");
   document.getElementById("sidebar-backdrop")?.classList.remove("active");
+  document.getElementById("mobile-nav-backdrop")?.classList.remove("active");
 
   if (isContainers) {
     containersTab?.classList.add("active");
@@ -15358,19 +15360,47 @@ function initDashboard() {
   }
 
   // Mobile Sidebar Toggle & Backdrop
+  const btnMobileNavToggle = document.getElementById("btn-mobile-nav-toggle");
+  const mobileNavBackdrop = document.getElementById("mobile-nav-backdrop");
+  const appSidebar = document.getElementById("app-sidebar");
+  const sidebarBackdrop = document.getElementById("sidebar-backdrop");
+
+  function closeMobileNavDrawer() {
+    appSidebar?.classList.remove("mobile-open");
+    appSidebar?.classList.remove("open");
+    mobileNavBackdrop?.classList.remove("active");
+    sidebarBackdrop?.classList.remove("active");
+  }
+
+  function toggleMobileNavDrawer() {
+    if (appSidebar) {
+      const isOpen = appSidebar.classList.toggle("mobile-open");
+      mobileNavBackdrop?.classList.toggle("active", isOpen);
+    }
+  }
+
+  btnMobileNavToggle?.addEventListener("click", toggleMobileNavDrawer);
+  mobileNavBackdrop?.addEventListener("click", closeMobileNavDrawer);
+
   document
     .getElementById("sidebar-toggle-btn")
     ?.addEventListener("click", () => {
-      document.getElementById("app-sidebar")?.classList.toggle("open");
-      document.getElementById("sidebar-backdrop")?.classList.toggle("active");
+      const isOpen = appSidebar?.classList.toggle("open");
+      sidebarBackdrop?.classList.toggle("active", isOpen);
     });
 
   document
     .getElementById("sidebar-backdrop")
-    ?.addEventListener("click", () => {
-      document.getElementById("app-sidebar")?.classList.remove("open");
-      document.getElementById("sidebar-backdrop")?.classList.remove("active");
+    ?.addEventListener("click", closeMobileNavDrawer);
+
+  // Auto-close mobile drawer when navigation links are clicked on mobile
+  document.querySelectorAll(".sidebar-nav-item, .nav-link, .btn-sidebar-footer, .sidebar-footer button").forEach((el) => {
+    el.addEventListener("click", () => {
+      if (window.innerWidth <= 768) {
+        closeMobileNavDrawer();
+      }
     });
+  });
 
   // Docker Sub-Tabs
   const subtabs = ["stacks", "containers", "images", "volumes", "networks", "updates"];
