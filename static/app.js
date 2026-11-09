@@ -7619,6 +7619,278 @@ async function handleDeleteStack(stackName) {
 }
 
 /**
+ * Ace Code Editor instances & state for Stack Editor Modal.
+ */
+let composeAceEditor = null;
+let envAceEditor = null;
+let isSyncingStackEditor = false;
+let lastSyncedComposeAceValue = null;
+let lastSyncedEnvAceValue = null;
+
+/**
+ * Update the Stack Editor footer status bar cursor position.
+ */
+function updateStackEditorStatusbar(line = 1, col = 1) {
+  const posEl = document.getElementById("stack-editor-cursor-pos");
+  if (posEl) {
+    posEl.textContent = `Ln ${Math.max(1, line)}, Col ${Math.max(1, col)}`;
+  }
+}
+
+/**
+ * Set gutter annotations on the Compose YAML Ace Editor session if available.
+ */
+function setStackEditorAnnotations(annotations = []) {
+  if (
+    composeAceEditor &&
+    composeAceEditor.session &&
+    typeof composeAceEditor.session.setAnnotations === "function"
+  ) {
+    try {
+      composeAceEditor.session.setAnnotations(annotations);
+    } catch (err) {
+      console.debug("Failed to set Ace annotations:", err);
+    }
+  }
+}
+
+/**
+ * Initialize Ace Editor instances on #stack-yaml-ace-editor and #stack-env-ace-editor
+ * with graceful fallback to <textarea> when Ace is not loaded (offline / Node VM tests).
+ */
+function initStackCodeEditors() {
+  if (typeof window === "undefined" || !window.ace || typeof window.ace.edit !== "function") {
+    return false;
+  }
+
+  const yamlContainer = document.getElementById("stack-yaml-ace-editor");
+  const yamlWrapper = document.getElementById("stack-yaml-editor-wrapper");
+  const yamlInput = document.getElementById("stack-yaml-input");
+
+  if (yamlContainer && !composeAceEditor) {
+    try {
+      composeAceEditor = window.ace.edit("stack-yaml-ace-editor");
+      composeAceEditor.setTheme("ace/theme/one_dark");
+      composeAceEditor.session.setMode("ace/mode/yaml");
+      composeAceEditor.setOptions({
+        tabSize: 2,
+        useSoftTabs: true,
+        displayIndentGuides: true,
+        showFoldWidgets: true,
+        showLineNumbers: true,
+        highlightActiveLine: true,
+        showPrintMargin: false,
+      });
+
+      if (yamlInput && yamlInput.value) {
+        composeAceEditor.setValue(yamlInput.value, -1);
+        lastSyncedComposeAceValue = yamlInput.value;
+      } else {
+        lastSyncedComposeAceValue = composeAceEditor.getValue();
+      }
+
+      composeAceEditor.session.on("change", () => {
+        if (isSyncingStackEditor) return;
+        const val = composeAceEditor.getValue();
+        lastSyncedComposeAceValue = val;
+        const inputEl = document.getElementById("stack-yaml-input");
+        if (inputEl) {
+          inputEl.value = val;
+        }
+      });
+
+      if (composeAceEditor.selection && typeof composeAceEditor.selection.on === "function") {
+        composeAceEditor.selection.on("changeCursor", () => {
+          const pos = composeAceEditor.getCursorPosition();
+          if (pos) {
+            updateStackEditorStatusbar(pos.row + 1, pos.column + 1);
+          }
+        });
+      }
+
+      if (composeAceEditor.commands && typeof composeAceEditor.commands.addCommand === "function") {
+        composeAceEditor.commands.addCommand({
+          name: "formatComposeYaml",
+          bindKey: { win: "Ctrl-Shift-F", mac: "Command-Shift-F" },
+          exec: () => {
+            formatStackYaml();
+          },
+        });
+      }
+
+      yamlWrapper?.classList.add("ace-active");
+    } catch (err) {
+      console.warn("Ace Editor YAML init fallback:", err);
+      composeAceEditor = null;
+      yamlWrapper?.classList.remove("ace-active");
+    }
+  }
+
+  const envContainer = document.getElementById("stack-env-ace-editor");
+  const envWrapper = document.getElementById("stack-env-editor-wrapper");
+  const envInput = document.getElementById("stack-env-input");
+
+  if (envContainer && !envAceEditor) {
+    try {
+      envAceEditor = window.ace.edit("stack-env-ace-editor");
+      envAceEditor.setTheme("ace/theme/one_dark");
+      envAceEditor.session.setMode("ace/mode/sh");
+      envAceEditor.setOptions({
+        tabSize: 2,
+        useSoftTabs: true,
+        displayIndentGuides: true,
+        showFoldWidgets: true,
+        showLineNumbers: true,
+        highlightActiveLine: true,
+        showPrintMargin: false,
+      });
+
+      if (envInput && envInput.value) {
+        envAceEditor.setValue(envInput.value, -1);
+        lastSyncedEnvAceValue = envInput.value;
+      } else {
+        lastSyncedEnvAceValue = envAceEditor.getValue();
+      }
+
+      envAceEditor.session.on("change", () => {
+        if (isSyncingStackEditor) return;
+        const val = envAceEditor.getValue();
+        lastSyncedEnvAceValue = val;
+        const inputEl = document.getElementById("stack-env-input");
+        if (inputEl) {
+          inputEl.value = val;
+        }
+      });
+
+      if (envAceEditor.commands && typeof envAceEditor.commands.addCommand === "function") {
+        envAceEditor.commands.addCommand({
+          name: "formatEnvContent",
+          bindKey: { win: "Ctrl-Shift-F", mac: "Command-Shift-F" },
+          exec: () => {
+            formatStackYaml();
+          },
+        });
+      }
+
+      envWrapper?.classList.add("ace-active");
+    } catch (err) {
+      console.warn("Ace Editor .env init fallback:", err);
+      envAceEditor = null;
+      envWrapper?.classList.remove("ace-active");
+    }
+  }
+
+  return !!(composeAceEditor || envAceEditor);
+}
+
+/**
+ * Get current Compose YAML value from synced textarea / Ace editor.
+ */
+function getStackYamlValue() {
+  const yamlInput = document.getElementById("stack-yaml-input");
+  if (composeAceEditor && typeof composeAceEditor.getValue === "function") {
+    if (yamlInput && yamlInput.value !== lastSyncedComposeAceValue) {
+      isSyncingStackEditor = true;
+      try {
+        composeAceEditor.setValue(yamlInput.value, -1);
+        lastSyncedComposeAceValue = yamlInput.value;
+      } finally {
+        isSyncingStackEditor = false;
+      }
+      return yamlInput.value;
+    }
+    const aceVal = composeAceEditor.getValue();
+    if (yamlInput && yamlInput.value !== aceVal) {
+      yamlInput.value = aceVal;
+    }
+    return aceVal;
+  }
+  return yamlInput?.value || "";
+}
+
+/**
+ * Set Compose YAML value in both #stack-yaml-input and Ace editor.
+ */
+function setStackYamlValue(val) {
+  const strVal = val ?? "";
+  const yamlInput = document.getElementById("stack-yaml-input");
+  if (yamlInput) {
+    yamlInput.value = strVal;
+  }
+  if (composeAceEditor && typeof composeAceEditor.setValue === "function") {
+    isSyncingStackEditor = true;
+    try {
+      composeAceEditor.setValue(strVal, -1);
+      lastSyncedComposeAceValue = strVal;
+      composeAceEditor.resize();
+    } finally {
+      isSyncingStackEditor = false;
+    }
+  }
+}
+
+/**
+ * Get current .env content from synced textarea / Ace editor.
+ */
+function getStackEnvValue() {
+  const envInput = document.getElementById("stack-env-input");
+  if (envAceEditor && typeof envAceEditor.getValue === "function") {
+    if (envInput && envInput.value !== lastSyncedEnvAceValue) {
+      isSyncingStackEditor = true;
+      try {
+        envAceEditor.setValue(envInput.value, -1);
+        lastSyncedEnvAceValue = envInput.value;
+      } finally {
+        isSyncingStackEditor = false;
+      }
+      return envInput.value;
+    }
+    const aceVal = envAceEditor.getValue();
+    if (envInput && envInput.value !== aceVal) {
+      envInput.value = aceVal;
+    }
+    return aceVal;
+  }
+  return envInput?.value || "";
+}
+
+/**
+ * Set .env content in both #stack-env-input and Ace editor.
+ */
+function setStackEnvValue(val) {
+  const strVal = val ?? "";
+  const envInput = document.getElementById("stack-env-input");
+  if (envInput) {
+    envInput.value = strVal;
+  }
+  if (envAceEditor && typeof envAceEditor.setValue === "function") {
+    isSyncingStackEditor = true;
+    try {
+      envAceEditor.setValue(strVal, -1);
+      lastSyncedEnvAceValue = strVal;
+      envAceEditor.resize();
+    } finally {
+      isSyncingStackEditor = false;
+    }
+  }
+}
+
+/**
+ * Synchronize Ace editors from the underlying <textarea> values.
+ */
+function syncStackEditorsFromTextareas() {
+  initStackCodeEditors();
+  const yamlInput = document.getElementById("stack-yaml-input");
+  const envInput = document.getElementById("stack-env-input");
+  if (yamlInput) {
+    setStackYamlValue(yamlInput.value);
+  }
+  if (envInput) {
+    setStackEnvValue(envInput.value);
+  }
+}
+
+/**
  * Switch Stack Editor tabs: 'compose' or 'env'.
  */
 function switchStackEditorTab(tabName) {
@@ -7627,17 +7899,109 @@ function switchStackEditorTab(tabName) {
   const tabBtnEnv = document.getElementById("tab-btn-env");
   const panelCompose = document.getElementById("editor-tab-panel-compose");
   const panelEnv = document.getElementById("editor-tab-panel-env");
+  const modeInfo = document.getElementById("stack-editor-mode-info");
 
   if (tabName === "env") {
     tabBtnCompose?.classList.remove("active");
     tabBtnEnv?.classList.add("active");
     panelCompose?.classList.add("hidden");
     panelEnv?.classList.remove("hidden");
+    if (modeInfo) modeInfo.textContent = "UTF-8 / .ENV";
+    if (envAceEditor && typeof envAceEditor.resize === "function") {
+      envAceEditor.resize();
+    }
   } else {
     tabBtnCompose?.classList.add("active");
     tabBtnEnv?.classList.remove("active");
     panelCompose?.classList.remove("hidden");
     panelEnv?.classList.add("hidden");
+    if (modeInfo) modeInfo.textContent = "UTF-8 / YAML";
+    if (composeAceEditor && typeof composeAceEditor.resize === "function") {
+      composeAceEditor.resize();
+    }
+  }
+}
+
+/**
+ * Render validation / formatting result into #stack-validation-status and update Ace annotations.
+ */
+function renderStackValidationResult(data, badgeTitle = "✓ Valid Compose YAML") {
+  const statusBox = document.getElementById("stack-validation-status");
+  if (!statusBox) return;
+
+  if (data && data.valid) {
+    const services = data.services || [];
+    const ports = data.ports || [];
+    const warnings = data.warnings || [];
+
+    let html = `
+      <div class="validation-header-row">
+        <span class="validation-badge-valid">${escapeHtml(badgeTitle)}</span>
+        <span class="validation-label">${services.length} service${services.length === 1 ? "" : "s"} detected</span>
+      </div>
+    `;
+
+    if (services.length > 0 || ports.length > 0) {
+      html += `<div class="validation-details-row">`;
+      if (services.length > 0) {
+        html +=
+          `<span class="validation-label">Services:</span> ` +
+          services.map((s) => `<span class="service-pill">${escapeHtml(s)}</span>`).join(" ");
+      }
+      if (ports.length > 0) {
+        html +=
+          `<span class="validation-label" style="margin-left:8px;">Ports:</span> ` +
+          ports.map((p) => `<span class="port-pill">${escapeHtml(p)}</span>`).join(" ");
+      }
+      html += `</div>`;
+    }
+
+    if (warnings.length > 0) {
+      html += `
+        <ul class="validation-error-list" style="color: var(--state-degraded); margin-top: 6px;">
+          ${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("")}
+        </ul>`;
+      setStackEditorAnnotations(
+        warnings.map((w) => ({
+          row: 0,
+          column: 0,
+          text: String(w),
+          type: "warning",
+        }))
+      );
+    } else {
+      setStackEditorAnnotations([]);
+    }
+
+    statusBox.innerHTML = html;
+    statusBox.classList.remove("hidden");
+  } else {
+    const errors = data?.errors || [data?.detail || "Validation failed."];
+    const errLine = data?.error_line;
+    const errCol = data?.error_col;
+    const lineInfoHtml = errLine
+      ? `<span class="validation-label">Line ${escapeHtml(String(errLine))}${errCol ? `, Col ${escapeHtml(String(errCol))}` : ""}</span>`
+      : "";
+
+    statusBox.innerHTML = `
+      <div class="validation-header-row">
+        <span class="validation-badge-invalid">✕ Invalid Compose YAML</span>
+        ${lineInfoHtml}
+      </div>
+      <ul class="validation-error-list">
+        ${errors.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}
+      </ul>
+    `;
+    statusBox.classList.remove("hidden");
+
+    setStackEditorAnnotations([
+      {
+        row: Math.max(0, (Number(errLine) || 1) - 1),
+        column: Math.max(0, (Number(errCol) || 1) - 1),
+        text: errors.join("; "),
+        type: "error",
+      },
+    ]);
   }
 }
 
@@ -7645,11 +8009,10 @@ function switchStackEditorTab(tabName) {
  * Validate Docker Compose YAML structure and ports via POST /api/docker/stacks/validate.
  */
 async function validateStackYaml(overrideYaml = null) {
-  const yamlInput = document.getElementById("stack-yaml-input");
   const statusBox = document.getElementById("stack-validation-status");
   if (!statusBox) return;
 
-  const yamlContent = overrideYaml !== null ? overrideYaml : (yamlInput?.value || "");
+  const yamlContent = overrideYaml !== null ? overrideYaml : getStackYamlValue();
   if (!yamlContent.trim()) {
     statusBox.className = "validation-status-box";
     statusBox.innerHTML = `
@@ -7658,6 +8021,9 @@ async function validateStackYaml(overrideYaml = null) {
         <span class="validation-label">Compose YAML content cannot be empty.</span>
       </div>`;
     statusBox.classList.remove("hidden");
+    setStackEditorAnnotations([
+      { row: 0, column: 0, text: "Compose YAML content cannot be empty.", type: "error" },
+    ]);
     return;
   }
 
@@ -7674,52 +8040,9 @@ async function validateStackYaml(overrideYaml = null) {
 
     const data = await resp.json().catch(() => ({}));
     if (resp.ok && data.valid) {
-      const services = data.services || [];
-      const ports = data.ports || [];
-      const warnings = data.warnings || [];
-
-      let html = `
-        <div class="validation-header-row">
-          <span class="validation-badge-valid">✓ Valid Compose YAML</span>
-          <span class="validation-label">${services.length} service${services.length === 1 ? "" : "s"} detected</span>
-        </div>
-      `;
-
-      if (services.length > 0 || ports.length > 0) {
-        html += `<div class="validation-details-row">`;
-        if (services.length > 0) {
-          html +=
-            `<span class="validation-label">Services:</span> ` +
-            services.map((s) => `<span class="service-pill">${escapeHtml(s)}</span>`).join(" ");
-        }
-        if (ports.length > 0) {
-          html +=
-            `<span class="validation-label" style="margin-left:8px;">Ports:</span> ` +
-            ports.map((p) => `<span class="port-pill">${escapeHtml(p)}</span>`).join(" ");
-        }
-        html += `</div>`;
-      }
-
-      if (warnings.length > 0) {
-        html += `
-          <ul class="validation-error-list" style="color: var(--state-degraded); margin-top: 6px;">
-            ${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join("")}
-          </ul>`;
-      }
-
-      statusBox.innerHTML = html;
-      statusBox.classList.remove("hidden");
+      renderStackValidationResult(data, "✓ Valid Compose YAML");
     } else {
-      const errors = data.errors || [data.detail || "Validation failed."];
-      statusBox.innerHTML = `
-        <div class="validation-header-row">
-          <span class="validation-badge-invalid">✕ Invalid Compose YAML</span>
-        </div>
-        <ul class="validation-error-list">
-          ${errors.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}
-        </ul>
-      `;
-      statusBox.classList.remove("hidden");
+      renderStackValidationResult(data);
     }
   } catch (err) {
     statusBox.innerHTML = `
@@ -7732,14 +8055,195 @@ async function validateStackYaml(overrideYaml = null) {
 }
 
 /**
+ * Canonical Format & Beautify for Docker Compose YAML and .env via POST /api/docker/stacks/format.
+ */
+async function formatStackYaml() {
+  const statusBox = document.getElementById("stack-validation-status");
+  const yamlVal = getStackYamlValue();
+  const envVal = getStackEnvValue();
+
+  if (statusBox) {
+    statusBox.className = "validation-status-box";
+    statusBox.innerHTML = `<span class="validation-label">Formatting &amp; validating YAML...</span>`;
+    statusBox.classList.remove("hidden");
+  }
+
+  try {
+    const resp = await apiFetch("/api/docker/stacks/format", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ compose_yaml: yamlVal, env_content: envVal }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.valid) {
+      if (data.formatted_yaml) {
+        setStackYamlValue(data.formatted_yaml);
+      }
+      if (data.formatted_env !== undefined && data.formatted_env !== null) {
+        setStackEnvValue(data.formatted_env);
+      }
+      renderStackValidationResult(data, "✓ Formatted & Valid Compose");
+    } else {
+      if (data.formatted_env !== undefined && data.formatted_env !== null && !yamlVal.trim()) {
+        setStackEnvValue(data.formatted_env);
+      }
+      renderStackValidationResult(data);
+    }
+  } catch (err) {
+    if (statusBox) {
+      statusBox.innerHTML = `
+        <div class="validation-header-row">
+          <span class="validation-badge-invalid">✕ Format Error</span>
+          <span class="validation-label">${escapeHtml(err.message)}</span>
+        </div>`;
+      statusBox.classList.remove("hidden");
+    }
+  }
+}
+
+/**
+ * Insert a 1-click Compose YAML snippet block into the editor.
+ */
+function insertComposeSnippet(snippetType) {
+  let current = getStackYamlValue();
+  const hasServicesRoot = /(?:^|\n)services\s*:/m.test(current);
+
+  const snippets = {
+    service: hasServicesRoot
+      ? `  app-service:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "8080:80"\n`
+      : `services:\n  app:\n    image: nginx:alpine\n    restart: unless-stopped\n    ports:\n      - "8080:80"\n`,
+    ports: hasServicesRoot
+      ? `    ports:\n      - "8080:80"\n`
+      : `services:\n  app:\n    image: nginx:alpine\n    ports:\n      - "8080:80"\n`,
+    volumes: hasServicesRoot
+      ? `    volumes:\n      - ./data:/data\n`
+      : `services:\n  app:\n    image: nginx:alpine\n    volumes:\n      - ./data:/data\n`,
+    environment: hasServicesRoot
+      ? `    environment:\n      - TZ=UTC\n      - NODE_ENV=production\n`
+      : `services:\n  app:\n    image: nginx:alpine\n    environment:\n      - TZ=UTC\n      - NODE_ENV=production\n`,
+    healthcheck: hasServicesRoot
+      ? `    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`
+      : `services:\n  app:\n    image: nginx:alpine\n    healthcheck:\n      test: ["CMD", "curl", "-f", "http://localhost"]\n      interval: 30s\n      timeout: 5s\n      retries: 3\n`,
+    network: /(?:^|\n)networks\s*:/m.test(current)
+      ? `  app-net:\n    driver: bridge\n`
+      : `${hasServicesRoot ? "" : "services:\n  app:\n    image: nginx:alpine\n\n"}networks:\n  app-net:\n    driver: bridge\n`,
+  };
+
+  const snippet = snippets[snippetType];
+  if (!snippet) return;
+
+  let updated = current;
+  if (!updated.trim()) {
+    updated = snippet;
+  } else {
+    if (!updated.endsWith("\n")) {
+      updated += "\n";
+    }
+    updated += snippet;
+  }
+
+  setStackYamlValue(updated);
+  formatStackYaml();
+}
+
+/**
+ * Fallback Textarea IDE Keyboard Ergonomics (2-space soft tabs, auto-indent on Enter,
+ * Ctrl+/ comment toggle, Ctrl+Shift+F format).
+ */
+function handleComposeTextareaKeydown(e) {
+  const textarea = e.target;
+  if (!textarea || typeof textarea.value !== "string") return;
+
+  const val = textarea.value;
+  const start = textarea.selectionStart ?? 0;
+  const end = textarea.selectionEnd ?? start;
+
+  // Ctrl+Shift+F / Cmd+Shift+F / Alt+Shift+F -> Format YAML
+  if ((e.ctrlKey || e.metaKey || e.altKey) && e.shiftKey && (e.key === "F" || e.key === "f")) {
+    e.preventDefault();
+    formatStackYaml();
+    return;
+  }
+
+  // Ctrl+/ or Cmd+/ -> Toggle '# ' comment on current or selected lines
+  if ((e.ctrlKey || e.metaKey) && e.key === "/") {
+    e.preventDefault();
+    const lineStart = val.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+    let lineEnd = val.indexOf("\n", end);
+    if (lineEnd === -1) lineEnd = val.length;
+
+    const selectedBlock = val.slice(lineStart, lineEnd);
+    const lines = selectedBlock.split("\n");
+    const allCommented = lines
+      .filter((l) => l.trim().length > 0)
+      .every((l) => /^\s*#/.test(l));
+
+    const updatedLines = lines.map((line) => {
+      if (allCommented) {
+        return line.replace(/^(\s*)#\s?/, "$1");
+      }
+      const match = line.match(/^(\s*)(.*)$/);
+      return `${match[1]}# ${match[2]}`;
+    });
+
+    const replacement = updatedLines.join("\n");
+    textarea.value = val.slice(0, lineStart) + replacement + val.slice(lineEnd);
+    textarea.selectionStart = lineStart;
+    textarea.selectionEnd = lineStart + replacement.length;
+    return;
+  }
+
+  // Tab / Shift+Tab -> 2-space indent or unindent
+  if (e.key === "Tab") {
+    e.preventDefault();
+    if (start !== end || e.shiftKey) {
+      const lineStart = val.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+      let lineEnd = val.indexOf("\n", end);
+      if (lineEnd === -1) lineEnd = val.length;
+
+      const selectedBlock = val.slice(lineStart, lineEnd);
+      const lines = selectedBlock.split("\n");
+      const updatedLines = lines.map((line) => {
+        if (e.shiftKey) {
+          return line.replace(/^ {1,2}/, "");
+        }
+        return "  " + line;
+      });
+      const replacement = updatedLines.join("\n");
+      textarea.value = val.slice(0, lineStart) + replacement + val.slice(lineEnd);
+      textarea.selectionStart = lineStart;
+      textarea.selectionEnd = lineStart + replacement.length;
+    } else {
+      textarea.value = val.slice(0, start) + "  " + val.slice(end);
+      textarea.selectionStart = textarea.selectionEnd = start + 2;
+    }
+    return;
+  }
+
+  // Enter -> Auto-indent to current line's indentation (+2 spaces if line ends with ':')
+  if (e.key === "Enter" && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+    e.preventDefault();
+    const lineStart = val.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+    const currentLineUpToCursor = val.slice(lineStart, start);
+    const indentMatch = currentLineUpToCursor.match(/^(\s*)/);
+    let indent = indentMatch ? indentMatch[1] : "";
+    if (/:\s*$/.test(currentLineUpToCursor.trim())) {
+      indent += "  ";
+    }
+    const insertion = "\n" + indent;
+    textarea.value = val.slice(0, start) + insertion + val.slice(end);
+    textarea.selectionStart = textarea.selectionEnd = start + insertion.length;
+  }
+}
+
+/**
  * Open Stack Editor modal for creating or updating a stack.
  */
 async function openStackEditor(stackName = null, prefill = null) {
   const modal = document.getElementById("stack-editor-modal");
   const title = document.getElementById("stack-editor-title");
   const nameInput = document.getElementById("stack-name-input");
-  const yamlInput = document.getElementById("stack-yaml-input");
-  const envInput = document.getElementById("stack-env-input");
   const saveText = document.getElementById("save-stack-text");
   const feedback = document.getElementById("stack-editor-feedback");
   const statusBox = document.getElementById("stack-validation-status");
@@ -7747,6 +8251,8 @@ async function openStackEditor(stackName = null, prefill = null) {
   if (feedback) feedback.classList.add("hidden");
   if (statusBox) statusBox.classList.add("hidden");
 
+  initStackCodeEditors();
+  setStackEditorAnnotations([]);
   switchStackEditorTab("compose");
 
   if (stackName) {
@@ -7756,25 +8262,25 @@ async function openStackEditor(stackName = null, prefill = null) {
       nameInput.disabled = true;
     }
     if (saveText) saveText.textContent = "Update Stack";
-    if (yamlInput) yamlInput.value = "Loading compose file...";
-    if (envInput) envInput.value = "";
+    setStackYamlValue("Loading compose file...");
+    setStackEnvValue("");
 
     try {
       const resp = await apiFetch(`/api/docker/stacks/${encodeURIComponent(stackName)}`);
       if (resp.ok) {
         const data = await resp.json();
-        if (yamlInput) yamlInput.value = data.stack?.compose_yaml || "";
-        if (envInput) envInput.value = data.stack?.env_content || "";
+        setStackYamlValue(data.stack?.compose_yaml || "");
+        setStackEnvValue(data.stack?.env_content || "");
         if (data.stack?.compose_yaml) {
           validateStackYaml(data.stack.compose_yaml);
         }
       } else {
-        if (yamlInput) yamlInput.value = "";
-        if (envInput) envInput.value = "";
+        setStackYamlValue("");
+        setStackEnvValue("");
       }
     } catch {
-      if (yamlInput) yamlInput.value = "";
-      if (envInput) envInput.value = "";
+      setStackYamlValue("");
+      setStackEnvValue("");
     }
   } else if (prefill) {
     if (title) title.textContent = "Deploy New Compose Stack";
@@ -7783,13 +8289,17 @@ async function openStackEditor(stackName = null, prefill = null) {
       nameInput.disabled = false;
     }
     if (saveText) saveText.textContent = "Deploy Stack";
-    if (yamlInput) yamlInput.value = prefill.compose_yaml || "";
-    if (envInput) envInput.value = prefill.env_content || "";
+    setStackYamlValue(prefill.compose_yaml || "");
+    setStackEnvValue(prefill.env_content || "");
     if (prefill.compose_yaml) {
       validateStackYaml(prefill.compose_yaml);
     }
     setTimeout(() => {
-      yamlInput?.focus();
+      if (composeAceEditor && typeof composeAceEditor.focus === "function") {
+        composeAceEditor.focus();
+      } else {
+        document.getElementById("stack-yaml-input")?.focus();
+      }
     }, 50);
   } else {
     if (title) title.textContent = "Deploy New Compose Stack";
@@ -7798,11 +8308,14 @@ async function openStackEditor(stackName = null, prefill = null) {
       nameInput.disabled = false;
     }
     if (saveText) saveText.textContent = "Deploy Stack";
-    if (yamlInput) yamlInput.value = "";
-    if (envInput) envInput.value = "";
+    setStackYamlValue("");
+    setStackEnvValue("");
   }
 
   modal?.classList.remove("hidden");
+  if (composeAceEditor && typeof composeAceEditor.resize === "function") {
+    composeAceEditor.resize();
+  }
 }
 
 function closeStackEditor() {
@@ -7810,16 +8323,15 @@ function closeStackEditor() {
 }
 
 function insertExampleYaml() {
-  const yamlInput = document.getElementById("stack-yaml-input");
-  if (!yamlInput) return;
-  yamlInput.value = `services:
+  const example = `services:
   app:
     image: nginx:alpine
     ports:
       - "8088:80"
     restart: unless-stopped
 `;
-  validateStackYaml(yamlInput.value);
+  setStackYamlValue(example);
+  validateStackYaml(example);
 }
 
 /**
@@ -7827,15 +8339,13 @@ function insertExampleYaml() {
  */
 async function handleSaveStack() {
   const nameInput = document.getElementById("stack-name-input");
-  const yamlInput = document.getElementById("stack-yaml-input");
-  const envInput = document.getElementById("stack-env-input");
   const deployToggle = document.getElementById("stack-deploy-toggle");
   const feedback = document.getElementById("stack-editor-feedback");
   const saveBtn = document.getElementById("save-stack-btn");
 
   const name = (nameInput?.value || "").trim();
-  const compose_yaml = (yamlInput?.value || "").trim();
-  const env_content = envInput?.value || "";
+  const compose_yaml = getStackYamlValue().trim();
+  const env_content = getStackEnvValue();
   const deploy = !!deployToggle?.checked;
   const isEdit = !!nameInput?.disabled;
 
@@ -13727,6 +14237,44 @@ function initDashboard() {
   document
     .getElementById("stack-validate-btn")
     ?.addEventListener("click", () => validateStackYaml());
+
+  document
+    .getElementById("stack-format-btn")
+    ?.addEventListener("click", () => formatStackYaml());
+
+  document
+    .getElementById("stack-env-format-btn")
+    ?.addEventListener("click", () => formatStackYaml());
+
+  const snippetToolbar = document.getElementById("stack-snippet-toolbar");
+  snippetToolbar?.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-snippet]");
+    if (!btn) return;
+    const snippetType = btn.getAttribute("data-snippet");
+    if (snippetType) {
+      insertComposeSnippet(snippetType);
+    }
+  });
+
+  const yamlTextarea = document.getElementById("stack-yaml-input");
+  const envTextarea = document.getElementById("stack-env-input");
+  const updateTextareaCursorStatus = (textarea) => {
+    if (!textarea || typeof textarea.value !== "string") return;
+    const pos = textarea.selectionStart ?? 0;
+    const upToCursor = textarea.value.slice(0, pos);
+    const lines = upToCursor.split("\n");
+    const line = lines.length;
+    const col = lines[lines.length - 1].length + 1;
+    updateStackEditorStatusbar(line, col);
+  };
+  if (yamlTextarea) {
+    yamlTextarea.addEventListener("keydown", handleComposeTextareaKeydown);
+    yamlTextarea.addEventListener("keyup", () => updateTextareaCursorStatus(yamlTextarea));
+    yamlTextarea.addEventListener("click", () => updateTextareaCursorStatus(yamlTextarea));
+  }
+  if (envTextarea) {
+    envTextarea.addEventListener("keydown", handleComposeTextareaKeydown);
+  }
 
   document
     .getElementById("tab-btn-compose")

@@ -266,6 +266,11 @@ class StackValidateRequest(BaseModel):
     compose_yaml: str
 
 
+class StackFormatRequest(BaseModel):
+    compose_yaml: str = ""
+    env_content: Optional[str] = None
+
+
 class StackActionRequest(BaseModel):
     action: str
 
@@ -1384,6 +1389,33 @@ async def api_docker_validate_stack(
     result = await asyncio.to_thread(
         main.docker_manager.validate_compose_yaml,
         payload.compose_yaml,
+    )
+    return result
+
+
+@app.post("/api/docker/stacks/format")
+async def api_docker_format_stack(
+    payload: StackFormatRequest,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    if not (payload.compose_yaml or "").strip() and payload.env_content is not None:
+        formatted_env = await asyncio.to_thread(
+            main.docker_manager.format_env_content,
+            payload.env_content,
+        )
+        return {
+            "valid": True,
+            "formatted_yaml": "",
+            "formatted_env": formatted_env,
+            "services": [],
+            "ports": [],
+            "volumes": [],
+            "warnings": [],
+        }
+    result = await asyncio.to_thread(
+        main.docker_manager.format_compose_yaml,
+        payload.compose_yaml,
+        payload.env_content,
     )
     return result
 

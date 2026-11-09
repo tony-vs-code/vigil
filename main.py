@@ -5807,9 +5807,14 @@ class DockerManager:
                     "errors": ["YAML parser engine unavailable."],
                 }
         except yaml.YAMLError as exc:
+            mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+            line = (int(mark.line) + 1) if mark is not None and hasattr(mark, "line") else None
+            col = (int(mark.column) + 1) if mark is not None and hasattr(mark, "column") else None
             return {
                 "valid": False,
                 "errors": [f"Invalid YAML syntax: {exc}"],
+                "error_line": line,
+                "error_col": col,
             }
         except Exception as exc:
             return {
@@ -5950,6 +5955,141 @@ class DockerManager:
             "image_tags": image_tags,
             "images": image_tags,
             "service_details": service_details,
+        }
+
+    def format_env_content(self, env_content: str) -> str:
+        """Canonically formats .env file content while preserving comments and values."""
+        if not env_content:
+            return ""
+        normalized = str(env_content).replace("\r\n", "\n").replace("\r", "\n")
+        if not normalized.strip():
+            return ""
+        formatted_lines: list[str] = []
+        blank_streak = 0
+        for raw_line in normalized.split("\n"):
+            stripped = raw_line.strip()
+            if not stripped:
+                blank_streak += 1
+                if blank_streak <= 1 and formatted_lines:
+                    formatted_lines.append("")
+                continue
+            blank_streak = 0
+            if stripped.startswith("#"):
+                formatted_lines.append(raw_line.rstrip())
+            elif "=" in raw_line:
+                key, val = raw_line.split("=", 1)
+                formatted_lines.append(f"{key.strip()}={val.strip()}")
+            else:
+                formatted_lines.append(raw_line.rstrip())
+        while formatted_lines and formatted_lines[-1] == "":
+            formatted_lines.pop()
+        return "\n".join(formatted_lines) + "\n" if formatted_lines else ""
+
+    def format_compose_yaml(
+        self, compose_yaml: str, env_content: Optional[str] = None
+    ) -> dict[str, Any]:
+        """Pre-processes, validates, and canonically orders Docker Compose YAML and optional .env content."""
+        normalized_yaml = (compose_yaml or "").replace("\r\n", "\n").replace("\r", "\n")
+        preprocessed_lines = [
+            re.sub(r"^\t+", lambda m: "  " * len(m.group(0)), line).rstrip()
+            for line in normalized_yaml.split("\n")
+        ]
+        preprocessed_yaml = "\n".join(preprocessed_lines)
+
+        validation = self.validate_compose_yaml(preprocessed_yaml)
+        if not validation.get("valid"):
+            return {
+                "valid": False,
+                "errors": validation.get("errors", []),
+                "error_line": validation.get("error_line"),
+                "error_col": validation.get("error_col"),
+            }
+
+        parsed = yaml.safe_load(preprocessed_yaml)
+        top_level_order = [
+            "version",
+            "name",
+            "services",
+            "networks",
+            "volumes",
+            "configs",
+            "secrets",
+        ]
+        service_key_order = [
+            "image",
+            "build",
+            "container_name",
+            "hostname",
+            "restart",
+            "privileged",
+            "user",
+            "network_mode",
+            "ports",
+            "expose",
+            "environment",
+            "env_file",
+            "volumes",
+            "networks",
+            "devices",
+            "depends_on",
+            "links",
+            "labels",
+            "command",
+            "entrypoint",
+            "working_dir",
+            "healthcheck",
+            "logging",
+            "deploy",
+        ]
+
+        ordered_doc: dict[str, Any] = {}
+        for k in top_level_order:
+            if k in parsed:
+                if k == "services" and isinstance(parsed[k], dict):
+                    ordered_services: dict[str, Any] = {}
+                    for svc_name, svc_conf in parsed[k].items():
+                        if isinstance(svc_conf, dict):
+                            ordered_svc: dict[str, Any] = {}
+                            for sk in service_key_order:
+                                if sk in svc_conf:
+                                    ordered_svc[sk] = svc_conf[sk]
+                            for sk, sv in svc_conf.items():
+                                if sk not in ordered_svc:
+                                    ordered_svc[sk] = sv
+                            ordered_services[svc_name] = ordered_svc
+                        else:
+                            ordered_services[svc_name] = svc_conf
+                    ordered_doc[k] = ordered_services
+                else:
+                    ordered_doc[k] = parsed[k]
+
+        for k, v in parsed.items():
+            if k not in ordered_doc and str(k).startswith("x-"):
+                ordered_doc[k] = v
+
+        for k, v in parsed.items():
+            if k not in ordered_doc:
+                ordered_doc[k] = v
+
+        formatted_yaml = yaml.safe_dump(
+            ordered_doc,
+            sort_keys=False,
+            default_flow_style=False,
+            indent=2,
+            allow_unicode=True,
+        )
+        formatted_env = (
+            self.format_env_content(env_content) if env_content is not None else None
+        )
+
+        return {
+            "valid": True,
+            "formatted_yaml": formatted_yaml,
+            "formatted_env": formatted_env,
+            "services": validation["services"],
+            "ports": validation["ports"],
+            "volumes": validation["volumes"],
+            "warnings": validation["warnings"],
         }
 
     def get_stack(self, name: str) -> Optional[dict[str, Any]]:
