@@ -11193,35 +11193,52 @@ async function handleSaveUpdateSchedule() {
 let currentPackagesSubtab = "updates";
 let cachedPackageUpdates = null;
 let cachedInstalledPackages = null;
+let cachedPythonPackages = null;
 let currentPkgSearchQuery = "";
 let currentPkgPage = 1;
 let currentPkgTotalPages = 1;
 let pkgInstalledSearchDebounceTimer = null;
 let lastUpgradeTargetPackage = null;
+let lastPythonUpgradeTargetPackage = null;
+let lastUpgradeModalType = "apt";
 
 function switchPackagesSubtab(subtab) {
   currentPackagesSubtab = subtab || "updates";
   const btnUpdates = document.getElementById("subtab-pkg-updates-btn");
   const btnInstalled = document.getElementById("subtab-pkg-installed-btn");
+  const btnPython = document.getElementById("subtab-pkg-python-btn");
   const panelUpdates = document.getElementById("pkg-updates-subtab-panel");
   const panelInstalled = document.getElementById("pkg-installed-subtab-panel");
+  const panelPython = document.getElementById("pkg-python-subtab-panel");
+
+  btnUpdates?.classList.remove("active");
+  btnUpdates?.setAttribute("aria-selected", "false");
+  btnInstalled?.classList.remove("active");
+  btnInstalled?.setAttribute("aria-selected", "false");
+  btnPython?.classList.remove("active");
+  btnPython?.setAttribute("aria-selected", "false");
+
+  panelUpdates?.classList.add("hidden");
+  panelInstalled?.classList.add("hidden");
+  panelPython?.classList.add("hidden");
 
   if (currentPackagesSubtab === "installed") {
-    btnUpdates?.classList.remove("active");
-    btnUpdates?.setAttribute("aria-selected", "false");
     btnInstalled?.classList.add("active");
     btnInstalled?.setAttribute("aria-selected", "true");
-    panelUpdates?.classList.add("hidden");
     panelInstalled?.classList.remove("hidden");
     if (!cachedInstalledPackages) {
       fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage);
     }
+  } else if (currentPackagesSubtab === "python") {
+    btnPython?.classList.add("active");
+    btnPython?.setAttribute("aria-selected", "true");
+    panelPython?.classList.remove("hidden");
+    if (!cachedPythonPackages) {
+      fetchPythonPackages(false);
+    }
   } else {
-    btnInstalled?.classList.remove("active");
-    btnInstalled?.setAttribute("aria-selected", "false");
     btnUpdates?.classList.add("active");
     btnUpdates?.setAttribute("aria-selected", "true");
-    panelInstalled?.classList.add("hidden");
     panelUpdates?.classList.remove("hidden");
     if (!cachedPackageUpdates) {
       fetchPackageUpdates();
@@ -11679,6 +11696,7 @@ async function refreshAptCache() {
 
 async function simulatePackageUpgrade(packageName = null) {
   lastUpgradeTargetPackage = packageName;
+  lastUpgradeModalType = "apt";
   const modal = document.getElementById("pkg-upgrade-modal");
   const modalTitle = document.getElementById("pkg-upgrade-modal-title");
   const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
@@ -11698,7 +11716,10 @@ async function simulatePackageUpgrade(packageName = null) {
   if (terminal) {
     terminal.textContent = "Executing simulation in background...\n\n";
   }
-  installModalBtn?.classList.add("hidden");
+  if (installModalBtn) {
+    installModalBtn.textContent = "Install Now";
+    installModalBtn.classList.add("hidden");
+  }
   modal?.classList.remove("hidden");
 
   try {
@@ -11718,7 +11739,10 @@ async function simulatePackageUpgrade(packageName = null) {
     if (terminal) {
       terminal.textContent = result.output || "Simulation completed with no output.";
     }
-    installModalBtn?.classList.remove("hidden");
+    if (installModalBtn) {
+      installModalBtn.textContent = "Install Now";
+      installModalBtn.classList.remove("hidden");
+    }
   } catch (err) {
     if (terminal) {
       terminal.textContent += `\nError executing simulation: ${err.message}`;
@@ -11735,6 +11759,7 @@ async function installPackageUpgrade(packageName = null) {
   }
 
   lastUpgradeTargetPackage = packageName;
+  lastUpgradeModalType = "apt";
   const modal = document.getElementById("pkg-upgrade-modal");
   const modalTitle = document.getElementById("pkg-upgrade-modal-title");
   const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
@@ -11806,6 +11831,353 @@ async function installPackageUpgrade(packageName = null) {
   }
 }
 
+async function fetchPythonPackages(checkPypi = false) {
+  const tbody = document.getElementById("pkg-python-tbody");
+  const btnCheck = document.getElementById("btn-check-pypi-updates");
+  if (btnCheck && checkPypi) btnCheck.classList.add("loading");
+
+  if (tbody && !cachedPythonPackages) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">Loading Vigil Python environment...</td></tr>';
+  }
+
+  if (checkPypi) {
+    showToast({
+      title: "Querying PyPI",
+      message: "Checking PyPI repositories for compatible package updates...",
+      type: "info",
+    });
+  }
+
+  try {
+    const url = checkPypi ? "/api/packages/python/check" : "/api/packages/python";
+    const resp = await apiFetch(url, {
+      method: checkPypi ? "POST" : "GET",
+    });
+    if (!resp.ok) {
+      throw new Error(`Failed to load Python packages (HTTP ${resp.status})`);
+    }
+    const data = await resp.json();
+    cachedPythonPackages = data;
+
+    const runtimeEl = document.getElementById("pkg-py-runtime-version");
+    const countDirectEl = document.getElementById("pkg-py-count-direct");
+    const countUpdatesEl = document.getElementById("pkg-py-count-updates");
+    const countHeldEl = document.getElementById("pkg-py-count-held");
+    const subtabBadge = document.getElementById("subtab-pkg-python-badge");
+
+    if (runtimeEl) {
+      runtimeEl.textContent = `Python ${data.python_version || "--"}`;
+    }
+    if (countDirectEl) {
+      countDirectEl.textContent = String(data.summary?.direct ?? 0);
+    }
+    if (countUpdatesEl) {
+      countUpdatesEl.textContent = String(data.summary?.updates_available ?? 0);
+    }
+    if (countHeldEl) {
+      countHeldEl.textContent = String(data.summary?.major_held ?? 0);
+    }
+    if (subtabBadge) {
+      const updatesCount = Number(data.summary?.updates_available ?? 0);
+      const totalCount = Number(data.summary?.total ?? 0);
+      subtabBadge.textContent = String(updatesCount > 0 ? updatesCount : totalCount);
+    }
+
+    renderPythonPackagesTable();
+
+    if (checkPypi) {
+      showToast({
+        title: "PyPI Check Complete",
+        message: `Found ${data.summary?.updates_available ?? 0} safe updates available.`,
+        type: "success",
+      });
+    }
+  } catch (err) {
+    console.error("fetchPythonPackages error:", err);
+    if (tbody) {
+      tbody.innerHTML = `<tr><td colspan="6" class="empty-state error-text">Error loading Python packages: ${escapeHtml(err.message)}</td></tr>`;
+    }
+    showToast({
+      title: "Python Packages Error",
+      message: err.message,
+      type: "error",
+    });
+  } finally {
+    if (btnCheck) btnCheck.classList.remove("loading");
+  }
+}
+
+function renderPythonPackagesTable() {
+  const tbody = document.getElementById("pkg-python-tbody");
+  if (!tbody) return;
+
+  const packages = cachedPythonPackages?.packages || [];
+  if (!Array.isArray(packages) || packages.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No Python packages found.</td></tr>';
+    return;
+  }
+
+  const searchInput = document.getElementById("pkg-python-search");
+  const query = (searchInput?.value || "").trim().toLowerCase();
+  const roleSelect = document.getElementById("pkg-python-role-filter");
+  const roleFilter = roleSelect?.value || "all";
+
+  const filtered = packages.filter((pkg) => {
+    if (roleFilter === "direct") {
+      const isDirect = Boolean(pkg.is_direct ?? pkg.direct ?? (pkg.role === "direct"));
+      if (!isDirect) return false;
+    } else if (roleFilter === "updates") {
+      if (!pkg.update_available) return false;
+    }
+
+    if (query) {
+      const name = (pkg.name || "").toLowerCase();
+      const constraint = (pkg.constraint || "").toLowerCase();
+      const summary = (pkg.summary || "").toLowerCase();
+      if (!name.includes(query) && !constraint.includes(query) && !summary.includes(query)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No Python packages found matching filter criteria.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = filtered
+    .map((pkg) => {
+      const isDirect = Boolean(pkg.is_direct ?? pkg.direct ?? (pkg.role === "direct"));
+      const roleBadge = isDirect
+        ? '<span class="status-badge status-ok">DIRECT</span>'
+        : '<span class="status-badge status-muted">TRANSITIVE</span>';
+      const constraintText = escapeHtml(pkg.constraint || "lockfile");
+
+      const installedVer = escapeHtml(pkg.installed_version || "--");
+      const latestCompat = escapeHtml(pkg.latest_compatible_version || pkg.installed_version || "--");
+      const isHeld = Boolean(pkg.major_held);
+      const heldNote = isHeld && pkg.latest_version
+        ? ` <span class="text-xs text-muted font-normal">(v${escapeHtml(pkg.latest_version)} held)</span>`
+        : "";
+
+      let statusBadge = "";
+      if (pkg.update_available) {
+        statusBadge = '<span class="status-badge status-warn">UPDATE AVAILABLE</span>';
+      } else if (pkg.major_held) {
+        const heldTitle = escapeHtml(`Newer major version (${pkg.latest_version || ""}) held back by SemVer safety bound`);
+        statusBadge = `<span class="status-badge status-ok" title="${heldTitle}">MAJOR HELD</span>`;
+      } else {
+        statusBadge = '<span class="status-badge status-ok">UP TO DATE</span>';
+      }
+
+      return `
+        <tr>
+          <td>
+            <div>
+              <strong class="mono-text">${escapeHtml(pkg.name)}</strong>
+              ${pkg.summary ? `<div class="text-xs text-muted" style="margin-top: 2px;">${escapeHtml(pkg.summary)}</div>` : ""}
+            </div>
+          </td>
+          <td>
+            <div style="display: flex; flex-direction: column; gap: 4px; align-items: flex-start;">
+              ${roleBadge}
+              <span class="mono-text text-xs text-muted">${constraintText}</span>
+            </div>
+          </td>
+          <td>
+            <span class="mono-text">${installedVer}</span>
+          </td>
+          <td>
+            <span class="mono-text font-bold ${pkg.update_available ? 'text-ok' : ''}">${latestCompat}</span>${heldNote}
+          </td>
+          <td>
+            ${statusBadge}
+          </td>
+          <td style="text-align: right;">
+            <div class="btn-action-group" style="justify-content: flex-end;">
+              <button
+                type="button"
+                class="btn-sm btn-secondary btn-py-simulate"
+                data-py-pkg="${escapeHtml(pkg.name)}"
+                title="Simulate upgrade for ${escapeHtml(pkg.name)}"
+              >
+                Simulate
+              </button>
+              <button
+                type="button"
+                class="btn-sm btn-primary btn-py-upgrade"
+                data-py-pkg="${escapeHtml(pkg.name)}"
+                title="Safe update for ${escapeHtml(pkg.name)}"
+              >
+                Safe Update
+              </button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  tbody.querySelectorAll(".btn-py-simulate").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const name = btn.getAttribute("data-py-pkg");
+      simulatePythonPackageUpgrade(name);
+    });
+  });
+
+  tbody.querySelectorAll(".btn-py-upgrade").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const name = btn.getAttribute("data-py-pkg");
+      upgradePythonPackage(name);
+    });
+  });
+}
+
+async function simulatePythonPackageUpgrade(packageName = null) {
+  lastPythonUpgradeTargetPackage = packageName;
+  lastUpgradeModalType = "python";
+  const modal = document.getElementById("pkg-upgrade-modal");
+  const modalTitle = document.getElementById("pkg-upgrade-modal-title");
+  const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
+  const terminal = document.getElementById("pkg-upgrade-terminal");
+  const installModalBtn = document.getElementById("btn-pkg-modal-install");
+
+  if (modalTitle) {
+    modalTitle.textContent = packageName
+      ? `Simulate Python Upgrade: ${packageName}`
+      : "Simulated Python Environment Upgrade";
+  }
+  if (modalSubtitle) {
+    modalSubtitle.textContent = packageName
+      ? `Dry run: uv lock --dry-run -P ${packageName}`
+      : "Dry run: uv lock --dry-run (safe, non-destructive resolution)";
+  }
+  if (terminal) {
+    terminal.textContent = "Executing uv dry-run simulation...\n\n";
+  }
+  installModalBtn?.classList.add("hidden");
+  modal?.classList.remove("hidden");
+
+  try {
+    const payload = {
+      packages: packageName ? [packageName] : null,
+      dry_run: true,
+      restart_service: false,
+    };
+    const resp = await apiFetch("/api/packages/python/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || errData.error || `Simulation request failed (HTTP ${resp.status})`);
+    }
+    const result = await resp.json();
+    if (terminal) {
+      terminal.textContent = result.output || result.stdout || "Simulation completed with no output.";
+    }
+    if (installModalBtn) {
+      installModalBtn.textContent = "Safe Upgrade Now";
+      installModalBtn.classList.remove("hidden");
+    }
+  } catch (err) {
+    if (terminal) {
+      terminal.textContent += `\nError executing simulation: ${err.message}`;
+    }
+  }
+}
+
+async function upgradePythonPackage(packageName = null) {
+  const confirmMsg = packageName
+    ? `Are you sure you want to safe-upgrade Python package "${packageName}"?`
+    : "Are you sure you want to safe-upgrade all compatible Python packages with pre-restart smoke test & rollback protection?";
+  if (!confirm(confirmMsg)) {
+    return;
+  }
+
+  lastPythonUpgradeTargetPackage = packageName;
+  lastUpgradeModalType = "python";
+  const modal = document.getElementById("pkg-upgrade-modal");
+  const modalTitle = document.getElementById("pkg-upgrade-modal-title");
+  const modalSubtitle = document.getElementById("pkg-upgrade-modal-subtitle");
+  const terminal = document.getElementById("pkg-upgrade-terminal");
+  const installModalBtn = document.getElementById("btn-pkg-modal-install");
+  const restartToggle = document.getElementById("pkg-python-restart-toggle");
+  const shouldRestart = Boolean(restartToggle?.checked);
+
+  if (modalTitle) {
+    modalTitle.textContent = packageName
+      ? `Safe Upgrading: ${packageName}`
+      : "Safe Upgrading Python Environment";
+  }
+  if (modalSubtitle) {
+    modalSubtitle.textContent = "uv sync with automated pre-restart smoke test & auto-rollback";
+  }
+  if (terminal) {
+    terminal.textContent = "Executing safe upgrade in background...\nVerifying smoke test health...\n\n";
+  }
+  installModalBtn?.classList.add("hidden");
+  modal?.classList.remove("hidden");
+
+  try {
+    const payload = {
+      packages: packageName ? [packageName] : null,
+      dry_run: false,
+      restart_service: shouldRestart,
+    };
+    const resp = await apiFetch("/api/packages/python/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(result.detail || result.error || `Upgrade failed (HTTP ${resp.status})`);
+    }
+
+    let terminalText = result.output || result.stdout || "";
+    const smokePassed = result.smoke_test?.passed ?? result.success;
+    if (smokePassed) {
+      terminalText += "\n\n✓ Smoke Test PASSED (main, api & 6 diagnostics healthy)";
+      if (shouldRestart) {
+        terminalText += "\n\nℹ Vigil service reload scheduled in 2 seconds...";
+      }
+      showToast({
+        title: "Python Package Upgraded",
+        message: packageName ? `Successfully updated ${packageName}` : "Successfully updated Python environment",
+        type: "success",
+      });
+    } else {
+      terminalText += "\n\n✕ Smoke Test FAILED — Automatically Rolled Back to Previous uv.lock";
+      if (result.smoke_test?.output) {
+        terminalText += "\n" + result.smoke_test.output;
+      }
+      showToast({
+        title: "Upgrade Rolled Back",
+        message: "Smoke test failed; previous uv.lock restored.",
+        type: "error",
+      });
+    }
+
+    if (terminal) {
+      terminal.textContent = terminalText;
+    }
+
+    await fetchPythonPackages(false);
+  } catch (err) {
+    if (terminal) {
+      terminal.textContent += `\nError executing upgrade: ${err.message}`;
+    }
+    showToast({
+      title: "Python Upgrade Error",
+      message: err.message,
+      type: "error",
+    });
+  }
+}
+
 function closePackageUpgradeModal() {
   document.getElementById("pkg-upgrade-modal")?.classList.add("hidden");
 }
@@ -11814,6 +12186,8 @@ function refreshPackagesView() {
   fetchPackageUpdates();
   // Preload installed packages in background so its badge and list are preloaded
   fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage);
+  // Preload python packages in background
+  fetchPythonPackages(false);
 }
 
 /* =========================================================================
@@ -14279,7 +14653,15 @@ function initDashboard() {
   // Packages & Updates Listeners
   document
     .getElementById("btn-refresh-packages")
-    ?.addEventListener("click", () => fetchPackageUpdates(true));
+    ?.addEventListener("click", () => {
+      if (currentPackagesSubtab === "python") {
+        fetchPythonPackages(true);
+      } else if (currentPackagesSubtab === "installed") {
+        fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage);
+      } else {
+        fetchPackageUpdates(true);
+      }
+    });
 
   document
     .getElementById("btn-refresh-apt-cache")
@@ -14295,7 +14677,13 @@ function initDashboard() {
 
   document
     .getElementById("btn-pkg-modal-install")
-    ?.addEventListener("click", () => installPackageUpgrade(lastUpgradeTargetPackage));
+    ?.addEventListener("click", () => {
+      if (lastUpgradeModalType === "python") {
+        upgradePythonPackage(lastPythonUpgradeTargetPackage);
+      } else {
+        installPackageUpgrade(lastUpgradeTargetPackage);
+      }
+    });
 
   document
     .getElementById("btn-close-pkg-upgrade-modal")
@@ -14312,6 +14700,26 @@ function initDashboard() {
   document
     .getElementById("subtab-pkg-installed-btn")
     ?.addEventListener("click", () => switchPackagesSubtab("installed"));
+
+  document
+    .getElementById("subtab-pkg-python-btn")
+    ?.addEventListener("click", () => switchPackagesSubtab("python"));
+
+  document
+    .getElementById("pkg-python-search")
+    ?.addEventListener("input", renderPythonPackagesTable);
+
+  document
+    .getElementById("pkg-python-role-filter")
+    ?.addEventListener("change", renderPythonPackagesTable);
+
+  document
+    .getElementById("btn-check-pypi-updates")
+    ?.addEventListener("click", () => fetchPythonPackages(true));
+
+  document
+    .getElementById("btn-upgrade-all-python")
+    ?.addEventListener("click", () => upgradePythonPackage(null));
 
   document
     .getElementById("pkg-updates-search")

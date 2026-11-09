@@ -2298,6 +2298,10 @@
                 <span>Installed Packages</span>
                 <span id="subtab-pkg-installed-badge" class="pill-counter">0</span>
               </button>
+              <button id="subtab-pkg-python-btn" class="subtab-nav-btn" type="button" role="tab" aria-selected="false" aria-controls="pkg-python-subtab-panel">
+                <span>Vigil Python Env</span>
+                <span id="subtab-pkg-python-badge" class="pill-counter">0</span>
+              </button>
             </div>
 
             <!-- Available Updates Subtab Panel -->
@@ -2425,6 +2429,93 @@
                       <polyline points="9 18 15 12 9 6"></polyline>
                     </svg>
                   </button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Vigil Python Environment Subtab Panel -->
+            <div id="pkg-python-subtab-panel" class="subtab-panel hidden" role="tabpanel" aria-labelledby="subtab-pkg-python-btn">
+              <div class="overview-status-ribbon" role="region" aria-label="Vigil Python Environment Summary">
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Python Runtime</span>
+                    <span id="pkg-py-runtime-version" class="pill-counter">--</span>
+                  </div>
+                </div>
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Direct Dependencies</span>
+                    <span id="pkg-py-count-direct" class="count-number count-ok">0</span>
+                  </div>
+                </div>
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Safe Updates Available</span>
+                    <span id="pkg-py-count-updates" class="count-number count-warn">0</span>
+                  </div>
+                </div>
+                <div class="status-ribbon-item">
+                  <div class="status-ribbon-badge-group">
+                    <span class="status-ribbon-label">Major Held (Protected)</span>
+                    <span id="pkg-py-count-held" class="pill-counter">0</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="table-controls-bar">
+                <div class="search-box">
+                  <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <input id="pkg-python-search" type="search" placeholder="Filter Python packages by name, constraint, or summary..." aria-label="Filter Python Packages" />
+                </div>
+                <div class="filter-actions">
+                  <select id="pkg-python-role-filter" class="module-interval-select" aria-label="Filter Python packages by role">
+                    <option value="all" selected>All Packages</option>
+                    <option value="direct">Direct (pyproject.toml)</option>
+                    <option value="updates">Updates Available</option>
+                  </select>
+                  <label class="checkbox-label" for="pkg-python-restart-toggle" title="Automatically restart vigil.service 2 seconds after a verified upgrade">
+                    <input type="checkbox" id="pkg-python-restart-toggle" />
+                    <span>Restart Service After Upgrade</span>
+                  </label>
+                  <button id="btn-check-pypi-updates" class="btn-secondary" type="button" title="Query PyPI for latest compatible versions">
+                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polyline points="23 4 23 10 17 10"></polyline>
+                      <polyline points="1 20 1 14 7 14"></polyline>
+                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                    </svg>
+                    <span>Check PyPI</span>
+                  </button>
+                  <button id="btn-upgrade-all-python" class="btn-primary" type="button" title="Safe upgrade all compatible Python packages with pre-restart smoke test &amp; auto-rollback">
+                    <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+                    </svg>
+                    <span>Safe Upgrade All</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="card table-card">
+                <div class="table-container">
+                  <table class="data-table" id="pkg-python-table">
+                    <thead>
+                      <tr>
+                        <th>Package</th>
+                        <th>Role &amp; Safety Bound</th>
+                        <th>Installed</th>
+                        <th>Latest Compatible</th>
+                        <th>Status</th>
+                        <th style="text-align: right;">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="pkg-python-tbody">
+                      <tr>
+                        <td colspan="6" class="empty-state">Loading Vigil Python environment...</td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>

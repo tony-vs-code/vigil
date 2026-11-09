@@ -7946,6 +7946,66 @@ hr.overview-flow-divider {
   word-break: break-word;
 }
 
+/* Python Package Manager & Status Helpers */
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-label input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--accent-primary);
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+
+.checkbox-label:hover {
+  color: var(--text-primary);
+}
+
+.status-badge.status-ok,
+.status-ok {
+  color: var(--state-clean);
+  background-color: var(--state-clean-bg);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.status-badge.status-warn,
+.status-warn {
+  color: var(--state-degraded);
+  background-color: var(--state-degraded-bg);
+  border-color: rgba(245, 158, 11, 0.4);
+}
+
+.status-badge.status-muted,
+.status-muted {
+  color: var(--text-muted);
+  background-color: rgba(148, 163, 184, 0.1);
+  border-color: rgba(148, 163, 184, 0.25);
+}
+
+.text-ok {
+  color: var(--state-clean) !important;
+}
+
+.text-xs {
+  font-size: 0.75rem !important;
+}
+
+.font-bold {
+  font-weight: 700 !important;
+}
+
+.font-normal {
+  font-weight: 400 !important;
+}
+
 /* Zero-Clutter Live Stream UI: Hide manual refresh buttons & interval selectors */
 #refresh-btn,
 .btn-module-refresh,
