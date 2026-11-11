@@ -2,6 +2,16 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.43] - 2026-11-10
+### Added
+- **Real-Time Subprocess Terminal Output Streaming**: Added streaming package upgrade endpoints (`/api/packages/upgrade/stream` and `/api/python/packages/upgrade/stream`) streaming live chunks directly from `apt-get` and `uv lock` / `uv sync` / diagnostics smoke tests.
+- **Interactive Terminal Viewer**: Rendered live logs into `#pkg-upgrade-terminal` with automatic scrolling pinned to the bottom during live subprocess execution.
+- **Automated Rollback & Health Verifications**: Integrated pre-restart automated diagnostics smoke testing and automatic `uv.lock` rollback on package sync failures.
+
+### Changed
+- **Backward-Compatible Endpoints**: Maintained existing JSON-based package upgrade endpoints and Node VM test fallback.
+- **Dynamic Toast & Cache Refresh**: Streamlined package upgrade completion with immediate cache invalidation and UI status indicators.
+
 ## [1.0.42] - 2026-11-09
 ### Added
 - **Visual Progress Bar Chart Generator**: Built `generate_telemetry_chart_url` constructing high-resolution QuickChart horizontal bar meters for CPU, Memory, Data Pool, and Root Disk with exact used and total capacity labels (`6.7/16 GB`, `8.4/16 TB`, `42/250 GB`).

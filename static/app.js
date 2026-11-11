@@ -12279,6 +12279,111 @@ async function refreshAptCache() {
   }
 }
 
+/**
+ * Stream a response chunk-by-chunk into a terminal DOM element.
+ * Supports web stream reader (browser fetch) and falls back to resp.text() / resp.json()
+ * for Node VM and non-streaming environments.
+ */
+async function streamTerminalResponse(resp, terminal, onChunk) {
+  if (!resp) return "";
+
+  if (resp.body && typeof resp.body.getReader === "function") {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulated = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const text = decoder.decode(value, { stream: true });
+        if (text) {
+          accumulated += text;
+          if (terminal) {
+            terminal.textContent += text;
+            terminal.scrollTop = terminal.scrollHeight;
+          }
+          if (typeof onChunk === "function") {
+            onChunk(text);
+          }
+        }
+      }
+      const finalChunk = decoder.decode();
+      if (finalChunk) {
+        accumulated += finalChunk;
+        if (terminal) {
+          terminal.textContent += finalChunk;
+          terminal.scrollTop = terminal.scrollHeight;
+        }
+        if (typeof onChunk === "function") {
+          onChunk(finalChunk);
+        }
+      }
+    } catch (err) {
+      console.error("Stream reader error:", err);
+      throw err;
+    }
+    return accumulated;
+  }
+
+  // Graceful fallback for non-streaming or Node VM environments
+  let output = "";
+  if (typeof resp.text === "function") {
+    try {
+      output = await resp.text();
+    } catch (_) {
+      output = "";
+    }
+  }
+
+  if (!output && typeof resp.json === "function") {
+    try {
+      const data = await resp.json();
+      if (data && typeof data === "object") {
+        if (data.success === false) {
+          output = `[FAILED] ${data.error || data.detail || "Operation failed"}\n${data.output || ""}`;
+        } else {
+          output =
+            data.output ||
+            data.stdout ||
+            data.detail ||
+            data.error ||
+            (typeof data === "string" ? data : JSON.stringify(data));
+        }
+      }
+    } catch (_) {
+      output = "";
+    }
+  } else if (output) {
+    try {
+      const parsed = JSON.parse(output);
+      if (parsed && typeof parsed === "object") {
+        if (parsed.success === false) {
+          output = `[FAILED] ${parsed.error || parsed.detail || "Operation failed"}\n${parsed.output || ""}`;
+        } else {
+          output =
+            parsed.output ||
+            parsed.stdout ||
+            parsed.detail ||
+            parsed.error ||
+            JSON.stringify(parsed);
+        }
+      }
+    } catch (_) {
+      // It is plain text, keep output as-is
+    }
+  }
+
+  if (terminal) {
+    terminal.textContent += output;
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+  if (typeof onChunk === "function") {
+    onChunk(output);
+  }
+  return output;
+}
+
 async function simulatePackageUpgrade(packageName = null) {
   lastUpgradeTargetPackage = packageName;
   lastUpgradeModalType = "apt";
@@ -12299,7 +12404,7 @@ async function simulatePackageUpgrade(packageName = null) {
       : "Dry run: apt-get -s dist-upgrade (safe, non-destructive)";
   }
   if (terminal) {
-    terminal.textContent = "Executing simulation in background...\n\n";
+    terminal.textContent = "";
   }
   if (installModalBtn) {
     installModalBtn.textContent = "Install Now";
@@ -12311,19 +12416,29 @@ async function simulatePackageUpgrade(packageName = null) {
     const payload = {
       packages: packageName ? [packageName] : [],
       dry_run: true,
+      stream: true,
     };
-    const resp = await apiFetch("/api/packages/upgrade", {
+    const resp = await apiFetch("/api/packages/upgrade?stream=true", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (!resp.ok) {
-      throw new Error(`Simulation request failed (HTTP ${resp.status})`);
+      const errText = await (typeof resp.text === "function" ? resp.text() : resp.json()).catch(() => "");
+      let errMsg = `Simulation request failed (HTTP ${resp.status})`;
+      if (typeof errText === "object" && errText !== null) {
+        errMsg = errText.detail || errText.error || errMsg;
+      } else if (typeof errText === "string" && errText) {
+        try {
+          const parsed = JSON.parse(errText);
+          if (parsed.detail || parsed.error) errMsg = parsed.detail || parsed.error;
+        } catch (_) {
+          errMsg = errText;
+        }
+      }
+      throw new Error(errMsg);
     }
-    const result = await resp.json();
-    if (terminal) {
-      terminal.textContent = result.output || "Simulation completed with no output.";
-    }
+    await streamTerminalResponse(resp, terminal);
     if (installModalBtn) {
       installModalBtn.textContent = "Install Now";
       installModalBtn.classList.remove("hidden");
@@ -12362,7 +12477,7 @@ async function installPackageUpgrade(packageName = null) {
       : "Executing: apt-get -y dist-upgrade (non-interactive)";
   }
   if (terminal) {
-    terminal.textContent = "Installing packages in background (this may take a few minutes)...\n\n";
+    terminal.textContent = "";
   }
   installModalBtn?.classList.add("hidden");
   modal?.classList.remove("hidden");
@@ -12371,22 +12486,33 @@ async function installPackageUpgrade(packageName = null) {
     const payload = {
       packages: packageName ? [packageName] : [],
       dry_run: false,
+      stream: true,
     };
-    const resp = await apiFetch("/api/packages/upgrade", {
+    const resp = await apiFetch("/api/packages/upgrade?stream=true", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      throw new Error(result.detail || result.error || `Package upgrade failed (HTTP ${resp.status})`);
+      const errText = await (typeof resp.text === "function" ? resp.text() : resp.json()).catch(() => "");
+      let errMsg = `Package upgrade failed (HTTP ${resp.status})`;
+      if (typeof errText === "object" && errText !== null) {
+        errMsg = errText.detail || errText.error || errMsg;
+      } else if (typeof errText === "string" && errText) {
+        try {
+          const parsed = JSON.parse(errText);
+          if (parsed.detail || parsed.error) errMsg = parsed.detail || parsed.error;
+        } catch (_) {
+          errMsg = errText;
+        }
+      }
+      throw new Error(errMsg);
     }
 
-    if (terminal) {
-      terminal.textContent = result.output || result.error || "Package installation finished.";
-    }
+    const output = await streamTerminalResponse(resp, terminal);
 
-    if (result.success) {
+    const hasError = output.includes("[FAILED]") || output.includes("[ERROR]");
+    if (!hasError) {
       showToast({
         title: "Package Upgrade Complete",
         message: packageName
@@ -12397,7 +12523,7 @@ async function installPackageUpgrade(packageName = null) {
     } else {
       showToast({
         title: "Package Upgrade Failed",
-        message: result.error || "apt-get returned a non-zero exit code.",
+        message: "apt-get encountered errors or returned a non-zero exit code.",
         type: "danger",
       });
     }
@@ -12639,7 +12765,7 @@ async function simulatePythonPackageUpgrade(packageName = null) {
       : "Dry run: uv lock --dry-run (safe, non-destructive resolution)";
   }
   if (terminal) {
-    terminal.textContent = "Executing uv dry-run simulation...\n\n";
+    terminal.textContent = "";
   }
   installModalBtn?.classList.add("hidden");
   modal?.classList.remove("hidden");
@@ -12649,6 +12775,7 @@ async function simulatePythonPackageUpgrade(packageName = null) {
       packages: packageName ? [packageName] : null,
       dry_run: true,
       restart_service: false,
+      stream: true,
     };
     const resp = await apiFetch("/api/packages/python/upgrade", {
       method: "POST",
@@ -12656,13 +12783,13 @@ async function simulatePythonPackageUpgrade(packageName = null) {
       body: JSON.stringify(payload),
     });
     if (!resp.ok) {
-      const errData = await resp.json().catch(() => ({}));
-      throw new Error(errData.detail || errData.error || `Simulation request failed (HTTP ${resp.status})`);
+      const errData = await (typeof resp.json === "function" ? resp.json() : resp.text()).catch(() => ({}));
+      const errMsg =
+        (typeof errData === "object" ? errData.detail || errData.error : errData) ||
+        `Simulation request failed (HTTP ${resp.status})`;
+      throw new Error(errMsg);
     }
-    const result = await resp.json();
-    if (terminal) {
-      terminal.textContent = result.output || result.stdout || "Simulation completed with no output.";
-    }
+    await streamTerminalResponse(resp, terminal);
     if (installModalBtn) {
       installModalBtn.textContent = "Safe Upgrade Now";
       installModalBtn.classList.remove("hidden");
@@ -12701,7 +12828,7 @@ async function upgradePythonPackage(packageName = null) {
     modalSubtitle.textContent = "uv sync with automated pre-restart smoke test & auto-rollback";
   }
   if (terminal) {
-    terminal.textContent = "Executing safe upgrade in background...\nVerifying smoke test health...\n\n";
+    terminal.textContent = "";
   }
   installModalBtn?.classList.add("hidden");
   modal?.classList.remove("hidden");
@@ -12711,43 +12838,39 @@ async function upgradePythonPackage(packageName = null) {
       packages: packageName ? [packageName] : null,
       dry_run: false,
       restart_service: shouldRestart,
+      stream: true,
     };
     const resp = await apiFetch("/api/packages/python/upgrade", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
-      throw new Error(result.detail || result.error || `Upgrade failed (HTTP ${resp.status})`);
+      const errData = await (typeof resp.json === "function" ? resp.json() : resp.text()).catch(() => ({}));
+      const errMsg =
+        (typeof errData === "object" ? errData.detail || errData.error : errData) ||
+        `Upgrade failed (HTTP ${resp.status})`;
+      throw new Error(errMsg);
     }
 
-    let terminalText = result.output || result.stdout || "";
-    const smokePassed = result.smoke_test?.passed ?? result.success;
-    if (smokePassed) {
-      terminalText += "\n\n✓ Smoke Test PASSED (main, api & 6 diagnostics healthy)";
-      if (shouldRestart) {
-        terminalText += "\n\nℹ Vigil service reload scheduled in 2 seconds...";
-      }
+    const output = await streamTerminalResponse(resp, terminal);
+
+    const hasFailed =
+      output.includes("[FAILED]") ||
+      output.includes("[ERROR]") ||
+      output.includes("[ROLLBACK]");
+    if (!hasFailed) {
       showToast({
         title: "Python Package Upgraded",
         message: packageName ? `Successfully updated ${packageName}` : "Successfully updated Python environment",
         type: "success",
       });
     } else {
-      terminalText += "\n\n✕ Smoke Test FAILED — Automatically Rolled Back to Previous uv.lock";
-      if (result.smoke_test?.output) {
-        terminalText += "\n" + result.smoke_test.output;
-      }
       showToast({
         title: "Upgrade Rolled Back",
-        message: "Smoke test failed; previous uv.lock restored.",
+        message: "Smoke test failed or upgrade error; previous uv.lock restored.",
         type: "error",
       });
-    }
-
-    if (terminal) {
-      terminal.textContent = terminalText;
     }
 
     await fetchPythonPackages(false);

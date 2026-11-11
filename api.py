@@ -24,7 +24,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import psutil
@@ -2149,13 +2149,33 @@ def api_packages_reboot(
 class PackageUpgradeRequest(BaseModel):
     packages: Optional[list[str]] = None
     dry_run: bool = True
+    stream: bool = False
 
 
-@app.post("/api/packages/upgrade")
+@app.post("/api/packages/upgrade", response_model=None)
 def api_packages_upgrade(
     req: PackageUpgradeRequest,
+    stream: bool = Query(default=False),
     _user: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Any:
+    should_stream = stream or req.stream
+    if should_stream:
+        if not req.dry_run:
+            target_desc = (
+                f"packages ({', '.join(req.packages)})"
+                if req.packages
+                else "all packages"
+            )
+            main.record_audit_event(
+                "packages.upgrade",
+                f"Streaming upgrade of {target_desc} initiated",
+                actor=_user,
+                severity="info",
+            )
+        return StreamingResponse(
+            main.package_manager.run_upgrade_stream(packages=req.packages, dry_run=req.dry_run),
+            media_type="text/plain; charset=utf-8",
+        )
     try:
         res = main.package_manager.run_upgrade(packages=req.packages, dry_run=req.dry_run)
         if not req.dry_run:
@@ -2178,10 +2198,34 @@ def api_packages_upgrade(
         raise HTTPException(status_code=500, detail=f"Error executing package upgrade: {exc}")
 
 
+@app.post("/api/packages/upgrade/stream")
+def api_packages_upgrade_stream(
+    req: PackageUpgradeRequest,
+    _user: str = Depends(require_auth),
+) -> StreamingResponse:
+    if not req.dry_run:
+        target_desc = (
+            f"packages ({', '.join(req.packages)})"
+            if req.packages
+            else "all packages"
+        )
+        main.record_audit_event(
+            "packages.upgrade",
+            f"Streaming upgrade of {target_desc} initiated",
+            actor=_user,
+            severity="info",
+        )
+    return StreamingResponse(
+        main.package_manager.run_upgrade_stream(packages=req.packages, dry_run=req.dry_run),
+        media_type="text/plain; charset=utf-8",
+    )
+
+
 class PythonPackageUpgradeRequest(BaseModel):
     packages: Optional[list[str]] = None
     dry_run: bool = False
     restart_service: bool = False
+    stream: bool = False
 
 
 @app.get("/api/packages/python")
@@ -2205,11 +2249,34 @@ async def api_packages_python_check(
         raise HTTPException(status_code=500, detail=f"Error checking Python package updates: {exc}")
 
 
-@app.post("/api/packages/python/upgrade")
+@app.post("/api/packages/python/upgrade", response_model=None)
 async def api_packages_python_upgrade(
     req: PythonPackageUpgradeRequest,
+    stream: bool = Query(default=False),
     _user: str = Depends(require_auth),
-) -> dict[str, Any]:
+) -> Any:
+    should_stream = stream or req.stream
+    if should_stream:
+        if not req.dry_run:
+            target_desc = (
+                f"packages ({', '.join(req.packages)})"
+                if req.packages
+                else "all packages"
+            )
+            main.record_audit_event(
+                "packages.python.upgrade",
+                f"Streaming Python upgrade of {target_desc} initiated",
+                actor=_user,
+                severity="info",
+            )
+        return StreamingResponse(
+            main.package_manager.upgrade_python_packages_stream(
+                packages=req.packages,
+                dry_run=req.dry_run,
+                restart_service=req.restart_service,
+            ),
+            media_type="text/plain; charset=utf-8",
+        )
     try:
         res = await asyncio.to_thread(
             main.package_manager.upgrade_python_packages,
@@ -2235,6 +2302,33 @@ async def api_packages_python_upgrade(
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error executing Python package upgrade: {exc}")
+
+
+@app.post("/api/packages/python/upgrade/stream")
+def api_packages_python_upgrade_stream(
+    req: PythonPackageUpgradeRequest,
+    _user: str = Depends(require_auth),
+) -> StreamingResponse:
+    if not req.dry_run:
+        target_desc = (
+            f"packages ({', '.join(req.packages)})"
+            if req.packages
+            else "all packages"
+        )
+        main.record_audit_event(
+            "packages.python.upgrade",
+            f"Streaming Python upgrade of {target_desc} initiated",
+            actor=_user,
+            severity="info",
+        )
+    return StreamingResponse(
+        main.package_manager.upgrade_python_packages_stream(
+            packages=req.packages,
+            dry_run=req.dry_run,
+            restart_service=req.restart_service,
+        ),
+        media_type="text/plain; charset=utf-8",
+    )
 
 
 # ============================================================================
