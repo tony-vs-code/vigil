@@ -1675,6 +1675,21 @@ def get_weekly_notification_state() -> Optional[Tuple[float, float, str]]:
     return get_notification_state_entry("raid_summary")
 
 
+_notification_subscribers: list[Any] = []
+
+
+def register_notification_subscriber(callback: Any) -> None:
+    """Register a callback for newly logged notifications/alerts."""
+    if callback not in _notification_subscribers:
+        _notification_subscribers.append(callback)
+
+
+def unregister_notification_subscriber(callback: Any) -> None:
+    """Unregister a notification subscriber callback."""
+    if callback in _notification_subscribers:
+        _notification_subscribers.remove(callback)
+
+
 def record_notification(
     status: str,
     timestamp: float,
@@ -1740,6 +1755,28 @@ def record_notification(
         connection.commit()
     finally:
         connection.close()
+
+    notification_event = {
+        "status": status,
+        "sent_at": float(timestamp),
+        "sent_at_formatted": format_timestamp(float(timestamp)),
+        "weekly": bool(weekly),
+        "kind": (
+            "test notification"
+            if status == "test"
+            else ("weekly summary" if weekly else "alert")
+        ),
+        "channel": channel or "all",
+        "trigger": trigger or status,
+        "title": title or "",
+        "details": details or "",
+        "outcome": outcome or "delivered",
+    }
+    for subscriber in list(_notification_subscribers):
+        try:
+            subscriber(notification_event)
+        except Exception as exc:
+            logging.debug(f"Notification subscriber error: {exc}")
 
 
 def get_notification_history(limit: int, detailed: bool = False) -> list:

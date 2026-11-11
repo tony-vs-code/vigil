@@ -16,6 +16,11 @@ const VALID_RAID_STATES = new Set([
 let refreshTimerId = null;
 let wsConnection = null;
 let wsReconnectTimerId = null;
+let sseSource = null;
+let sseConnected = false;
+let sseRetryCount = 0;
+let sseReconnectTimerId = null;
+const SSE_ADAPTIVE_POLL_INTERVAL_MS = 60000;
 let localTickerTimerId = null;
 let currentBootTime = null;
 let currentWeeklyDueAt = null;
@@ -2883,7 +2888,29 @@ function startPolling({ immediate = true } = {}) {
   if (immediate) {
     refreshDashboard();
   }
-  refreshTimerId = window.setInterval(refreshDashboard, AUTO_REFRESH_INTERVAL_MS);
+  const interval = sseConnected ? SSE_ADAPTIVE_POLL_INTERVAL_MS : AUTO_REFRESH_INTERVAL_MS;
+  refreshTimerId = window.setInterval(refreshDashboard, interval);
+}
+
+function pollSystemStatus() {
+  return refreshDashboard();
+}
+
+function pollDockerUpdates() {
+  if (typeof fetchDockerStatus === "function") {
+    fetchDockerStatus();
+  }
+  if (typeof fetchDockerUpdates === "function") {
+    fetchDockerUpdates({ background: true });
+  }
+}
+
+function adjustAdaptivePolling(isSSEActive) {
+  if (refreshTimerId) {
+    window.clearInterval(refreshTimerId);
+  }
+  const interval = isSSEActive ? SSE_ADAPTIVE_POLL_INTERVAL_MS : AUTO_REFRESH_INTERVAL_MS;
+  refreshTimerId = window.setInterval(refreshDashboard, interval);
 }
 
 /**
@@ -2911,12 +2938,12 @@ function updateConnectionIndicator(state) {
     streamIndicator.classList.remove("stream-active", "stream-reconnecting", "stream-paused");
     if (state === "live") {
       streamIndicator.classList.add("stream-active");
-      if (streamText) streamText.textContent = "Stream: Active";
+      if (streamText) streamText.textContent = "Live Stream";
       streamIndicator.setAttribute("title", "Direct system event streaming active (POSIX statvfs, sysfs RAID, Docker socket)");
     } else if (state === "reconnecting") {
       streamIndicator.classList.add("stream-reconnecting");
-      if (streamText) streamText.textContent = "Stream: Reconnecting";
-      streamIndicator.setAttribute("title", "Reconnecting to direct system event stream...");
+      if (streamText) streamText.textContent = "Reconnecting (Polling active)";
+      streamIndicator.setAttribute("title", "Reconnecting to direct system event stream... (standard interval polling active)");
     } else {
       streamIndicator.classList.add("stream-paused");
       if (streamText) streamText.textContent = "Stream: Polling";
@@ -2946,6 +2973,583 @@ function closeWebSocket() {
     wsConnection = null;
   }
 }
+
+/**
+ * Cleanly close active Server-Sent Events (SSE) EventSource connection.
+ */
+function closeSSEStream() {
+  if (sseReconnectTimerId) {
+    window.clearTimeout(sseReconnectTimerId);
+    sseReconnectTimerId = null;
+  }
+  if (sseSource) {
+    sseSource.onopen = null;
+    sseSource.onerror = null;
+    try {
+      sseSource.close();
+    } catch {
+      // Ignore close errors
+    }
+    sseSource = null;
+  }
+  sseConnected = false;
+}
+
+const closeSSEConnection = closeSSEStream;
+
+/**
+ * In-place patch target container row in #docker-containers-tbody.
+ */
+function patchDockerContainerRowInPlace(containerId, containerName, action) {
+  const tbody = document.getElementById("docker-containers-tbody");
+  if (tbody) {
+    const rows = tbody.querySelectorAll ? tbody.querySelectorAll("tr") : [];
+    let targetRow = null;
+    const cidShort = containerId ? containerId.slice(0, 12) : "";
+    for (const row of rows) {
+      const rowText = row.textContent || "";
+      if (
+        (containerId && (rowText.includes(containerId) || (cidShort && rowText.includes(cidShort)))) ||
+        (containerName && rowText.includes(containerName)) ||
+        (containerId && row.querySelector && row.querySelector(`[data-cid="${containerId}"]`))
+      ) {
+        targetRow = row;
+        break;
+      }
+    }
+
+    if (targetRow) {
+      targetRow.classList.remove("row-highlight");
+      void targetRow.offsetWidth;
+      targetRow.classList.add("row-highlight");
+      window.setTimeout(() => {
+        targetRow.classList.remove("row-highlight");
+      }, 2000);
+
+      const badge = targetRow.querySelector ? targetRow.querySelector(".status-badge") : null;
+      if (badge) {
+        badge.classList.remove(
+          "status-clean",
+          "status-failed",
+          "status-degraded",
+          "status-unhealthy",
+          "status-none",
+          "status-recovering"
+        );
+        let statusClass = "status-clean";
+        const actLower = (action || "").toLowerCase();
+        if (["die", "kill", "stop", "exited", "dead", "failed"].includes(actLower)) {
+          statusClass = "status-failed";
+        } else if (["pause", "paused", "restarting"].includes(actLower)) {
+          statusClass = "status-degraded";
+        } else if (actLower.includes("unhealthy")) {
+          statusClass = "status-unhealthy";
+        }
+        badge.classList.add(statusClass);
+        badge.innerHTML = `<span class="status-dot"></span> ${escapeHtml(action || "updated")}`;
+      }
+    }
+  }
+
+  // Update cachedDockerContainers state
+  if (Array.isArray(cachedDockerContainers)) {
+    const cidShort = containerId ? containerId.slice(0, 12) : "";
+    const item = cachedDockerContainers.find(
+      (c) =>
+        (containerId && (c.id === containerId || (cidShort && c.id?.startsWith(cidShort)))) ||
+        (containerName && c.name === containerName)
+    );
+    if (item) {
+      item.state = action;
+      item.status = action;
+    }
+  }
+}
+
+/**
+ * Dynamically prepend a new notification record to #notification-history-tbody.
+ */
+function prependNotificationRow(entry) {
+  if (!entry || typeof entry !== "object") return;
+  const tbody = document.getElementById("notification-history-tbody");
+  if (!tbody) return;
+
+  // Clear empty state if present
+  const emptyRow = tbody.querySelector ? tbody.querySelector(".empty-state") : null;
+  if (emptyRow) {
+    const parentRow = emptyRow.closest ? emptyRow.closest("tr") : emptyRow.parentElement;
+    if (parentRow) {
+      if (typeof parentRow.remove === "function") {
+        parentRow.remove();
+      } else if (parentRow.parentElement && typeof parentRow.parentElement.removeChild === "function") {
+        parentRow.parentElement.removeChild(parentRow);
+      }
+    }
+  }
+
+  const tr = document.createElement("tr");
+  tr.className = "row-highlight";
+  window.setTimeout(() => tr.classList.remove("row-highlight"), 2500);
+
+  // 1. Timestamp
+  const tdTime = document.createElement("td");
+  tdTime.className = "mono-text";
+  tdTime.textContent = entry.sent_at_formatted || (typeof formatTimestampLocal === "function" ? formatTimestampLocal(entry.sent_at || entry.timestamp || Date.now() / 1000) : new Date().toLocaleTimeString());
+
+  // 2. Trigger
+  const tdTrigger = document.createElement("td");
+  const triggerBadge = document.createElement("span");
+  const triggerStr = String(entry.trigger || entry.status || "ALERT");
+  triggerBadge.className = "trigger-badge";
+  triggerBadge.textContent = triggerStr.toUpperCase();
+  tdTrigger.appendChild(triggerBadge);
+
+  // 3. Channel
+  const tdChannel = document.createElement("td");
+  tdChannel.textContent = entry.channel || "Discord";
+
+  // 4. Subject / Summary
+  const tdSubject = document.createElement("td");
+  tdSubject.textContent = entry.title || entry.subject || entry.details || "-";
+
+  // 5. Outcome
+  const tdOutcome = document.createElement("td");
+  const isSuccess = entry.success !== false;
+  tdOutcome.innerHTML = `<span class="status-badge ${isSuccess ? "status-clean" : "status-failed"}"><span class="status-dot"></span> ${isSuccess ? "Delivered" : "Failed"}</span>`;
+
+  tr.appendChild(tdTime);
+  tr.appendChild(tdTrigger);
+  tr.appendChild(tdChannel);
+  tr.appendChild(tdSubject);
+  tr.appendChild(tdOutcome);
+
+  if (tbody.firstChild) {
+    tbody.insertBefore(tr, tbody.firstChild);
+  } else {
+    tbody.appendChild(tr);
+  }
+
+  const countBadge = document.getElementById("history-count-badge");
+  if (countBadge) {
+    const curCount = tbody.querySelectorAll ? tbody.querySelectorAll("tr").length : 1;
+    countBadge.textContent = `${curCount} ${curCount === 1 ? "record" : "records"}`;
+  }
+}
+
+/**
+ * Handle fine-grained SSE telemetry data.
+ */
+function handleSSETelemetry(data) {
+  if (!data || typeof data !== "object") return;
+
+  // 1. CPU Telemetry
+  const cpuPercent = Number(
+    data.cpu?.percent ?? data.cpu_percent ?? (typeof data.cpu === "number" ? data.cpu : NaN)
+  );
+  if (!Number.isNaN(cpuPercent)) {
+    const cpuValEl = document.getElementById("cpu-percent-value");
+    const cpuBarEl = document.getElementById("cpu-progress-bar");
+    if (cpuValEl) cpuValEl.textContent = `${cpuPercent.toFixed(1)}%`;
+    if (cpuBarEl) {
+      cpuBarEl.style.width = `${Math.min(100, Math.max(0, cpuPercent)).toFixed(1)}%`;
+      if (typeof updateProgressBar === "function") {
+        updateProgressBar(cpuBarEl, cpuPercent);
+      }
+    }
+  }
+
+  // CPU Cores Badge and grid
+  const cores = data.cpu?.cores || data.cpu_cores;
+  if (Array.isArray(cores) && cores.length > 0) {
+    const cpuCoresBadge = document.getElementById("cpu-cores-badge");
+    if (cpuCoresBadge) {
+      cpuCoresBadge.textContent = `${cores.length} ${cores.length === 1 ? "Core" : "Cores"}`;
+    }
+    const coresGrid = document.getElementById("cpu-cores-grid");
+    if (coresGrid) {
+      const items = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+      cores.forEach((coreVal, idx) => {
+        const item = items[idx];
+        if (item) {
+          const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
+          const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
+          if (pctEl) pctEl.textContent = `${cPercent.toFixed(1)}%`;
+          const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
+          if (fillEl) fillEl.style.width = `${cPercent.toFixed(1)}%`;
+        }
+      });
+    }
+  }
+
+  // CPU Load Average
+  const loadAvg = data.load_avg || data.cpu?.load_avg;
+  if (Array.isArray(loadAvg) && loadAvg.length > 0) {
+    const cpuLoadEl = document.getElementById("cpu-load-detail");
+    if (cpuLoadEl) {
+      cpuLoadEl.textContent = `Load avg: ${loadAvg.map((v) => Number(v).toFixed(2)).join(", ")}`;
+    }
+  }
+
+  // Thermal / Temperature
+  const thermalVal = data.thermal || data.thermals || data.cpu?.temp || data.temp;
+  if (thermalVal !== undefined && thermalVal !== null) {
+    if (typeof thermalVal === "number" || typeof thermalVal === "string") {
+      const badge = document.getElementById("cpu-temp-badge");
+      if (badge) {
+        const num = parseFloat(thermalVal);
+        if (!isNaN(num)) {
+          badge.textContent = `${num.toFixed(0)}°C`;
+          badge.classList.remove("temp-ok", "temp-warn", "temp-crit", "temp-hot", "temp-warm", "temp-cool");
+          if (num >= 80) {
+            badge.classList.add("temp-crit", "temp-hot");
+          } else if (num >= 60) {
+            badge.classList.add("temp-warn", "temp-warm");
+          } else {
+            badge.classList.add("temp-ok", "temp-cool");
+          }
+        }
+      }
+    } else if (typeof updateCpuTempBadge === "function") {
+      updateCpuTempBadge(thermalVal);
+    }
+  }
+
+  // 2. Memory Telemetry
+  const mem = data.memory || {};
+  const memPercent = Number(
+    mem.percent ?? data.mem_percent ?? data.memory_percent ?? (typeof data.memory === "number" ? data.memory : NaN)
+  );
+  if (!Number.isNaN(memPercent)) {
+    const memValEl = document.getElementById("memory-percent-value");
+    const memBarEl = document.getElementById("memory-progress-bar");
+    if (memValEl) memValEl.textContent = `${memPercent.toFixed(1)}%`;
+    if (memBarEl) {
+      memBarEl.style.width = `${Math.min(100, Math.max(0, memPercent)).toFixed(1)}%`;
+      if (typeof updateProgressBar === "function") {
+        updateProgressBar(memBarEl, memPercent);
+      }
+    }
+  }
+  if (mem.used !== undefined || mem.used_gb !== undefined || mem.total !== undefined || mem.total_gb !== undefined) {
+    const memDetailEl = document.getElementById("memory-detail");
+    if (memDetailEl) {
+      const usedStr = mem.used !== undefined ? formatBytes(mem.used) : (mem.used_gb !== undefined ? `${Number(mem.used_gb).toFixed(1)} GB` : "--");
+      const totalStr = mem.total !== undefined ? formatBytes(mem.total) : (mem.total_gb !== undefined ? `${Number(mem.total_gb).toFixed(1)} GB` : "--");
+      const availStr = mem.available !== undefined ? formatBytes(mem.available) : "";
+      memDetailEl.textContent = availStr
+        ? `${usedStr} / ${totalStr} used (${availStr} avail)`
+        : `${usedStr} / ${totalStr} used`;
+    }
+  }
+  if (mem.total !== undefined || mem.total_gb !== undefined) {
+    const memTotalBadge = document.getElementById("memory-total-badge");
+    if (memTotalBadge) {
+      memTotalBadge.textContent = mem.total !== undefined ? `${formatBytes(mem.total)} Total` : `${Number(mem.total_gb).toFixed(1)} GB Total`;
+    }
+  }
+  const chipUsed = document.getElementById("memory-chip-used");
+  if (chipUsed && (mem.used !== undefined || mem.used_gb !== undefined)) {
+    chipUsed.textContent = `In use: ${mem.used !== undefined ? formatBytes(mem.used) : `${Number(mem.used_gb).toFixed(1)} GB`}`;
+  }
+  const chipAvail = document.getElementById("memory-chip-available");
+  if (chipAvail && mem.available !== undefined) {
+    chipAvail.textContent = `Available: ${formatBytes(mem.available)}`;
+  }
+  const chipCached = document.getElementById("memory-chip-cached");
+  if (chipCached && mem.cached !== undefined) {
+    chipCached.textContent = `Cached: ${formatBytes(mem.cached)}`;
+  }
+  const chipFree = document.getElementById("memory-chip-free");
+  if (chipFree && mem.free !== undefined) {
+    chipFree.textContent = `Free: ${formatBytes(mem.free)}`;
+  }
+
+  // 3. Disk Telemetry
+  const disk = data.disk || data.storage || {};
+  const diskPercent = Number(
+    disk.percent ?? disk.percentage ?? data.disk_percent ?? (typeof data.disk === "number" ? data.disk : NaN)
+  );
+  if (!Number.isNaN(diskPercent)) {
+    const diskValEl = document.getElementById("disk-percent-value");
+    const diskBarEl = document.getElementById("disk-progress-bar");
+    if (diskValEl) diskValEl.textContent = `${diskPercent.toFixed(1)}%`;
+    if (diskBarEl) {
+      diskBarEl.style.width = `${Math.min(100, Math.max(0, diskPercent)).toFixed(1)}%`;
+      if (typeof updateProgressBar === "function") {
+        updateProgressBar(diskBarEl, diskPercent);
+      }
+    }
+  }
+  if (disk.used !== undefined || disk.used_gb !== undefined || disk.total !== undefined || disk.total_gb !== undefined) {
+    const diskDetailEl = document.getElementById("disk-detail");
+    if (diskDetailEl) {
+      const usedStr = disk.used !== undefined ? formatBytes(disk.used) : (disk.used_gb !== undefined ? `${Number(disk.used_gb).toFixed(1)} GB` : "--");
+      const totalStr = disk.total !== undefined ? formatBytes(disk.total) : (disk.total_gb !== undefined ? `${Number(disk.total_gb).toFixed(1)} GB` : "--");
+      const freeStr = disk.free !== undefined ? formatBytes(disk.free) : (disk.free_gb !== undefined ? `${Number(disk.free_gb).toFixed(1)} GB free` : "");
+      diskDetailEl.textContent = freeStr
+        ? `${usedStr} / ${totalStr} (${freeStr} free)`
+        : `${usedStr} / ${totalStr}`;
+    }
+  }
+
+  // 4. Update Header Timestamp
+  const lastUpdatedEl = document.getElementById("last-updated");
+  if (lastUpdatedEl) {
+    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+/**
+ * Handle SSE full snapshot event.
+ */
+function handleSSESnapshot(data) {
+  if (!data || typeof data !== "object") return;
+  if (data.system) {
+    renderSystemMetrics(data.system);
+    setModuleLastUpdated("system");
+  }
+  if (data.raid) {
+    renderRaidDetails(data.raid);
+    setModuleLastUpdated("raid");
+    const isAdaptive =
+      Boolean(data.adaptive_fast) ||
+      ["recovering", "resyncing", "degraded"].includes(
+        String(data.raid.status || "").toLowerCase()
+      );
+    updateRaidAdaptiveBadge(isAdaptive);
+  }
+  if (data.docker) {
+    renderDockerStatus(data.docker);
+    setModuleLastUpdated("docker");
+    if (Array.isArray(data.docker.containers || data.containers)) {
+      cachedDockerContainers = data.docker.containers || data.containers;
+      renderDockerContainers(null, cachedDockerContainers);
+    }
+    if (Array.isArray(data.docker.stacks || data.stacks)) {
+      cachedDockerStacks = data.docker.stacks || data.stacks;
+      renderDockerStacks(cachedDockerStacks);
+    }
+  }
+  if (data.notifications || data.history) {
+    renderNotificationHistory(data.notifications || data.history);
+    setModuleLastUpdated("notifications");
+  }
+  if (data.notification_state) {
+    renderWeeklyNotificationState(data.notification_state);
+  }
+  if (data.refresh_intervals) {
+    syncIntervalSelects(data.refresh_intervals);
+  }
+  if (data.version || data.version_info) {
+    updateVersionBadge(data.version_info || data.version);
+  }
+  const lastUpdatedEl = document.getElementById("last-updated");
+  if (lastUpdatedEl) {
+    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+/**
+ * Handle SSE docker lifecycle event.
+ */
+function handleSSEDockerEvent(data) {
+  if (!data || typeof data !== "object") return;
+  const evt = data.event || data;
+  const actionRaw = String(evt.action || evt.Action || evt.status || data.action || data.status || "").trim();
+  const action = actionRaw.toLowerCase();
+  const actor = evt.Actor || evt.actor || data.actor || {};
+  const attrs = actor.Attributes || actor.attributes || {};
+  const containerName =
+    attrs.name ||
+    evt.container_name ||
+    evt.name ||
+    data.container_name ||
+    data.name ||
+    "Container";
+  const containerId =
+    actor.ID ||
+    evt.container_id ||
+    evt.id ||
+    data.container_id ||
+    data.id ||
+    "";
+
+  patchDockerContainerRowInPlace(containerId, containerName, action);
+
+  if (["die", "kill", "stop", "oom"].includes(action)) {
+    if (typeof showToast === "function") {
+      showToast({
+        title: "Container Stopped",
+        message: `${containerName} (${actionRaw || action})`,
+        type: "danger",
+      });
+    }
+  } else if (action === "start") {
+    if (typeof showToast === "function") {
+      showToast({
+        title: "Container Started",
+        message: `${containerName} is running`,
+        type: "success",
+      });
+    }
+  }
+
+  if (data.docker) {
+    renderDockerStatus(data.docker);
+    setModuleLastUpdated("docker");
+  }
+}
+
+/**
+ * Handle SSE module update event.
+ */
+function handleSSEModuleUpdate(data) {
+  if (!data || typeof data !== "object") return;
+  const mod = data.module;
+  if (mod === "raid" || data.raid) {
+    if (data.raid) renderRaidDetails(data.raid);
+    setModuleLastUpdated("raid");
+    const isAdaptive =
+      Boolean(data.adaptive_fast) ||
+      (data.raid &&
+        ["recovering", "resyncing", "degraded"].includes(
+          String(data.raid.status || "").toLowerCase()
+        ));
+    updateRaidAdaptiveBadge(isAdaptive);
+  }
+  if (mod === "system" || data.system) {
+    if (data.system) renderSystemMetrics(data.system);
+    setModuleLastUpdated("system");
+  }
+  if (mod === "docker" || mod === "containers" || data.docker) {
+    if (data.docker) renderDockerStatus(data.docker);
+    setModuleLastUpdated("docker");
+  }
+  if (mod === "notifications" || data.history || data.notification_state) {
+    if (data.history) renderNotificationHistory(data.history);
+    if (data.notification_state) renderWeeklyNotificationState(data.notification_state);
+    setModuleLastUpdated("notifications");
+  }
+}
+
+/**
+ * Handle SSE notification dispatch event.
+ */
+function handleSSENotification(data) {
+  if (!data || typeof data !== "object") return;
+  prependNotificationRow(data);
+
+  const drawerBadge = document.getElementById("notif-drawer-badge");
+  if (drawerBadge) {
+    const count = (parseInt(drawerBadge.textContent, 10) || 0) + 1;
+    drawerBadge.textContent = String(count);
+    drawerBadge.classList.remove("hidden");
+  }
+  setModuleLastUpdated("notifications");
+}
+
+/**
+ * Initialize client-side Server-Sent Events (SSE) connection to /api/events.
+ * Provides fine-grained DOM patching, telemetry streaming, and adaptive polling backoff.
+ */
+function initSSEStream() {
+  if (typeof window === "undefined" || typeof window.EventSource !== "function") {
+    console.info("EventSource is not supported in this environment; falling back to interval polling.");
+    return;
+  }
+  if (!isAuthenticated) {
+    return;
+  }
+
+  closeSSEStream();
+
+  const authToken = getStoredToken();
+  const query = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const sseUrl = `/api/events${query}`;
+
+  try {
+    sseSource = new window.EventSource(sseUrl);
+  } catch (err) {
+    console.warn("Failed to instantiate EventSource:", err);
+    sseConnected = false;
+    updateConnectionIndicator("reconnecting");
+    adjustAdaptivePolling(false);
+    return;
+  }
+
+  sseSource.onopen = () => {
+    sseConnected = true;
+    sseRetryCount = 0;
+    updateConnectionIndicator("live");
+    adjustAdaptivePolling(true);
+  };
+
+  sseSource.onerror = () => {
+    sseConnected = false;
+    sseRetryCount += 1;
+    updateConnectionIndicator("reconnecting");
+    adjustAdaptivePolling(false);
+  };
+
+  sseSource.addEventListener("snapshot", (e) => {
+    try {
+      const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+      if (!data || typeof data !== "object") return;
+      handleSSESnapshot(data);
+    } catch (err) {
+      console.warn("Failed to parse SSE snapshot payload:", err);
+    }
+  });
+
+  sseSource.addEventListener("telemetry", (e) => {
+    try {
+      const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+      if (!data || typeof data !== "object") return;
+      handleSSETelemetry(data);
+    } catch (err) {
+      console.warn("Failed to parse SSE telemetry payload:", err);
+    }
+  });
+
+  sseSource.addEventListener("docker_event", (e) => {
+    try {
+      const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+      if (!data || typeof data !== "object") return;
+      handleSSEDockerEvent(data);
+    } catch (err) {
+      console.warn("Failed to parse SSE docker_event payload:", err);
+    }
+  });
+
+  sseSource.addEventListener("module_update", (e) => {
+    try {
+      const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+      if (!data || typeof data !== "object") return;
+      handleSSEModuleUpdate(data);
+    } catch (err) {
+      console.warn("Failed to parse SSE module_update payload:", err);
+    }
+  });
+
+  sseSource.addEventListener("notification", (e) => {
+    try {
+      const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
+      if (!data || typeof data !== "object") return;
+      handleSSENotification(data);
+    } catch (err) {
+      console.warn("Failed to parse SSE notification payload:", err);
+    }
+  });
+
+  sseSource.addEventListener("ping", () => {
+    const lastUpdatedEl = document.getElementById("last-updated");
+    if (lastUpdatedEl && (!lastUpdatedEl.textContent || lastUpdatedEl.textContent === "Never updated")) {
+      lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    }
+  });
+}
+
+const initSSEConnection = initSSEStream;
 
 /**
  * Set the last-updated label for a specific module and stop button loading state.
@@ -3822,6 +4426,7 @@ async function handleGoogleCredentialResponse(response) {
 function openAuthOverlay({ setupRequired = false, googleClientId = "" } = {}) {
   isAuthenticated = false;
   closeWebSocket();
+  closeSSEStream();
   stopPolling();
   stopSystemUpdatePolling();
 
@@ -3876,6 +4481,7 @@ function onAuthenticatedSuccess(username) {
 
   startPolling();
   connectWebSocket();
+  initSSEStream();
   fetchDiscordSettings();
   fetchNotificationCenterConfig();
   checkForUpdates({ silent: true });
@@ -4003,6 +4609,7 @@ async function handleLoginSubmit(event) {
 
 async function handleLogout() {
   closeWebSocket();
+  closeSSEStream();
   try {
     await apiFetch("/api/auth/logout", { method: "POST" });
   } catch {
@@ -4335,6 +4942,7 @@ async function applyReleaseUpdate() {
     );
 
     closeWebSocket();
+    closeSSEStream();
     stopPolling();
     pollUntilServerRestarts();
   } catch (err) {
@@ -16874,3 +17482,22 @@ function initDashboard() {
 }
 
 document.addEventListener("DOMContentLoaded", initDashboard);
+
+if (typeof window !== "undefined") {
+  window.initSSEStream = initSSEStream;
+  window.initSSEConnection = initSSEConnection;
+  window.closeSSEStream = closeSSEStream;
+  window.closeSSEConnection = closeSSEConnection;
+  window.pollSystemStatus = pollSystemStatus;
+  window.pollDockerUpdates = pollDockerUpdates;
+  window.adjustAdaptivePolling = adjustAdaptivePolling;
+  window.patchDockerContainerRowInPlace = patchDockerContainerRowInPlace;
+  window.prependNotificationRow = prependNotificationRow;
+  window.handleSSETelemetry = handleSSETelemetry;
+  window.handleSSESnapshot = handleSSESnapshot;
+  window.handleSSEDockerEvent = handleSSEDockerEvent;
+  window.handleSSEModuleUpdate = handleSSEModuleUpdate;
+  window.handleSSENotification = handleSSENotification;
+  window.getSSEConnected = () => sseConnected;
+  window.getSSESource = () => sseSource;
+}

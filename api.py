@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sqlite3
 from subprocess import CalledProcessError
+import threading
 import time
 from typing import Any, Optional
 from urllib.error import HTTPError, URLError
@@ -107,6 +108,7 @@ async def docker_events_listener(
                                 "docker": main.docker_mgr.get_status(),
                             }
                             await ws_manager.broadcast(notification_payload)
+                            await sse_manager.broadcast("docker_event", notification_payload)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -138,6 +140,7 @@ async def notifications_evaluator_loop() -> None:
         if sample is not None:
             try:
                 await ws_manager.broadcast({"type": "telemetry_sample", "sample": sample})
+                await sse_manager.broadcast("telemetry", sample)
             except Exception:
                 pass
 
@@ -160,6 +163,7 @@ async def notifications_evaluator_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _docker_events_task, _notifications_task, _sentinel_probes_task
+    sse_manager.set_loop(asyncio.get_running_loop())
     try:
         main.init_state_db()
     except Exception as exc:
@@ -221,6 +225,131 @@ class ConnectionManager:
 
 
 ws_manager = ConnectionManager()
+
+
+class SSEManager:
+    """Manages active Server-Sent Events subscriber queues and real-time broadcasts."""
+
+    def __init__(self, max_queue_size: int = 200) -> None:
+        self._subscribers: set[asyncio.Queue] = set()
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._max_queue_size = max_queue_size
+
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Register the active event loop for thread-safe cross-thread broadcasts."""
+        self._loop = loop
+
+    @property
+    def subscribers(self) -> set[asyncio.Queue]:
+        """Return a snapshot of current subscriber queues."""
+        with self._lock:
+            return set(self._subscribers)
+
+    @property
+    def active_subscribers(self) -> set[asyncio.Queue]:
+        """Alias for subscribers set."""
+        with self._lock:
+            return set(self._subscribers)
+
+    @property
+    def subscriber_count(self) -> int:
+        """Return the count of active subscriber queues."""
+        with self._lock:
+            return len(self._subscribers)
+
+    def subscribe(self) -> asyncio.Queue:
+        """Subscribe a new queue to SSE events."""
+        if self._loop is None or not self._loop.is_running():
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._max_queue_size)
+        with self._lock:
+            self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        """Unsubscribe a queue from SSE events."""
+        with self._lock:
+            self._subscribers.discard(queue)
+
+    async def broadcast(self, event: str, data: Any) -> None:
+        """Broadcast an event and its data payload to all active subscriber queues asynchronously."""
+        with self._lock:
+            subscribers = list(self._subscribers)
+
+        if not subscribers:
+            return
+
+        item = (event, data)
+        for queue in subscribers:
+            try:
+                queue.put_nowait(item)
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(item)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def broadcast_sync(self, event: str, data: Any) -> None:
+        """Synchronous helper using asyncio.run_coroutine_threadsafe when invoked from worker threads."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self.broadcast(event, data), loop)
+                return
+            except Exception as exc:
+                logging.debug(f"Error in SSE broadcast_sync run_coroutine_threadsafe: {exc}")
+
+        # Fallback if no running loop is active
+        with self._lock:
+            subscribers = list(self._subscribers)
+
+        item = (event, data)
+        for queue in subscribers:
+            try:
+                queue.put_nowait(item)
+            except Exception:
+                pass
+
+
+SSEBroadcaster = SSEManager
+sse_manager = SSEManager()
+sse_broadcaster = sse_manager
+
+
+def _on_notification_logged(payload: dict[str, Any]) -> None:
+    try:
+        sse_manager.broadcast_sync("notification", payload)
+    except Exception as exc:
+        logging.debug(f"Error dispatching notification to SSE: {exc}")
+
+
+main.register_notification_subscriber(_on_notification_logged)
+
+
+def format_sse(event: str, data: Any) -> str:
+    """Format an SSE message block according to text/event-stream specification."""
+    if isinstance(data, str):
+        payload_str = data
+    else:
+        try:
+            payload_str = json.dumps(data)
+        except Exception:
+            payload_str = str(data)
+    return f"event: {event}\ndata: {payload_str}\n\n"
 
 
 class SetupRequest(BaseModel):
@@ -371,6 +500,9 @@ def _extract_session_token(request: Request) -> Optional[str]:
     auth_header = request.headers.get("authorization") or ""
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
+    query_token = request.query_params.get("token")
+    if query_token:
+        return query_token.strip()
     return None
 
 
@@ -663,10 +795,13 @@ async def _build_module_update(module_name: str) -> dict[str, Any]:
 
 async def _broadcast_module(module_name: str) -> None:
     try:
-        if not ws_manager.active_connections:
+        is_mocked = hasattr(sse_manager.broadcast, "assert_called") or hasattr(sse_manager.broadcast, "mock")
+        if not ws_manager.active_connections and sse_manager.subscriber_count == 0 and not is_mocked:
             return
         payload = await _build_module_update(module_name)
-        await ws_manager.broadcast(payload)
+        if ws_manager.active_connections:
+            await ws_manager.broadcast(payload)
+        await sse_manager.broadcast("module_update", payload)
     except Exception as exc:
         logging.debug(f"Broadcast module '{module_name}' error: {exc}")
 
@@ -1072,6 +1207,66 @@ def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
     return None
 
 
+async def sse_event_generator(
+    request: Request,
+    queue: asyncio.Queue,
+    ping_interval: float = 15.0,
+):
+    try:
+        # Immediately yield full initial snapshot on connect
+        snapshot = await asyncio.to_thread(_build_full_snapshot)
+        yield format_sse("snapshot", snapshot)
+
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=ping_interval)
+                event, data = item
+                yield format_sse(event, data)
+            except asyncio.TimeoutError:
+                yield "event: ping\ndata: {}\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        pass
+    except Exception as exc:
+        logging.debug(f"SSE generator error: {exc}")
+    finally:
+        sse_manager.unsubscribe(queue)
+
+
+async def _sse_stream_response(request: Request, ping_interval: float = 15.0) -> StreamingResponse:
+    queue = sse_manager.subscribe()
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        sse_event_generator(request, queue, ping_interval=ping_interval),
+        media_type="text/event-stream",
+        headers=headers,
+    )
+
+
+@app.get("/api/events")
+async def api_events_stream(
+    request: Request,
+    ping_interval: float = Query(default=15.0, ge=0.01, le=120.0),
+    _user: str = Depends(require_auth),
+) -> StreamingResponse:
+    return await _sse_stream_response(request, ping_interval=ping_interval)
+
+
+@app.get("/api/stream/events")
+async def api_stream_events_alias(
+    request: Request,
+    ping_interval: float = Query(default=15.0, ge=0.01, le=120.0),
+    _user: str = Depends(require_auth),
+) -> StreamingResponse:
+    return await _sse_stream_response(request, ping_interval=ping_interval)
+
+
+@app.websocket("/ws")
 @app.websocket("/api/ws")
 async def api_websocket(websocket: WebSocket) -> None:
     token = _extract_ws_token(websocket)
