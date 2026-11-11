@@ -29,7 +29,7 @@ import discord
 import logging
 from logging.handlers import RotatingFileHandler
 import sqlite3
-from typing import Any, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Optional, Tuple, Union
 
 try:
     from decouple import config as _decouple_config
@@ -72,7 +72,7 @@ try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None  # type: ignore
-from typing import Any, Optional, Tuple, Union
+from typing import Any, AsyncGenerator, Optional, Tuple, Union
 import re
 try:
     import yaml
@@ -8698,6 +8698,79 @@ class PackageManager:
                 "returncode": -1,
             }
 
+    async def run_upgrade_stream(
+        self, packages: Optional[list[str]] = None, dry_run: bool = True
+    ) -> AsyncGenerator[str, None]:
+        """Execute package upgrade or simulation and stream output chunk by chunk."""
+        if not self.is_supported():
+            yield "[ERROR] Package manager (apt/apt-get) is not available on this host\n"
+            return
+
+        if dry_run:
+            cmd = ["apt-get", "-y", "-s"]
+        else:
+            cmd = [
+                "apt-get",
+                "-y",
+                "-o",
+                "Dpkg::Options::=--force-confdef",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+            ]
+
+        if packages:
+            clean_pkgs = []
+            for p in packages:
+                p_clean = str(p).strip()
+                if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9+\-\.:]*$", p_clean):
+                    yield f"[ERROR] Invalid package name '{p}'\n"
+                    return
+                clean_pkgs.append(p_clean)
+            cmd.extend(["install", "--only-upgrade"] + clean_pkgs)
+        else:
+            cmd.append("dist-upgrade")
+
+        yield f"$ {' '.join(cmd)}\n\n"
+
+        exec_cmd = list(cmd)
+        if (
+            not dry_run
+            and hasattr(os, "geteuid")
+            and os.geteuid() != 0
+            and shutil.which("sudo")
+        ):
+            exec_cmd = ["sudo", "-n", "env", "DEBIAN_FRONTEND=noninteractive"] + cmd
+
+        env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *exec_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                text = (
+                    line.decode("utf-8", errors="replace")
+                    if isinstance(line, (bytes, bytearray))
+                    else str(line)
+                )
+                yield text
+
+            rc = await process.wait()
+            self.invalidate_cache()
+            if rc == 0:
+                yield "\n\n[SUCCESS] Package installation completed successfully.\n"
+            else:
+                yield f"\n\n[FAILED] Process exited with code {rc}.\n"
+        except Exception as exc:
+            self.invalidate_cache()
+            yield f"\n\n[FAILED] Process exited with error: {exc}\n"
+
     @staticmethod
     def _normalize_py_pkg_name(name: str) -> str:
         """Normalize Python distribution names per PEP 503."""
@@ -9196,6 +9269,193 @@ class PackageManager:
                 "error": str(exc),
                 "returncode": 1,
             }
+
+    async def upgrade_python_packages_stream(
+        self,
+        packages: Optional[list[str]] = None,
+        dry_run: bool = False,
+        restart_service: bool = False,
+    ) -> AsyncGenerator[str, None]:
+        """Upgrade Python virtual environment packages via uv and stream real-time output."""
+        clean_pkgs: list[str] = []
+        if packages is not None:
+            for pkg in packages:
+                p_str = str(pkg).strip()
+                if not p_str or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$", p_str):
+                    yield f"[ERROR] Invalid package name: '{pkg}'\n"
+                    return
+                clean_pkgs.append(p_str)
+
+        uv_bin = _resolve_uv_binary()
+        if clean_pkgs:
+            lock_cmd = [uv_bin, "lock"] + [arg for p in clean_pkgs for arg in ("--upgrade-package", p)]
+        else:
+            lock_cmd = [uv_bin, "lock", "--upgrade"]
+
+        if dry_run:
+            full_cmd = lock_cmd + ["--dry-run"]
+            yield f"$ {' '.join(full_cmd)}\n\n"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *full_cmd,
+                    cwd=str(REPO_DIR),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    yield line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+                rc = await proc.wait()
+                if rc == 0:
+                    yield "\n\n[SUCCESS] Dry-run lock simulation completed successfully.\n"
+                else:
+                    yield f"\n\n[FAILED] Dry-run exited with code {rc}.\n"
+            except Exception as exc:
+                yield f"\n\n[FAILED] Dry-run encountered error: {exc}\n"
+            return
+
+        uv_lock_path = REPO_DIR / "uv.lock"
+        lock_snapshot: Optional[bytes] = None
+        if uv_lock_path.is_file():
+            try:
+                lock_snapshot = uv_lock_path.read_bytes()
+            except Exception:
+                lock_snapshot = None
+
+        try:
+            # 1. uv lock
+            yield f"$ {' '.join(lock_cmd)}\n\n"
+            proc = await asyncio.create_subprocess_exec(
+                *lock_cmd,
+                cwd=str(REPO_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                yield line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+            lock_rc = await proc.wait()
+            if lock_rc != 0:
+                if lock_snapshot is not None:
+                    try:
+                        uv_lock_path.write_bytes(lock_snapshot)
+                    except Exception:
+                        pass
+                yield f"\n\n[FAILED] uv lock exited with code {lock_rc}.\n"
+                return
+
+            # 2. uv sync
+            sync_cmd = [uv_bin, "sync"]
+            yield f"\n$ {' '.join(sync_cmd)}\n\n"
+            sync_proc = await asyncio.create_subprocess_exec(
+                *sync_cmd,
+                cwd=str(REPO_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            while True:
+                line = await sync_proc.stdout.readline()
+                if not line:
+                    break
+                yield line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+            sync_rc = await sync_proc.wait()
+            if sync_rc != 0:
+                if lock_snapshot is not None:
+                    try:
+                        uv_lock_path.write_bytes(lock_snapshot)
+                        yield "\n[ROLLBACK] Reverting uv.lock and rolling back environment with uv sync --frozen...\n"
+                        rb_proc = await asyncio.create_subprocess_exec(
+                            uv_bin, "sync", "--frozen",
+                            cwd=str(REPO_DIR),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT,
+                        )
+                        while True:
+                            rline = await rb_proc.stdout.readline()
+                            if not rline:
+                                break
+                            yield rline.decode("utf-8", errors="replace") if isinstance(rline, (bytes, bytearray)) else str(rline)
+                        await rb_proc.wait()
+                    except Exception as rb_exc:
+                        yield f"[ROLLBACK ERROR] {rb_exc}\n"
+                yield f"\n\n[FAILED] uv sync exited with code {sync_rc}.\n"
+                return
+
+            # 3. Smoke test
+            yield "\nRunning pre-restart smoke test...\n"
+            smoke_cmd = [
+                sys.executable,
+                "-c",
+                "import main, api; diag = main.run_system_diagnostics(); assert diag.get('overall_status') in ('PASS', 'WARN'), f'Diagnostics failed: {diag}'",
+            ]
+            smoke_proc = await asyncio.create_subprocess_exec(
+                *smoke_cmd,
+                cwd=str(REPO_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            while True:
+                line = await smoke_proc.stdout.readline()
+                if not line:
+                    break
+                yield line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+            smoke_rc = await smoke_proc.wait()
+
+            if smoke_rc != 0:
+                yield f"\n[FAILED] Smoke test failed with code {smoke_rc}.\n"
+                if lock_snapshot is not None:
+                    try:
+                        uv_lock_path.write_bytes(lock_snapshot)
+                        yield "\n[ROLLBACK] Rolling back environment with uv sync --frozen...\n"
+                        rb_proc = await asyncio.create_subprocess_exec(
+                            uv_bin, "sync", "--frozen",
+                            cwd=str(REPO_DIR),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT,
+                        )
+                        while True:
+                            rline = await rb_proc.stdout.readline()
+                            if not rline:
+                                break
+                            yield rline.decode("utf-8", errors="replace") if isinstance(rline, (bytes, bytearray)) else str(rline)
+                        await rb_proc.wait()
+                        yield "[ROLLBACK] Environment restored to previous state.\n"
+                    except Exception as rb_exc:
+                        yield f"[ROLLBACK ERROR] {rb_exc}\n"
+                return
+
+            self.invalidate_cache()
+            yield "\n[SUCCESS] Smoke test passed!\n"
+
+            if restart_service:
+                yield "[INFO] Scheduling service restart...\n"
+                try:
+                    subprocess.Popen(
+                        [
+                            "bash",
+                            "-c",
+                            "sleep 2 && (systemctl restart vigil 2>/dev/null || systemctl restart raidcheck raidcheck-web)",
+                        ],
+                        cwd=str(REPO_DIR),
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    yield "[SUCCESS] Service restart triggered successfully.\n"
+                except OSError as e:
+                    yield f"[WARNING] Could not spawn delayed service restart: {e}\n"
+
+        except Exception as exc:
+            if lock_snapshot is not None:
+                try:
+                    uv_lock_path.write_bytes(lock_snapshot)
+                except Exception:
+                    pass
+            yield f"\n\n[FAILED] Python upgrade encountered unexpected error: {exc}\n"
 
 
 package_manager = PackageManager()

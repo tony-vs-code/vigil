@@ -8249,6 +8249,95 @@ class TestPackageManagerBackendAndEndpoints(unittest.TestCase):
             self.assertEqual(logs[0]["severity"], "info")
             self.assertIn("curl", logs[0]["description"])
 
+    def test_run_upgrade_stream_backend_and_endpoints(self):
+        pm = main.PackageManager()
+
+        async def _collect(gen):
+            out = []
+            async for chunk in gen:
+                out.append(chunk)
+            return "".join(out)
+
+        # 1. Invalid package name yields error
+        out_bad = asyncio.run(_collect(pm.run_upgrade_stream(packages=["bad;pkg"], dry_run=True)))
+        self.assertIn("[ERROR] Invalid package name 'bad;pkg'", out_bad)
+
+        # 2. Unsupported platform yields error
+        with patch.object(pm, "is_supported", return_value=False):
+            out_unsupported = asyncio.run(_collect(pm.run_upgrade_stream(packages=None, dry_run=True)))
+            self.assertIn("[ERROR] Package manager (apt/apt-get) is not available", out_unsupported)
+
+        # 3. Successful streaming run
+        mock_proc = MagicMock()
+        mock_proc.stdout.readline = AsyncMock(side_effect=[
+            b"Reading package lists...\n",
+            b"Building dependency tree...\n",
+            b"The following packages will be upgraded: curl\n",
+            b"",
+        ])
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch.object(pm, "is_supported", return_value=True), \
+             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc)):
+            stream_out = asyncio.run(_collect(pm.run_upgrade_stream(packages=["curl"], dry_run=True)))
+            self.assertIn("$ apt-get -y -s install --only-upgrade curl", stream_out)
+            self.assertIn("Reading package lists...", stream_out)
+            self.assertIn("[SUCCESS] Package installation completed successfully.", stream_out)
+
+        # 4. Failed process exit code
+        mock_proc_fail = MagicMock()
+        mock_proc_fail.stdout.readline = AsyncMock(side_effect=[
+            b"E: Some packaging error\n",
+            b"",
+        ])
+        mock_proc_fail.wait = AsyncMock(return_value=100)
+
+        with patch.object(pm, "is_supported", return_value=True), \
+             patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc_fail)):
+            stream_fail_out = asyncio.run(_collect(pm.run_upgrade_stream(packages=None, dry_run=False)))
+            self.assertIn("[FAILED] Process exited with code 100.", stream_fail_out)
+
+        # 5. API endpoint POST /api/packages/upgrade?stream=true
+        async def _dummy_stream(packages=None, dry_run=True):
+            yield "$ apt-get -y -s dist-upgrade\n\n"
+            yield "Inst dummy [1.0] (1.0 Debian:stable)\n"
+            yield "\n\n[SUCCESS] Package installation completed successfully.\n"
+
+        with patch.object(main.package_manager, "run_upgrade_stream", side_effect=_dummy_stream):
+            # via query param
+            resp = asgi_post(
+                api.app,
+                "/api/packages/upgrade?stream=true",
+                json_body={"dry_run": True},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text/plain", resp.headers.get("content-type", ""))
+            self.assertIn("Inst dummy", resp.text)
+            self.assertIn("[SUCCESS]", resp.text)
+
+            # via JSON stream=True
+            resp_body = asgi_post(
+                api.app,
+                "/api/packages/upgrade",
+                json_body={"dry_run": True, "stream": True},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp_body.status_code, 200)
+            self.assertIn("text/plain", resp_body.headers.get("content-type", ""))
+            self.assertIn("Inst dummy", resp_body.text)
+
+            # via dedicated /stream endpoint
+            resp_stream = asgi_post(
+                api.app,
+                "/api/packages/upgrade/stream",
+                json_body={"dry_run": True},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp_stream.status_code, 200)
+            self.assertIn("text/plain", resp_stream.headers.get("content-type", ""))
+            self.assertIn("Inst dummy", resp_stream.text)
+
     def test_api_package_endpoints_and_status(self):
         # 1. Status includes reboot_status and updates_summary
         status_resp = asgi_get(api.app, "/api/status", cookies=self.auth_cookies)
@@ -15242,6 +15331,107 @@ class PythonPackageManagerTests(unittest.TestCase):
                 resp = asgi_post(api.app, "/api/packages/python/upgrade", json_body={"packages": ["aiohttp"], "dry_run": True})
                 self.assertEqual(resp.status_code, 200)
                 self.assertTrue(resp.json()["success"])
+        finally:
+            api.app.dependency_overrides.pop(api.require_auth, None)
+
+    def test_upgrade_python_packages_stream_backend_and_endpoints(self):
+        async def _collect(gen):
+            out = []
+            async for chunk in gen:
+                out.append(chunk)
+            return "".join(out)
+
+        # 1. Validation error
+        out_bad = asyncio.run(_collect(self.pm.upgrade_python_packages_stream(packages=["bad;pkg"])))
+        self.assertIn("[ERROR] Invalid package name: 'bad;pkg'", out_bad)
+
+        # 2. Dry run streaming
+        mock_proc = MagicMock()
+        mock_proc.stdout.readline = AsyncMock(side_effect=[
+            b"Would update 1 package\n",
+            b"",
+        ])
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=mock_proc)):
+            out_dry = asyncio.run(_collect(self.pm.upgrade_python_packages_stream(packages=["aiohttp"], dry_run=True)))
+            self.assertIn("uv lock --upgrade-package aiohttp --dry-run", out_dry)
+            self.assertIn("Would update 1 package", out_dry)
+            self.assertIn("[SUCCESS] Dry-run lock simulation completed successfully.", out_dry)
+
+        # 3. Real upgrade streaming: uv lock, uv sync, smoke test
+        mock_lock_proc = MagicMock()
+        mock_lock_proc.stdout.readline = AsyncMock(side_effect=[b"Locked 1 package\n", b""])
+        mock_lock_proc.wait = AsyncMock(return_value=0)
+
+        mock_sync_proc = MagicMock()
+        mock_sync_proc.stdout.readline = AsyncMock(side_effect=[b"Installed 1 package\n", b""])
+        mock_sync_proc.wait = AsyncMock(return_value=0)
+
+        mock_smoke_proc = MagicMock()
+        mock_smoke_proc.stdout.readline = AsyncMock(side_effect=[b"Diagnostics OK\n", b""])
+        mock_smoke_proc.wait = AsyncMock(return_value=0)
+
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.read_bytes", return_value=b"fake-lock"), \
+             patch("asyncio.create_subprocess_exec", side_effect=[mock_lock_proc, mock_sync_proc, mock_smoke_proc]):
+            out_real = asyncio.run(_collect(self.pm.upgrade_python_packages_stream(packages=None, dry_run=False)))
+            self.assertIn("uv lock --upgrade", out_real)
+            self.assertIn("uv sync", out_real)
+            self.assertIn("[SUCCESS] Smoke test passed!", out_real)
+
+        # 4. Real upgrade with smoke test failure and rollback
+        mock_lock_fail = MagicMock()
+        mock_lock_fail.stdout.readline = AsyncMock(side_effect=[b"Locked 1 package\n", b""])
+        mock_lock_fail.wait = AsyncMock(return_value=0)
+
+        mock_sync_fail = MagicMock()
+        mock_sync_fail.stdout.readline = AsyncMock(side_effect=[b"Installed 1 package\n", b""])
+        mock_sync_fail.wait = AsyncMock(return_value=0)
+
+        mock_smoke_fail = MagicMock()
+        mock_smoke_fail.stdout.readline = AsyncMock(side_effect=[b"AssertionError: failed!\n", b""])
+        mock_smoke_fail.wait = AsyncMock(return_value=1)
+
+        mock_rollback_proc = MagicMock()
+        mock_rollback_proc.stdout.readline = AsyncMock(side_effect=[b"Restored frozen dependencies\n", b""])
+        mock_rollback_proc.wait = AsyncMock(return_value=0)
+
+        with patch("pathlib.Path.is_file", return_value=True), \
+             patch("pathlib.Path.read_bytes", return_value=b"fake-lock"), \
+             patch("pathlib.Path.write_bytes") as mock_write, \
+             patch("asyncio.create_subprocess_exec", side_effect=[mock_lock_fail, mock_sync_fail, mock_smoke_fail, mock_rollback_proc]):
+            out_rb = asyncio.run(_collect(self.pm.upgrade_python_packages_stream(packages=None, dry_run=False)))
+            self.assertIn("[FAILED] Smoke test failed with code 1.", out_rb)
+            self.assertIn("[ROLLBACK] Rolling back environment", out_rb)
+            mock_write.assert_called_with(b"fake-lock")
+
+        # 5. API streaming endpoints
+        async def _dummy_py_stream(packages=None, dry_run=False, restart_service=False):
+            yield "$ uv lock --upgrade\n\n"
+            yield "Locked 1 pkg\n"
+            yield "\n[SUCCESS] Smoke test passed!\n"
+
+        api.app.dependency_overrides[api.require_auth] = lambda: "admin"
+        try:
+            with patch.object(main.package_manager, "upgrade_python_packages_stream", side_effect=_dummy_py_stream):
+                # Query param
+                resp_q = asgi_post(api.app, "/api/packages/python/upgrade?stream=true", json_body={"dry_run": True})
+                self.assertEqual(resp_q.status_code, 200)
+                self.assertIn("text/plain", resp_q.headers.get("content-type", ""))
+                self.assertIn("Locked 1 pkg", resp_q.text)
+
+                # JSON body stream=True
+                resp_b = asgi_post(api.app, "/api/packages/python/upgrade", json_body={"dry_run": True, "stream": True})
+                self.assertEqual(resp_b.status_code, 200)
+                self.assertIn("text/plain", resp_b.headers.get("content-type", ""))
+                self.assertIn("Locked 1 pkg", resp_b.text)
+
+                # Dedicated /stream endpoint
+                resp_s = asgi_post(api.app, "/api/packages/python/upgrade/stream", json_body={"dry_run": True})
+                self.assertEqual(resp_s.status_code, 200)
+                self.assertIn("text/plain", resp_s.headers.get("content-type", ""))
+                self.assertIn("Locked 1 pkg", resp_s.text)
         finally:
             api.app.dependency_overrides.pop(api.require_auth, None)
 
