@@ -2,6 +2,17 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.44] - 2026-11-11
+### Added
+- **Server-Sent Events (SSE) Live Streaming**: Implemented continuous event streaming on `/api/events` and `/api/stream/events` for real-time telemetry, Docker lifecycle events, RAID alerts, and outbound notifications.
+- **Reactive In-Place DOM Patching**: Integrated fine-grained targeted DOM updates for CPU, RAM, Disk gauges, per-core meters, load averages, and Docker container status pills without page redraws or UI flicker.
+- **Live Stream Indicator**: Added `#live-stream-indicator` and `#live-stream-text` in dashboard header displaying active SSE connection state and animated pulse dot.
+- **Adaptive Polling Throttling**: Automatically throttles periodic REST polling intervals to a 60s watchdog cycle during active SSE streaming, conserving CPU and network bandwidth.
+- **Resilient Fallback**: Automatically reverts to standard 5s/10s interval polling upon SSE disconnection or in environments without native `EventSource`.
+
+### Changed
+- **Full Backward Compatibility**: Retained full compatibility across all 63 REST API endpoints, WebSocket connection routes, and headless Node VM test suites.
+
 ## [1.0.43] - 2026-11-10
 ### Added
 - **Real-Time Subprocess Terminal Output Streaming**: Added streaming package upgrade endpoints (`/api/packages/upgrade/stream` and `/api/python/packages/upgrade/stream`) streaming live chunks directly from `apt-get` and `uv lock` / `uv sync` / diagnostics smoke tests.

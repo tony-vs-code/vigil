@@ -1085,6 +1085,17 @@ body {
   animation: pulse-glow 1.5s infinite ease-in-out;
 }
 
+.live-stream-indicator.stream-reconnecting .live-pulse-dot {
+  background-color: var(--state-recovering);
+  box-shadow: 0 0 6px var(--state-recovering);
+}
+
+.live-stream-indicator.stream-paused .live-pulse-dot {
+  background-color: var(--text-muted);
+  box-shadow: none;
+  animation: none;
+}
+
 .last-updated {
   font-size: 0.75rem;
   color: var(--text-muted);
@@ -8707,6 +8718,11 @@ hr.overview-flow-divider {
 #live-stream-indicator,
 #auto-refresh-indicator {
   display: none !important;
+}
+
+#live-stream-indicator.stream-active,
+#live-stream-indicator.stream-reconnecting {
+  display: inline-flex !important;
 }
 
 
