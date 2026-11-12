@@ -2,6 +2,18 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.45] - 2026-11-12
+### Added
+- **Silent Background Telemetry Sync**: Restricted refresh icon spin animations strictly to explicit manual button clicks; background polling and periodic telemetry ticks now run silently without visual disruption.
+- **Value-Diffing DOM Reconciliation**: Added `setTextIfChanged`, `setWidthIfChanged`, and `setBadgeIfChanged` guards to suppress unnecessary DOM updates and avoid layout thrashing.
+- **Keyed In-Place Table Updates**: Reconciled RAID member disks and notification logs in-place against existing `<tr>` elements keyed by `data-device` to prevent table redraws and preserve operator scroll position.
+- **Tabular Numeric Alignment**: Enabled `font-variant-numeric: tabular-nums` across telemetry gauges and stat cards to prevent horizontal layout shift as digits fluctuate.
+- **60 FPS Canvas Redraws**: Synchronized chart drawing passes to display refresh rates using `requestAnimationFrame` with cached canvas dimensions.
+- **Fluid Meter Transitions**: Applied `0.6s cubic-bezier(0.4, 0, 0.2, 1)` easing curves to progress bar meters for natural transitions.
+
+### Changed
+- **Full Backward Compatibility**: Maintained complete compatibility across all 63 REST API endpoints and 718 client DOM element contracts.
+
 ## [1.0.44] - 2026-11-11
 ### Added
 - **Server-Sent Events (SSE) Live Streaming**: Implemented continuous event streaming on `/api/events` and `/api/stream/events` for real-time telemetry, Docker lifecycle events, RAID alerts, and outbound notifications.

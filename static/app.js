@@ -443,22 +443,52 @@ function normalizeRaidState(rawState) {
 }
 
 /**
+ * Fast, safe DOM reconciliation helpers to prevent visual flicker and jumping elements.
+ */
+function setTextIfChanged(el, text) {
+  if (el) {
+    const str = text === null || text === undefined ? "" : String(text);
+    if (el.textContent !== str) {
+      el.textContent = str;
+    }
+  }
+}
+
+function setWidthIfChanged(el, widthPercent) {
+  if (el) {
+    const widthStr = `${widthPercent}%`;
+    if (el.style.width !== widthStr) {
+      el.style.width = widthStr;
+    }
+  }
+}
+
+function setBadgeIfChanged(badgeEl, textEl, stateClass, text) {
+  if (!badgeEl) return;
+  if (stateClass && badgeEl.className !== stateClass) {
+    badgeEl.className = stateClass;
+  }
+  const target = textEl || badgeEl;
+  setTextIfChanged(target, text);
+}
+
+/**
  * Apply status badge classes and text for a given RAID state.
  */
 function applyStatusBadge(badgeEl, textEl, rawState) {
   if (!badgeEl) return;
   const state = normalizeRaidState(rawState);
-
-  VALID_RAID_STATES.forEach((s) => badgeEl.classList.remove(`status-${s}`));
-  badgeEl.classList.add(`status-${state}`);
-  badgeEl.setAttribute("data-state", state);
+  const targetClass = `status-badge status-${state}`;
+  if (badgeEl.className !== targetClass) {
+    badgeEl.className = targetClass;
+  }
+  if (badgeEl.getAttribute("data-state") !== state) {
+    badgeEl.setAttribute("data-state", state);
+  }
 
   const label = state === "none" ? "NO RAID" : state.toUpperCase();
-  if (textEl) {
-    textEl.textContent = label;
-  } else {
-    badgeEl.textContent = label;
-  }
+  const targetEl = textEl || badgeEl;
+  setTextIfChanged(targetEl, label);
 }
 
 /**
@@ -467,12 +497,14 @@ function applyStatusBadge(badgeEl, textEl, rawState) {
 function updateProgressBar(barEl, percent) {
   if (!barEl) return;
   const clamped = Math.max(0, Math.min(100, Number(percent) || 0));
-  barEl.style.width = `${clamped.toFixed(1)}%`;
-  barEl.classList.remove("warn", "danger");
-  if (clamped >= 90) {
-    barEl.classList.add("danger");
-  } else if (clamped >= 75) {
-    barEl.classList.add("warn");
+  setWidthIfChanged(barEl, clamped.toFixed(1));
+  const isDanger = clamped >= 90;
+  const isWarn = !isDanger && clamped >= 75;
+  if (barEl.classList.contains("danger") !== isDanger) {
+    barEl.classList.toggle("danger", isDanger);
+  }
+  if (barEl.classList.contains("warn") !== isWarn) {
+    barEl.classList.toggle("warn", isWarn);
   }
 }
 
@@ -518,232 +550,273 @@ function renderMemoryHistoryChart(history) {
  */
 function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
   if (!canvas) return;
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  const w = Math.floor(rect.width) || canvas.clientWidth || 600;
-  const h = Math.floor(rect.height) || canvas.clientHeight || 150;
 
-  const targetW = Math.round(w * dpr);
-  const targetH = Math.round(h * dpr);
-  if (canvas.width !== targetW || canvas.height !== targetH) {
-    canvas.width = targetW;
-    canvas.height = targetH;
-  }
+  const render = () => {
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    let w = canvas._cachedWidth;
+    let h = canvas._cachedHeight;
+    if (!w || !h) {
+      const rect = typeof canvas.getBoundingClientRect === "function" ? canvas.getBoundingClientRect() : null;
+      w = (rect && Math.floor(rect.width)) || canvas.clientWidth || 600;
+      h = (rect && Math.floor(rect.height)) || canvas.clientHeight || 150;
+      canvas._cachedWidth = w;
+      canvas._cachedHeight = h;
+    }
 
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
+    const targetW = Math.round(w * dpr);
+    const targetH = Math.round(h * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
 
-  ctx.save();
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, w, h);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-  // 1. Task-manager style dark background
-  ctx.fillStyle = "rgba(4, 9, 20, 0.8)";
-  ctx.fillRect(0, 0, w, h);
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
 
-  // 2. Padding and usable plot geometry
-  const padLeft = 34;
-  const padRight = 12;
-  const padTop = 14;
-  const padBottom = 18;
-  const plotW = Math.max(10, w - padLeft - padRight);
-  const plotH = Math.max(10, h - padTop - padBottom);
+    // 1. Task-manager style dark background
+    ctx.fillStyle = "rgba(4, 9, 20, 0.8)";
+    ctx.fillRect(0, 0, w, h);
 
-  // 3. Subtle horizontal grid lines & percentage labels (100%, 75%, 50%, 25%, 0%)
-  const gridPcts = [100, 75, 50, 25, 0];
-  ctx.lineWidth = 1;
-  gridPcts.forEach((pct) => {
-    const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
-    ctx.strokeStyle = pct === 0 ? "rgba(148, 163, 184, 0.35)" : "rgba(71, 85, 105, 0.24)";
+    // 2. Padding and usable plot geometry
+    const padLeft = 34;
+    const padRight = 12;
+    const padTop = 14;
+    const padBottom = 18;
+    const plotW = Math.max(10, w - padLeft - padRight);
+    const plotH = Math.max(10, h - padTop - padBottom);
+
+    // 3. Subtle horizontal grid lines & percentage labels (100%, 75%, 50%, 25%, 0%)
+    const gridPcts = [100, 75, 50, 25, 0];
+    ctx.lineWidth = 1;
+    gridPcts.forEach((pct) => {
+      const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
+      ctx.strokeStyle = pct === 0 ? "rgba(148, 163, 184, 0.35)" : "rgba(71, 85, 105, 0.24)";
+      ctx.beginPath();
+      ctx.moveTo(padLeft, y);
+      ctx.lineTo(w - padRight, y);
+      ctx.stroke();
+
+      ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
+      ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ctx.fillText(`${pct}%`, padLeft - 5, y);
+    });
+
+    // Vertical time ticks
+    const numVDivs = 6;
+    ctx.strokeStyle = "rgba(71, 85, 105, 0.16)";
     ctx.beginPath();
-    ctx.moveTo(padLeft, y);
-    ctx.lineTo(w - padRight, y);
+    for (let d = 1; d < numVDivs; d++) {
+      const x = Math.round(padLeft + (plotW / numVDivs) * d) + 0.5;
+      ctx.moveTo(x, padTop);
+      ctx.lineTo(x, padTop + plotH);
+    }
     ctx.stroke();
 
-    ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
-    ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
-    ctx.textAlign = "right";
-    ctx.textBaseline = "middle";
-    ctx.fillText(`${pct}%`, padLeft - 5, y);
-  });
-
-  // Vertical time ticks
-  const numVDivs = 6;
-  ctx.strokeStyle = "rgba(71, 85, 105, 0.16)";
-  ctx.beginPath();
-  for (let d = 1; d < numVDivs; d++) {
-    const x = Math.round(padLeft + (plotW / numVDivs) * d) + 0.5;
-    ctx.moveTo(x, padTop);
-    ctx.lineTo(x, padTop + plotH);
-  }
-  ctx.stroke();
-
-  // Handle normalization of buffers (support single buffer or array of buffers)
-  if (!buffers || buffers.length === 0) {
-    ctx.restore();
-    return;
-  }
-  const isSingleBuffer = Array.isArray(buffers) && typeof buffers[0] === "number";
-  const allBuffers = isSingleBuffer ? [buffers] : buffers;
-
-  const maxSamples = CPU_CORE_HISTORY_LIMIT;
-  const stepX = plotW / Math.max(1, maxSamples - 1);
-
-  // Prepare points for each core
-  const coreSeries = [];
-  for (let idx = 0; idx < allBuffers.length; idx++) {
-    const buf = allBuffers[idx];
-    if (!buf || buf.length === 0) continue;
-    const n = buf.length;
-    const pts = [];
-    for (let i = 0; i < n; i++) {
-      const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
-      const x = (w - padRight) - (n - 1 - i) * stepX;
-      const y = padTop + plotH * (1 - sample / 100);
-      pts.push({ x, y });
+    // Handle normalization of buffers (support single buffer or array of buffers)
+    if (!buffers || buffers.length === 0) {
+      ctx.restore();
+      return;
     }
-    if (pts.length === 1) {
-      pts.unshift({ x: padLeft, y: pts[0].y });
+    const isSingleBuffer = Array.isArray(buffers) && typeof buffers[0] === "number";
+    const allBuffers = isSingleBuffer ? [buffers] : buffers;
+
+    const maxSamples = CPU_CORE_HISTORY_LIMIT;
+    const stepX = plotW / Math.max(1, maxSamples - 1);
+
+    // Prepare points for each core
+    const coreSeries = [];
+    for (let idx = 0; idx < allBuffers.length; idx++) {
+      const buf = allBuffers[idx];
+      if (!buf || buf.length === 0) continue;
+      const n = buf.length;
+      const pts = [];
+      for (let i = 0; i < n; i++) {
+        const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
+        const x = (w - padRight) - (n - 1 - i) * stepX;
+        const y = padTop + plotH * (1 - sample / 100);
+        pts.push({ x, y });
+      }
+      if (pts.length === 1) {
+        pts.unshift({ x: padLeft, y: pts[0].y });
+      }
+      const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+      coreSeries.push({ idx, color, pts });
     }
-    const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
-    coreSeries.push({ idx, color, pts });
-  }
 
-  const hasHover =
-    activeHoverIndex !== null &&
-    activeHoverIndex !== undefined &&
-    activeHoverIndex >= 0;
+    const hasHover =
+      activeHoverIndex !== null &&
+      activeHoverIndex !== undefined &&
+      activeHoverIndex >= 0;
 
-  // Render function for a core series
-  const renderSeriesLine = (series, isEmphasized, isDimmed) => {
-    const { color, pts } = series;
-    if (!pts || pts.length === 0) return;
+    // Render function for a core series
+    const renderSeriesLine = (series, isEmphasized, isDimmed) => {
+      const { color, pts } = series;
+      if (!pts || pts.length === 0) return;
 
-    if (isEmphasized) {
-      // Glow and thicker line
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2.4;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 8;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.globalAlpha = 1.0;
-      ctx.beginPath();
-      pts.forEach((pt, i) => {
-        if (i === 0) ctx.moveTo(pt.x, pt.y);
-        else ctx.lineTo(pt.x, pt.y);
-      });
-      ctx.stroke();
-      ctx.restore();
+      if (isEmphasized) {
+        // Glow and thicker line
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.4;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.globalAlpha = 1.0;
+        ctx.beginPath();
+        pts.forEach((pt, i) => {
+          if (i === 0) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.stroke();
+        ctx.restore();
 
-      // Subtle gradient underlay for emphasized line
-      ctx.save();
-      const areaGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-      areaGrad.addColorStop(0, `${color}33`);
-      areaGrad.addColorStop(1, `${color}00`);
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, padTop + plotH);
-      pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
-      ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
-      ctx.closePath();
-      ctx.fillStyle = areaGrad;
-      ctx.fill();
-      ctx.restore();
+        // Subtle gradient underlay for emphasized line
+        ctx.save();
+        const areaGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+        areaGrad.addColorStop(0, `${color}33`);
+        areaGrad.addColorStop(1, `${color}00`);
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, padTop + plotH);
+        pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+        ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
+        ctx.closePath();
+        ctx.fillStyle = areaGrad;
+        ctx.fill();
+        ctx.restore();
 
-      // Rightmost current utilization pulse dot
-      const last = pts[pts.length - 1];
-      ctx.save();
-      ctx.fillStyle = color;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 8;
-      ctx.beginPath();
-      ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    } else if (isDimmed) {
-      // Dimmed line
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.0;
-      ctx.globalAlpha = 0.2;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.beginPath();
-      pts.forEach((pt, i) => {
-        if (i === 0) ctx.moveTo(pt.x, pt.y);
-        else ctx.lineTo(pt.x, pt.y);
-      });
-      ctx.stroke();
+        // Rightmost current utilization pulse dot
+        const last = pts[pts.length - 1];
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.beginPath();
+        ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else if (isDimmed) {
+        // Dimmed line
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.0;
+        ctx.globalAlpha = 0.2;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        pts.forEach((pt, i) => {
+          if (i === 0) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.stroke();
 
-      const last = pts[pts.length - 1];
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(last.x, last.y, 1.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
+        const last = pts[pts.length - 1];
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(last.x, last.y, 1.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        // Subtle area fill under standard series line
+        ctx.save();
+        const stdGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
+        stdGrad.addColorStop(0, `${color}18`);
+        stdGrad.addColorStop(1, `${color}04`);
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, padTop + plotH);
+        pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+        ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
+        ctx.closePath();
+        ctx.fillStyle = stdGrad;
+        ctx.fill();
+        ctx.restore();
+
+        // Clean standard line
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.8;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 3;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.globalAlpha = 0.92;
+        ctx.beginPath();
+        pts.forEach((pt, i) => {
+          if (i === 0) ctx.moveTo(pt.x, pt.y);
+          else ctx.lineTo(pt.x, pt.y);
+        });
+        ctx.stroke();
+        ctx.restore();
+
+        // Rightmost edge dot
+        const last = pts[pts.length - 1];
+        ctx.save();
+        ctx.fillStyle = color;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 4;
+        ctx.beginPath();
+        ctx.arc(last.x, last.y, 2.2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    };
+
+    if (hasHover) {
+      // Draw non-hovered (dimmed) lines first
+      coreSeries
+        .filter((s) => s.idx !== activeHoverIndex)
+        .forEach((s) => renderSeriesLine(s, false, true));
+
+      // Draw active hovered (emphasized) line on top
+      const hoveredSeries = coreSeries.find((s) => s.idx === activeHoverIndex);
+      if (hoveredSeries) {
+        renderSeriesLine(hoveredSeries, true, false);
+      }
     } else {
-      // Subtle area fill under standard series line
-      ctx.save();
-      const stdGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-      stdGrad.addColorStop(0, `${color}18`);
-      stdGrad.addColorStop(1, `${color}04`);
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, padTop + plotH);
-      pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
-      ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
-      ctx.closePath();
-      ctx.fillStyle = stdGrad;
-      ctx.fill();
-      ctx.restore();
-
-      // Clean standard line
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.8;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 3;
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-      ctx.globalAlpha = 0.92;
-      ctx.beginPath();
-      pts.forEach((pt, i) => {
-        if (i === 0) ctx.moveTo(pt.x, pt.y);
-        else ctx.lineTo(pt.x, pt.y);
-      });
-      ctx.stroke();
-      ctx.restore();
-
-      // Rightmost edge dot
-      const last = pts[pts.length - 1];
-      ctx.save();
-      ctx.fillStyle = color;
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 4;
-      ctx.beginPath();
-      ctx.arc(last.x, last.y, 2.2, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
+      // Draw all lines cleanly
+      coreSeries.forEach((s) => renderSeriesLine(s, false, false));
     }
+
+    ctx.restore();
   };
 
-  if (hasHover) {
-    // Draw non-hovered (dimmed) lines first
-    coreSeries
-      .filter((s) => s.idx !== activeHoverIndex)
-      .forEach((s) => renderSeriesLine(s, false, true));
-
-    // Draw active hovered (emphasized) line on top
-    const hoveredSeries = coreSeries.find((s) => s.idx === activeHoverIndex);
-    if (hoveredSeries) {
-      renderSeriesLine(hoveredSeries, true, false);
+  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+    if (canvas._cpuRafId) {
+      window.cancelAnimationFrame(canvas._cpuRafId);
     }
+    canvas._cpuRafId = window.requestAnimationFrame(() => {
+      canvas._cpuRafId = null;
+      render();
+    });
   } else {
-    // Draw all lines cleanly
-    coreSeries.forEach((s) => renderSeriesLine(s, false, false));
+    render();
   }
+}
 
-  ctx.restore();
+let cpuCanvasResizeDebounceTimer = null;
+if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+  window.addEventListener("resize", () => {
+    if (cpuCanvasResizeDebounceTimer) clearTimeout(cpuCanvasResizeDebounceTimer);
+    cpuCanvasResizeDebounceTimer = setTimeout(() => {
+      const unifiedCanvas =
+        document.getElementById("cpu-cores-unified-canvas") ||
+        (document.querySelector && document.querySelector(".cpu-core-canvas"));
+      if (unifiedCanvas) {
+        unifiedCanvas._cachedWidth = null;
+        unifiedCanvas._cachedHeight = null;
+        if (typeof cpuCoresHistoryBuffers !== "undefined" && cpuCoresHistoryBuffers.length > 0) {
+          const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+          drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, typeof activeHoveredCoreIndex !== "undefined" ? activeHoveredCoreIndex : null);
+        }
+      }
+    }, 150);
+  });
 }
 
 /**
@@ -826,7 +899,7 @@ function renderSystemMetrics(system) {
   const cpuPercent = Number(system.cpu_percent) || 0;
   const cpuValEl = document.getElementById("cpu-percent-value");
   const cpuBarEl = document.getElementById("cpu-progress-bar");
-  if (cpuValEl) cpuValEl.textContent = `${cpuPercent.toFixed(1)}%`;
+  if (cpuValEl) setTextIfChanged(cpuValEl, `${cpuPercent.toFixed(1)}%`);
   updateProgressBar(cpuBarEl, cpuPercent);
 
   // CPU Cores Badge and Load Average
@@ -835,7 +908,7 @@ function renderSystemMetrics(system) {
     const logicalCores =
       system.cpu_count_logical ||
       (Array.isArray(system.cpu_cores) ? system.cpu_cores.length : 1);
-    cpuCoresBadge.textContent = `${logicalCores} ${logicalCores === 1 ? "Core" : "Cores"}`;
+    setTextIfChanged(cpuCoresBadge, `${logicalCores} ${logicalCores === 1 ? "Core" : "Cores"}`);
   }
 
   // CPU Package Temperature Badge
@@ -848,9 +921,9 @@ function renderSystemMetrics(system) {
   const cpuLoadEl = document.getElementById("cpu-load-detail");
   if (cpuLoadEl) {
     if (Array.isArray(system.load_avg) && system.load_avg.length > 0) {
-      cpuLoadEl.textContent = `Load avg: ${system.load_avg.map((v) => Number(v).toFixed(2)).join(", ")}`;
+      setTextIfChanged(cpuLoadEl, `Load avg: ${system.load_avg.map((v) => Number(v).toFixed(2)).join(", ")}`);
     } else {
-      cpuLoadEl.textContent = "Load avg: --";
+      setTextIfChanged(cpuLoadEl, "Load avg: --");
     }
   }
 
@@ -937,16 +1010,18 @@ function renderSystemMetrics(system) {
       if (!item) return;
 
       const labelEl = item.querySelector(".cpu-core-label");
-      if (labelEl) labelEl.textContent = `Core ${idx}`;
+      if (labelEl) setTextIfChanged(labelEl, `Core ${idx}`);
 
       const percentEl = item.querySelector(".cpu-core-percent");
-      if (percentEl) percentEl.textContent = `${cPercent.toFixed(1)}%`;
+      if (percentEl) setTextIfChanged(percentEl, `${cPercent.toFixed(1)}%`);
 
       const barEl = item.querySelector(".cpu-core-track .progress-fill");
       if (barEl) {
         const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
-        barEl.style.width = `${cPercent.toFixed(1)}%`;
-        barEl.style.backgroundColor = color;
+        setWidthIfChanged(barEl, cPercent.toFixed(1));
+        if (barEl.style.backgroundColor !== color) {
+          barEl.style.backgroundColor = color;
+        }
       }
     });
 
@@ -961,25 +1036,25 @@ function renderSystemMetrics(system) {
   const memValEl = document.getElementById("memory-percent-value");
   const memBarEl = document.getElementById("memory-progress-bar");
   const memDetailEl = document.getElementById("memory-detail");
-  if (memValEl) memValEl.textContent = `${memPercent.toFixed(1)}%`;
+  if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
   updateProgressBar(memBarEl, memPercent);
   if (memDetailEl) {
-    memDetailEl.textContent = `${formatBytes(mem.used)} / ${formatBytes(mem.total)} used (${formatBytes(mem.available)} avail)`;
+    setTextIfChanged(memDetailEl, `${formatBytes(mem.used)} / ${formatBytes(mem.total)} used (${formatBytes(mem.available)} avail)`);
   }
 
   // Memory breakdown chips
   const memTotalBadge = document.getElementById("memory-total-badge");
   if (memTotalBadge && mem.total) {
-    memTotalBadge.textContent = `${formatBytes(mem.total)} Total`;
+    setTextIfChanged(memTotalBadge, `${formatBytes(mem.total)} Total`);
   }
   const chipUsed = document.getElementById("memory-chip-used");
   const chipAvailable = document.getElementById("memory-chip-available");
   const chipCached = document.getElementById("memory-chip-cached");
   const chipFree = document.getElementById("memory-chip-free");
-  if (chipUsed) chipUsed.textContent = `In use: ${formatBytes(mem.used)}`;
-  if (chipAvailable) chipAvailable.textContent = `Available: ${formatBytes(mem.available || 0)}`;
-  if (chipCached) chipCached.textContent = `Cached: ${formatBytes(mem.cached || 0)}`;
-  if (chipFree) chipFree.textContent = `Free: ${formatBytes(mem.free || 0)}`;
+  if (chipUsed) setTextIfChanged(chipUsed, `In use: ${formatBytes(mem.used)}`);
+  if (chipAvailable) setTextIfChanged(chipAvailable, `Available: ${formatBytes(mem.available || 0)}`);
+  if (chipCached) setTextIfChanged(chipCached, `Cached: ${formatBytes(mem.cached || 0)}`);
+  if (chipFree) setTextIfChanged(chipFree, `Free: ${formatBytes(mem.free || 0)}`);
 
   // Memory rolling historical trend chart
   memoryHistoryBuffer.push(memPercent);
@@ -994,7 +1069,7 @@ function renderSystemMetrics(system) {
   const diskValEl = document.getElementById("disk-percent-value");
   const diskBarEl = document.getElementById("disk-progress-bar");
   const diskDetailEl = document.getElementById("disk-detail");
-  if (diskValEl) diskValEl.textContent = `${diskPercent.toFixed(1)}%`;
+  if (diskValEl) setTextIfChanged(diskValEl, `${diskPercent.toFixed(1)}%`);
   updateProgressBar(diskBarEl, diskPercent);
   if (diskDetailEl) {
     const usedFormatted = formatBytes(disk.used ?? disk.used_bytes);
@@ -1002,7 +1077,7 @@ function renderSystemMetrics(system) {
     const freeFormatted = formatBytes(disk.free ?? disk.free_bytes ?? disk.available);
     const mountLabel = disk.mount || disk.mount_path || disk.path;
     const prefix = mountLabel ? `[${mountLabel}] ` : "";
-    diskDetailEl.textContent = `${prefix}${usedFormatted} / ${totalFormatted} (${freeFormatted} free)`;
+    setTextIfChanged(diskDetailEl, `${prefix}${usedFormatted} / ${totalFormatted} (${freeFormatted} free)`);
   }
 
   // Uptime & Host Platform Telemetry
@@ -1012,28 +1087,28 @@ function renderSystemMetrics(system) {
   const uptimeValEl = document.getElementById("uptime-value");
   const bootDetailEl = document.getElementById("boot-time-detail");
   if (uptimeValEl) {
-    uptimeValEl.textContent = formatUptimeFromBoot(system.boot_time);
+    setTextIfChanged(uptimeValEl, formatUptimeFromBoot(system.boot_time));
   }
   if (bootDetailEl) {
-    bootDetailEl.textContent = `Booted: ${formatTimestampLocal(system.boot_time)}`;
+    setTextIfChanged(bootDetailEl, `Booted: ${formatTimestampLocal(system.boot_time)}`);
   }
   const uptimeLoadBadge = document.getElementById("uptime-load-badge");
   if (uptimeLoadBadge) {
     if (Array.isArray(system.load_avg) && system.load_avg.length > 0) {
-      uptimeLoadBadge.textContent = `Load: ${system.load_avg.map((v) => Number(v).toFixed(2)).join(", ")}`;
-      uptimeLoadBadge.style.display = "";
+      setTextIfChanged(uptimeLoadBadge, `Load: ${system.load_avg.map((v) => Number(v).toFixed(2)).join(", ")}`);
+      if (uptimeLoadBadge.style.display !== "") uptimeLoadBadge.style.display = "";
     } else {
-      uptimeLoadBadge.textContent = "Load: --";
+      setTextIfChanged(uptimeLoadBadge, "Load: --");
     }
   }
 
   const hostOsEl = document.getElementById("host-os-detail");
   if (hostOsEl) {
-    hostOsEl.textContent = system.os_distro || system.platform || "Linux";
+    setTextIfChanged(hostOsEl, system.os_distro || system.platform || "Linux");
   }
   const hostKernelEl = document.getElementById("host-kernel-detail");
   if (hostKernelEl) {
-    hostKernelEl.textContent = system.kernel || "--";
+    setTextIfChanged(hostKernelEl, system.kernel || "--");
   }
 
   // Network Telemetry
@@ -1054,12 +1129,12 @@ function renderSystemMetrics(system) {
     const typeLabel = primaryIface.adapter_type && primaryIface.adapter_type !== "virtual" && primaryIface.adapter_type !== "docker"
       ? ` (${primaryIface.adapter_type})`
       : "";
-    ifaceNameEl.textContent = `${rawName}${typeLabel}`;
+    setTextIfChanged(ifaceNameEl, `${rawName}${typeLabel}`);
   }
 
   const ifaceIpEl = document.getElementById("host-network-ip");
   if (ifaceIpEl) {
-    ifaceIpEl.textContent = primaryIface.ip || (primaryIface.interface ? "No IPv4" : "--");
+    setTextIfChanged(ifaceIpEl, primaryIface.ip || (primaryIface.interface ? "No IPv4" : "--"));
   }
 
   const rxBytes = Number(net.total_bytes_recv ?? primaryIface.bytes_recv) || 0;
@@ -1082,21 +1157,24 @@ function renderSystemMetrics(system) {
 
   const netRxEl = document.getElementById("host-network-rx");
   if (netRxEl) {
-    netRxEl.textContent =
-      rx_rate > 0 ? `${formatBytes(rxBytes)} (${formatBytes(rx_rate)}/s)` : formatBytes(rxBytes);
+    setTextIfChanged(
+      netRxEl,
+      rx_rate > 0 ? `${formatBytes(rxBytes)} (${formatBytes(rx_rate)}/s)` : formatBytes(rxBytes)
+    );
   }
 
   const netTxEl = document.getElementById("host-network-tx");
   if (netTxEl) {
-    netTxEl.textContent =
-      tx_rate > 0 ? `${formatBytes(txBytes)} (${formatBytes(tx_rate)}/s)` : formatBytes(txBytes);
+    setTextIfChanged(
+      netTxEl,
+      tx_rate > 0 ? `${formatBytes(txBytes)} (${formatBytes(tx_rate)}/s)` : formatBytes(txBytes)
+    );
   }
 
   const netStatusEl = document.getElementById("host-network-status");
   if (netStatusEl) {
     const isOnline = ifaces.some((i) => i.is_up) || (Number(net.total_bytes_recv) > 0);
-    netStatusEl.textContent = isOnline ? "CONNECTED" : "DISCONNECTED";
-    netStatusEl.className = `status-badge ${isOnline ? "status-ok" : "status-failed"}`;
+    setBadgeIfChanged(netStatusEl, null, `status-badge ${isOnline ? "status-ok" : "status-failed"}`, isOnline ? "CONNECTED" : "DISCONNECTED");
   }
 
   // Mounted Storage Volumes Mini-List on Overview Card 3 (if present and visible)
@@ -2044,16 +2122,16 @@ function renderRaidDetails(raid) {
       syncContainer.classList.remove("hidden");
       const asciiBar = generateAsciiProgressBar(syncInfo.percent, 12);
       if (syncLabel) {
-        syncLabel.textContent = `${syncInfo.action}: ${syncInfo.percent.toFixed(1)}% ${asciiBar}`;
+        setTextIfChanged(syncLabel, `${syncInfo.action}: ${syncInfo.percent.toFixed(1)}% ${asciiBar}`);
       }
       if (syncFill) {
-        syncFill.style.width = `${syncInfo.percent.toFixed(1)}%`;
+        setWidthIfChanged(syncFill, syncInfo.percent.toFixed(1));
       }
       if (syncEta) {
         let etaText = "";
         if (syncInfo.speed) etaText += `${syncInfo.speed} `;
         if (syncInfo.eta) etaText += `(ETA: ${syncInfo.eta})`;
-        syncEta.textContent = etaText.trim();
+        setTextIfChanged(syncEta, etaText.trim());
       }
     } else {
       syncContainer.classList.add("hidden");
@@ -2071,18 +2149,18 @@ function renderRaidDetails(raid) {
   const failedEl = document.getElementById("raid-failed-devices");
   const spareEl = document.getElementById("raid-spare-devices");
 
-  if (activeEl) activeEl.textContent = activeCount;
-  if (workingEl) workingEl.textContent = workingCount;
+  if (activeEl) setTextIfChanged(activeEl, activeCount);
+  if (workingEl) setTextIfChanged(workingEl, workingCount);
   if (failedEl) {
-    failedEl.textContent = failedCount;
+    setTextIfChanged(failedEl, failedCount);
     failedEl.classList.toggle("count-danger", Number(failedCount) > 0);
   }
-  if (spareEl) spareEl.textContent = spareCount;
+  if (spareEl) setTextIfChanged(spareEl, spareCount);
 
   // Details definition list
   const setField = (id, value) => {
     const el = document.getElementById(id);
-    if (el) el.textContent = value || "--";
+    if (el) setTextIfChanged(el, value || "--");
   };
 
   if (isNoRaid) {
@@ -2148,50 +2226,65 @@ function renderRaidDetails(raid) {
   const devices = Array.isArray(raid.devices) ? raid.devices : [];
   const disksBadge = document.getElementById("disks-count-badge");
   if (disksBadge) {
-    disksBadge.textContent = `${devices.length} ${devices.length === 1 ? "disk" : "disks"}`;
+    setTextIfChanged(disksBadge, `${devices.length} ${devices.length === 1 ? "disk" : "disks"}`);
   }
 
   const tbody = document.getElementById("active-disks-tbody");
   if (!tbody) return;
-  tbody.innerHTML = "";
 
   if (isNoRaid || devices.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 6;
-    td.className = "empty-state";
-    td.textContent = isNoRaid
+    const emptyText = isNoRaid
       ? "No RAID array configured or detected on this host"
       : "No active member disks detected";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
+    let emptyRow = tbody.querySelector ? tbody.querySelector("tr.empty-row, tr > td.empty-state") : null;
+    if (emptyRow) {
+      const td = emptyRow.tagName === "TD" ? emptyRow : (emptyRow.querySelector("td") || emptyRow.children[0]);
+      if (td) setTextIfChanged(td, emptyText);
+    } else {
+      tbody.innerHTML = "";
+      const tr = document.createElement("tr");
+      tr.className = "empty-row";
+      const td = document.createElement("td");
+      td.colSpan = 6;
+      td.className = "empty-state";
+      td.textContent = emptyText;
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+    }
     return;
   }
 
+  // Remove empty state row if present
+  const emptyCell = tbody.querySelector ? tbody.querySelector("td.empty-state") : null;
+  if (emptyCell && emptyCell.parentElement && emptyCell.parentElement.parentElement === tbody) {
+    tbody.removeChild(emptyCell.parentElement);
+  }
+
+  // Map existing device rows by data-device
+  const existingRows = new Map();
+  const childRows = Array.from(tbody.children || []);
+  childRows.forEach((row) => {
+    const devAttr = row.getAttribute ? row.getAttribute("data-device") : null;
+    if (devAttr) {
+      existingRows.set(devAttr, row);
+    }
+  });
+
+  const activeDeviceKeys = new Set();
+
   devices.forEach((item) => {
-    const tr = document.createElement("tr");
-
-    // 1. Device name with mono font
-    const tdDev = document.createElement("td");
-    tdDev.className = "mono-text";
     const rawDev = item.device || "unknown";
-    tdDev.textContent = rawDev;
-
-    // Resolve smart data from cache if present
     const cleanDev = rawDev.replace("/dev/", "");
+    activeDeviceKeys.add(cleanDev);
+
     const smartData =
       smartDisksCache[cleanDev] ||
       smartDisksCache[rawDev] ||
       smartDisksCache[`/dev/${cleanDev}`] ||
       {};
 
-    // 2. Model name
-    const tdModel = document.createElement("td");
-    tdModel.textContent = item.model || smartData.model || "Unknown";
+    const modelName = item.model || smartData.model || "Unknown";
 
-    // 3. State
-    const tdState = document.createElement("td");
-    const stateBadge = document.createElement("span");
     const stateStr = String(item.state || "unknown").toLowerCase();
     const isHealthy =
       stateStr.includes("active") ||
@@ -2201,21 +2294,15 @@ function renderRaidDetails(raid) {
       stateStr.includes("faulty") ||
       stateStr.includes("failed") ||
       stateStr.includes("removed");
-
-    stateBadge.className = `status-badge ${
+    const stateBadgeClass = `status-badge ${
       isFaulty
         ? "status-failed"
         : isHealthy
           ? "status-clean"
           : "status-degraded"
     }`;
-    stateBadge.textContent = item.state || "unknown";
-    tdState.appendChild(stateBadge);
+    const stateText = item.state || "unknown";
 
-    // 4. S.M.A.R.T. Health (clickable button/pill)
-    const tdSmart = document.createElement("td");
-    const smartBtn = document.createElement("button");
-    smartBtn.type = "button";
     const isPassed =
       item.passed === true ||
       smartData.passed === true ||
@@ -2236,14 +2323,9 @@ function renderRaidDetails(raid) {
     } else if (item.smart_status) {
       smartText = item.smart_status.toUpperCase();
     }
-    smartBtn.className = `smart-badge ${smartClass}`;
-    smartBtn.setAttribute("data-disk", cleanDev);
-    smartBtn.title = `View S.M.A.R.T. diagnostics for ${cleanDev}`;
-    smartBtn.textContent = smartText;
-    tdSmart.appendChild(smartBtn);
+    const fullSmartClass = `smart-badge ${smartClass}`;
+    const smartTitle = `View S.M.A.R.T. diagnostics for ${cleanDev}`;
 
-    // 5. Temperature badge
-    const tdTemp = document.createElement("td");
     const tempVal =
       item.temperature_c !== undefined && item.temperature_c !== null
         ? item.temperature_c
@@ -2252,23 +2334,6 @@ function renderRaidDetails(raid) {
           ? smartData.temperature_c
           : null;
 
-    if (tempVal !== null && tempVal !== undefined) {
-      const tempBadge = document.createElement("span");
-      const tempNum = Number(tempVal);
-      const tempClass =
-        tempNum > 60 ? "temp-crit" : tempNum > 50 ? "temp-warn" : "temp-ok";
-      tempBadge.className = `temp-badge ${tempClass}`;
-      tempBadge.textContent = `${tempNum}°C`;
-      tdTemp.appendChild(tempBadge);
-    } else {
-      const noTemp = document.createElement("span");
-      noTemp.className = "text-muted";
-      noTemp.textContent = "--";
-      tdTemp.appendChild(noTemp);
-    }
-
-    // 6. Slot / Role
-    const tdSlot = document.createElement("td");
     const slotRoleVal =
       item.slot !== undefined && item.slot !== null && item.slot !== ""
         ? item.slot === "-"
@@ -2281,15 +2346,110 @@ function renderRaidDetails(raid) {
               ? item.state.split(" ")[0]
               : "--") ||
           "--";
-    tdSlot.textContent = slotRoleVal;
 
-    tr.appendChild(tdDev);
-    tr.appendChild(tdModel);
-    tr.appendChild(tdState);
-    tr.appendChild(tdSmart);
-    tr.appendChild(tdTemp);
-    tr.appendChild(tdSlot);
-    tbody.appendChild(tr);
+    let tr = existingRows.get(cleanDev);
+    if (tr) {
+      // Reconcile existing row in-place
+      const cells = tr.children;
+      if (cells && cells.length >= 6) {
+        setTextIfChanged(cells[0], rawDev);
+        setTextIfChanged(cells[1], modelName);
+
+        const stBadge = cells[2].querySelector ? cells[2].querySelector(".status-badge") : cells[2].children[0];
+        setBadgeIfChanged(stBadge, null, stateBadgeClass, stateText);
+
+        const smBtn = cells[3].querySelector ? cells[3].querySelector("button.smart-badge") : cells[3].children[0];
+        if (smBtn) {
+          if (smBtn.className !== fullSmartClass) smBtn.className = fullSmartClass;
+          if (smBtn.getAttribute("data-disk") !== cleanDev) smBtn.setAttribute("data-disk", cleanDev);
+          if (smBtn.title !== smartTitle) smBtn.title = smartTitle;
+          setTextIfChanged(smBtn, smartText);
+        }
+
+        if (tempVal !== null && tempVal !== undefined) {
+          const tempNum = Number(tempVal);
+          const tempClass = tempNum > 60 ? "temp-badge temp-crit" : tempNum > 50 ? "temp-badge temp-warn" : "temp-badge temp-ok";
+          let tBadge = cells[4].querySelector ? cells[4].querySelector(".temp-badge") : null;
+          if (!tBadge) {
+            cells[4].innerHTML = "";
+            tBadge = document.createElement("span");
+            cells[4].appendChild(tBadge);
+          }
+          setBadgeIfChanged(tBadge, null, tempClass, `${tempNum}°C`);
+        } else {
+          let mutedSpan = cells[4].querySelector ? cells[4].querySelector(".text-muted") : null;
+          if (!mutedSpan) {
+            cells[4].innerHTML = "";
+            mutedSpan = document.createElement("span");
+            mutedSpan.className = "text-muted";
+            cells[4].appendChild(mutedSpan);
+          }
+          setTextIfChanged(mutedSpan, "--");
+        }
+
+        setTextIfChanged(cells[5], slotRoleVal);
+      }
+    } else {
+      // Create new keyed row
+      tr = document.createElement("tr");
+      tr.setAttribute("data-device", cleanDev);
+
+      const tdDev = document.createElement("td");
+      tdDev.className = "mono-text";
+      tdDev.textContent = rawDev;
+
+      const tdModel = document.createElement("td");
+      tdModel.textContent = modelName;
+
+      const tdState = document.createElement("td");
+      const stateBadge = document.createElement("span");
+      stateBadge.className = stateBadgeClass;
+      stateBadge.textContent = stateText;
+      tdState.appendChild(stateBadge);
+
+      const tdSmart = document.createElement("td");
+      const smartBtn = document.createElement("button");
+      smartBtn.type = "button";
+      smartBtn.className = fullSmartClass;
+      smartBtn.setAttribute("data-disk", cleanDev);
+      smartBtn.title = smartTitle;
+      smartBtn.textContent = smartText;
+      tdSmart.appendChild(smartBtn);
+
+      const tdTemp = document.createElement("td");
+      if (tempVal !== null && tempVal !== undefined) {
+        const tempBadge = document.createElement("span");
+        const tempNum = Number(tempVal);
+        const tempClass =
+          tempNum > 60 ? "temp-crit" : tempNum > 50 ? "temp-warn" : "temp-ok";
+        tempBadge.className = `temp-badge ${tempClass}`;
+        tempBadge.textContent = `${tempNum}°C`;
+        tdTemp.appendChild(tempBadge);
+      } else {
+        const noTemp = document.createElement("span");
+        noTemp.className = "text-muted";
+        noTemp.textContent = "--";
+        tdTemp.appendChild(noTemp);
+      }
+
+      const tdSlot = document.createElement("td");
+      tdSlot.textContent = slotRoleVal;
+
+      tr.appendChild(tdDev);
+      tr.appendChild(tdModel);
+      tr.appendChild(tdState);
+      tr.appendChild(tdSmart);
+      tr.appendChild(tdTemp);
+      tr.appendChild(tdSlot);
+      tbody.appendChild(tr);
+    }
+  });
+
+  // Remove detached device rows
+  existingRows.forEach((row, devKey) => {
+    if (!activeDeviceKeys.has(devKey) && row.parentElement === tbody) {
+      tbody.removeChild(row);
+    }
   });
 
   // Overview summary card
@@ -2300,18 +2460,18 @@ function renderRaidDetails(raid) {
   const overviewRaidSummary = document.getElementById("overview-raid-summary");
   if (overviewRaidSummary) {
     if (isNoRaid) {
-      overviewRaidSummary.textContent = "No RAID array configured or detected";
+      setTextIfChanged(overviewRaidSummary, "No RAID array configured or detected");
     } else if (syncInfo && ["resyncing", "recovering"].includes(status)) {
       const level = (raid.raid_level || "RAID").toUpperCase();
       const speedText = syncInfo.speed ? ` • ${syncInfo.speed}` : "";
       const etaText = syncInfo.eta ? ` (ETA: ${syncInfo.eta})` : "";
-      overviewRaidSummary.textContent = `${level} • ${syncInfo.action} ${syncInfo.percent.toFixed(1)}%${speedText}${etaText}`;
+      setTextIfChanged(overviewRaidSummary, `${level} • ${syncInfo.action} ${syncInfo.percent.toFixed(1)}%${speedText}${etaText}`);
     } else {
       const level = (raid.raid_level || "RAID").toUpperCase();
       const size = raid.array_size || "--";
       const act = raid.active_devices ?? 0;
       const tot = raid.working_devices ?? act;
-      overviewRaidSummary.textContent = `${level} • ${size} • ${act}/${tot} disks active`;
+      setTextIfChanged(overviewRaidSummary, `${level} • ${size} • ${act}/${tot} disks active`);
     }
   }
 }
@@ -2374,6 +2534,8 @@ function renderWeeklyNotificationState(notificationState) {
   }
 }
 
+let cachedNotificationHistorySig = null;
+
 /**
  * Render Notification History table from /api/history?limit=20 payload.
  */
@@ -2386,13 +2548,26 @@ function renderNotificationHistory(historyPayload) {
 
   const countBadge = document.getElementById("history-count-badge");
   if (countBadge) {
-    countBadge.textContent = `${records.length} ${records.length === 1 ? "record" : "records"}`;
+    setTextIfChanged(
+      countBadge,
+      `${records.length} ${records.length === 1 ? "record" : "records"}`
+    );
   }
 
   renderDrawerNotificationList(records);
 
   const tbody = document.getElementById("notification-history-tbody");
   if (!tbody) return;
+
+  const sig = records.length === 0
+    ? "__EMPTY__"
+    : `${records.length}::` + records.map((r) => `${r.id ?? ""}:${r.sent_at ?? ""}:${r.outcome ?? ""}:${r.status ?? ""}:${r.trigger ?? ""}:${r.channel ?? ""}`).join("|");
+
+  if (cachedNotificationHistorySig === sig && tbody.children && tbody.children.length > 0) {
+    return;
+  }
+  cachedNotificationHistorySig = sig;
+
   tbody.innerHTML = "";
 
   if (records.length === 0) {
@@ -2793,12 +2968,12 @@ function updateVersionBadge(versionInfo) {
 /**
  * Fetch both /api/status and /api/history?limit=20 and update the UI.
  */
-async function refreshDashboard() {
+async function refreshDashboard({ manual = false } = {}) {
   if (isFetching || !isAuthenticated) return;
   isFetching = true;
 
   const refreshBtn = document.getElementById("refresh-btn");
-  if (refreshBtn) refreshBtn.classList.add("loading");
+  if (manual && refreshBtn) refreshBtn.classList.add("loading");
 
   try {
     const [statusResp, historyResp] = await Promise.all([
@@ -2847,7 +3022,7 @@ async function refreshDashboard() {
 
     const lastUpdatedEl = document.getElementById("last-updated");
     if (lastUpdatedEl) {
-      lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      setTextIfChanged(lastUpdatedEl, `Updated ${new Date().toLocaleTimeString()}`);
     }
   } catch (err) {
     console.error("Dashboard refresh error:", err);
@@ -2856,7 +3031,7 @@ async function refreshDashboard() {
     );
   } finally {
     isFetching = false;
-    if (refreshBtn) refreshBtn.classList.remove("loading");
+    if (manual && refreshBtn) refreshBtn.classList.remove("loading");
   }
 }
 
@@ -3149,12 +3324,9 @@ function handleSSETelemetry(data) {
   if (!Number.isNaN(cpuPercent)) {
     const cpuValEl = document.getElementById("cpu-percent-value");
     const cpuBarEl = document.getElementById("cpu-progress-bar");
-    if (cpuValEl) cpuValEl.textContent = `${cpuPercent.toFixed(1)}%`;
-    if (cpuBarEl) {
-      cpuBarEl.style.width = `${Math.min(100, Math.max(0, cpuPercent)).toFixed(1)}%`;
-      if (typeof updateProgressBar === "function") {
-        updateProgressBar(cpuBarEl, cpuPercent);
-      }
+    if (cpuValEl) setTextIfChanged(cpuValEl, `${cpuPercent.toFixed(1)}%`);
+    if (cpuBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(cpuBarEl, cpuPercent);
     }
   }
 
@@ -3163,7 +3335,7 @@ function handleSSETelemetry(data) {
   if (Array.isArray(cores) && cores.length > 0) {
     const cpuCoresBadge = document.getElementById("cpu-cores-badge");
     if (cpuCoresBadge) {
-      cpuCoresBadge.textContent = `${cores.length} ${cores.length === 1 ? "Core" : "Cores"}`;
+      setTextIfChanged(cpuCoresBadge, `${cores.length} ${cores.length === 1 ? "Core" : "Cores"}`);
     }
     const coresGrid = document.getElementById("cpu-cores-grid");
     if (coresGrid) {
@@ -3173,9 +3345,9 @@ function handleSSETelemetry(data) {
         if (item) {
           const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
           const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
-          if (pctEl) pctEl.textContent = `${cPercent.toFixed(1)}%`;
+          if (pctEl) setTextIfChanged(pctEl, `${cPercent.toFixed(1)}%`);
           const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
-          if (fillEl) fillEl.style.width = `${cPercent.toFixed(1)}%`;
+          if (fillEl) setWidthIfChanged(fillEl, cPercent.toFixed(1));
         }
       });
     }
@@ -3186,7 +3358,7 @@ function handleSSETelemetry(data) {
   if (Array.isArray(loadAvg) && loadAvg.length > 0) {
     const cpuLoadEl = document.getElementById("cpu-load-detail");
     if (cpuLoadEl) {
-      cpuLoadEl.textContent = `Load avg: ${loadAvg.map((v) => Number(v).toFixed(2)).join(", ")}`;
+      setTextIfChanged(cpuLoadEl, `Load avg: ${loadAvg.map((v) => Number(v).toFixed(2)).join(", ")}`);
     }
   }
 
@@ -3198,14 +3370,12 @@ function handleSSETelemetry(data) {
       if (badge) {
         const num = parseFloat(thermalVal);
         if (!isNaN(num)) {
-          badge.textContent = `${num.toFixed(0)}°C`;
-          badge.classList.remove("temp-ok", "temp-warn", "temp-crit", "temp-hot", "temp-warm", "temp-cool");
-          if (num >= 80) {
-            badge.classList.add("temp-crit", "temp-hot");
-          } else if (num >= 60) {
-            badge.classList.add("temp-warn", "temp-warm");
-          } else {
-            badge.classList.add("temp-ok", "temp-cool");
+          setTextIfChanged(badge, `${num.toFixed(0)}°C`);
+          const isCrit = num >= 80;
+          const isWarn = !isCrit && num >= 60;
+          const targetClass = `status-badge ${isCrit ? "temp-badge temp-crit temp-hot" : isWarn ? "temp-badge temp-warn temp-warm" : "temp-badge temp-ok temp-cool"}`;
+          if (badge.className !== targetClass) {
+            badge.className = targetClass;
           }
         }
       }
@@ -3222,12 +3392,9 @@ function handleSSETelemetry(data) {
   if (!Number.isNaN(memPercent)) {
     const memValEl = document.getElementById("memory-percent-value");
     const memBarEl = document.getElementById("memory-progress-bar");
-    if (memValEl) memValEl.textContent = `${memPercent.toFixed(1)}%`;
-    if (memBarEl) {
-      memBarEl.style.width = `${Math.min(100, Math.max(0, memPercent)).toFixed(1)}%`;
-      if (typeof updateProgressBar === "function") {
-        updateProgressBar(memBarEl, memPercent);
-      }
+    if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
+    if (memBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(memBarEl, memPercent);
     }
   }
   if (mem.used !== undefined || mem.used_gb !== undefined || mem.total !== undefined || mem.total_gb !== undefined) {
@@ -3236,32 +3403,35 @@ function handleSSETelemetry(data) {
       const usedStr = mem.used !== undefined ? formatBytes(mem.used) : (mem.used_gb !== undefined ? `${Number(mem.used_gb).toFixed(1)} GB` : "--");
       const totalStr = mem.total !== undefined ? formatBytes(mem.total) : (mem.total_gb !== undefined ? `${Number(mem.total_gb).toFixed(1)} GB` : "--");
       const availStr = mem.available !== undefined ? formatBytes(mem.available) : "";
-      memDetailEl.textContent = availStr
-        ? `${usedStr} / ${totalStr} used (${availStr} avail)`
-        : `${usedStr} / ${totalStr} used`;
+      setTextIfChanged(
+        memDetailEl,
+        availStr
+          ? `${usedStr} / ${totalStr} used (${availStr} avail)`
+          : `${usedStr} / ${totalStr} used`
+      );
     }
   }
   if (mem.total !== undefined || mem.total_gb !== undefined) {
     const memTotalBadge = document.getElementById("memory-total-badge");
     if (memTotalBadge) {
-      memTotalBadge.textContent = mem.total !== undefined ? `${formatBytes(mem.total)} Total` : `${Number(mem.total_gb).toFixed(1)} GB Total`;
+      setTextIfChanged(memTotalBadge, mem.total !== undefined ? `${formatBytes(mem.total)} Total` : `${Number(mem.total_gb).toFixed(1)} GB Total`);
     }
   }
   const chipUsed = document.getElementById("memory-chip-used");
   if (chipUsed && (mem.used !== undefined || mem.used_gb !== undefined)) {
-    chipUsed.textContent = `In use: ${mem.used !== undefined ? formatBytes(mem.used) : `${Number(mem.used_gb).toFixed(1)} GB`}`;
+    setTextIfChanged(chipUsed, `In use: ${mem.used !== undefined ? formatBytes(mem.used) : `${Number(mem.used_gb).toFixed(1)} GB`}`);
   }
   const chipAvail = document.getElementById("memory-chip-available");
   if (chipAvail && mem.available !== undefined) {
-    chipAvail.textContent = `Available: ${formatBytes(mem.available)}`;
+    setTextIfChanged(chipAvail, `Available: ${formatBytes(mem.available)}`);
   }
   const chipCached = document.getElementById("memory-chip-cached");
   if (chipCached && mem.cached !== undefined) {
-    chipCached.textContent = `Cached: ${formatBytes(mem.cached)}`;
+    setTextIfChanged(chipCached, `Cached: ${formatBytes(mem.cached)}`);
   }
   const chipFree = document.getElementById("memory-chip-free");
   if (chipFree && mem.free !== undefined) {
-    chipFree.textContent = `Free: ${formatBytes(mem.free)}`;
+    setTextIfChanged(chipFree, `Free: ${formatBytes(mem.free)}`);
   }
 
   // 3. Disk Telemetry
@@ -3272,12 +3442,9 @@ function handleSSETelemetry(data) {
   if (!Number.isNaN(diskPercent)) {
     const diskValEl = document.getElementById("disk-percent-value");
     const diskBarEl = document.getElementById("disk-progress-bar");
-    if (diskValEl) diskValEl.textContent = `${diskPercent.toFixed(1)}%`;
-    if (diskBarEl) {
-      diskBarEl.style.width = `${Math.min(100, Math.max(0, diskPercent)).toFixed(1)}%`;
-      if (typeof updateProgressBar === "function") {
-        updateProgressBar(diskBarEl, diskPercent);
-      }
+    if (diskValEl) setTextIfChanged(diskValEl, `${diskPercent.toFixed(1)}%`);
+    if (diskBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(diskBarEl, diskPercent);
     }
   }
   if (disk.used !== undefined || disk.used_gb !== undefined || disk.total !== undefined || disk.total_gb !== undefined) {
@@ -3286,16 +3453,19 @@ function handleSSETelemetry(data) {
       const usedStr = disk.used !== undefined ? formatBytes(disk.used) : (disk.used_gb !== undefined ? `${Number(disk.used_gb).toFixed(1)} GB` : "--");
       const totalStr = disk.total !== undefined ? formatBytes(disk.total) : (disk.total_gb !== undefined ? `${Number(disk.total_gb).toFixed(1)} GB` : "--");
       const freeStr = disk.free !== undefined ? formatBytes(disk.free) : (disk.free_gb !== undefined ? `${Number(disk.free_gb).toFixed(1)} GB free` : "");
-      diskDetailEl.textContent = freeStr
-        ? `${usedStr} / ${totalStr} (${freeStr} free)`
-        : `${usedStr} / ${totalStr}`;
+      setTextIfChanged(
+        diskDetailEl,
+        freeStr
+          ? `${usedStr} / ${totalStr} (${freeStr} free)`
+          : `${usedStr} / ${totalStr}`
+      );
     }
   }
 
   // 4. Update Header Timestamp
   const lastUpdatedEl = document.getElementById("last-updated");
   if (lastUpdatedEl) {
-    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    setTextIfChanged(lastUpdatedEl, `Updated ${new Date().toLocaleTimeString()}`);
   }
 }
 
@@ -3557,10 +3727,10 @@ const initSSEConnection = initSSEStream;
 function setModuleLastUpdated(moduleName) {
   const el = document.getElementById(`${moduleName}-last-updated`);
   if (el) {
-    el.textContent = `Updated ${formatTimeOnly(new Date())}`;
+    setTextIfChanged(el, `Updated ${formatTimeOnly(new Date())}`);
   }
   const btn = document.getElementById(`refresh-${moduleName}-btn`);
-  if (btn) {
+  if (btn && btn.classList.contains("loading")) {
     btn.classList.remove("loading");
   }
 }
@@ -4349,7 +4519,7 @@ function handleManualRefresh() {
       // Fall back to HTTP refresh below if send fails
     }
   }
-  refreshDashboard();
+  refreshDashboard({ manual: true });
   if (currentViewTab === "containers") {
     fetchDockerStatus();
     refreshDockerSubtab(currentDockerSubtab);
@@ -5652,14 +5822,16 @@ function renderNotificationCenterConfig(config) {
 
   const overviewDiscordBadge = document.getElementById("overview-discord-badge");
   if (overviewDiscordBadge) {
-    overviewDiscordBadge.className = `status-badge ${discordEnabled ? "status-clean" : "status-degraded"}`;
-    overviewDiscordBadge.textContent = discordEnabled ? "ACTIVE" : "DISABLED";
+    const targetClass = `status-badge ${discordEnabled ? "status-clean" : "status-degraded"}`;
+    const targetText = discordEnabled ? "ACTIVE" : "DISABLED";
+    setBadgeIfChanged(overviewDiscordBadge, null, targetClass, targetText);
   }
   const overviewDiscordSummary = document.getElementById("overview-discord-summary");
   if (overviewDiscordSummary) {
-    overviewDiscordSummary.textContent = discordEnabled
+    const targetText = discordEnabled
       ? `Active Discord alerts channel: ${channelId || "configured"}`
       : "Discord notifications are currently disabled";
+    setTextIfChanged(overviewDiscordSummary, targetText);
   }
 
   // 2. Telegram Channel
@@ -6616,18 +6788,15 @@ function renderServicesSummary(summary) {
   const summaryEl = document.getElementById("overview-services-summary");
   if (badge) {
     if (failed > 0) {
-      badge.textContent = `${failed} FAILED`;
-      badge.className = "status-badge status-danger";
+      setBadgeIfChanged(badge, null, "status-badge status-danger", `${failed} FAILED`);
     } else if (running > 0) {
-      badge.textContent = "ACTIVE";
-      badge.className = "status-badge status-ok";
+      setBadgeIfChanged(badge, null, "status-badge status-ok", "ACTIVE");
     } else {
-      badge.textContent = "OK";
-      badge.className = "status-badge status-ok";
+      setBadgeIfChanged(badge, null, "status-badge status-ok", "OK");
     }
   }
   if (summaryEl) {
-    summaryEl.textContent = `${running} Running, ${failed} Failed`;
+    setTextIfChanged(summaryEl, `${running} Running, ${failed} Failed`);
   }
 }
 
@@ -7947,21 +8116,20 @@ function renderDockerStatus(data) {
   // Overview summary card
   const overviewDockerBadge = document.getElementById("overview-docker-badge");
   if (overviewDockerBadge) {
-    overviewDockerBadge.className = "status-badge";
+    let targetClass = "status-badge status-clean";
+    let targetText = "RUNNING";
     if (!data.installed) {
-      overviewDockerBadge.classList.add("status-failed");
-      overviewDockerBadge.textContent = "NOT INSTALLED";
+      targetClass = "status-badge status-failed";
+      targetText = "NOT INSTALLED";
     } else if (!data.running) {
-      overviewDockerBadge.classList.add("status-degraded");
-      overviewDockerBadge.textContent = "STOPPED";
-    } else {
-      overviewDockerBadge.classList.add("status-clean");
-      overviewDockerBadge.textContent = "RUNNING";
+      targetClass = "status-badge status-degraded";
+      targetText = "STOPPED";
     }
+    setBadgeIfChanged(overviewDockerBadge, null, targetClass, targetText);
   }
   const overviewDockerSummary = document.getElementById("overview-docker-summary");
   if (overviewDockerSummary) {
-    overviewDockerSummary.textContent = `${runningCount}/${containersCount} containers running • ${stacksCount} stacks`;
+    setTextIfChanged(overviewDockerSummary, `${runningCount}/${containersCount} containers running • ${stacksCount} stacks`);
   }
 
   // Subtab badges
@@ -12465,24 +12633,20 @@ function renderPackagesOverviewRibbon(rebootStatus, updatesData) {
 
   if (badge && summary) {
     if (rebootRequired) {
-      badge.textContent = "REBOOT REQ";
-      badge.className = "status-badge status-danger";
+      setBadgeIfChanged(badge, null, "status-badge status-danger", "REBOOT REQ");
       const pkgCount = rebootStatus.packages?.length || 0;
-      summary.textContent = pkgCount > 0 ? `${pkgCount} package(s) require reboot` : "System restart required";
+      setTextIfChanged(summary, pkgCount > 0 ? `${pkgCount} package(s) require reboot` : "System restart required");
     } else if (totalUpdates > 0) {
       if (securityUpdates > 0) {
-        badge.textContent = `${totalUpdates} UPDATES`;
-        badge.className = "status-badge status-danger";
-        summary.textContent = `${securityUpdates} security, ${standardUpdates} standard`;
+        setBadgeIfChanged(badge, null, "status-badge status-danger", `${totalUpdates} UPDATES`);
+        setTextIfChanged(summary, `${securityUpdates} security, ${standardUpdates} standard`);
       } else {
-        badge.textContent = `${totalUpdates} UPDATES`;
-        badge.className = "status-badge status-warn";
-        summary.textContent = `${standardUpdates} update(s) available`;
+        setBadgeIfChanged(badge, null, "status-badge status-warn", `${totalUpdates} UPDATES`);
+        setTextIfChanged(summary, `${standardUpdates} update(s) available`);
       }
     } else {
-      badge.textContent = "CLEAN";
-      badge.className = "status-badge status-ok";
-      summary.textContent = "0 updates, system clean";
+      setBadgeIfChanged(badge, null, "status-badge status-ok", "CLEAN");
+      setTextIfChanged(summary, "0 updates, system clean");
     }
   }
 
