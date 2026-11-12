@@ -120,6 +120,81 @@ let lastDockerUpdatesRenderKey = "";
 let lastSystemNetSample = null;
 
 /**
+ * Global Reactive Live Store with Pub/Sub (VigilLiveStore)
+ */
+const VigilLiveStore = (function () {
+  const state = {
+    telemetry: null,
+    system: null,
+    docker: null,
+    raid: null,
+    notifications: null,
+    probes: null,
+    connection: "disconnected",
+  };
+  const listeners = new Map(); // slice -> Set<Function>
+
+  function subscribe(slice, callback) {
+    if (typeof callback !== "function") return () => {};
+    if (!listeners.has(slice)) {
+      listeners.set(slice, new Set());
+    }
+    listeners.get(slice).add(callback);
+    // Immediately replay current state for this slice if present
+    const currentVal = slice === "*" ? state : state[slice];
+    if (currentVal !== null && currentVal !== undefined) {
+      try {
+        callback(currentVal);
+      } catch (err) {
+        console.error(`Error in VigilLiveStore immediate subscriber for '${slice}':`, err);
+      }
+    }
+    return () => {
+      const set = listeners.get(slice);
+      if (set) set.delete(callback);
+    };
+  }
+
+  function getState(slice) {
+    return slice ? state[slice] : state;
+  }
+
+  function dispatch(slice, data) {
+    if (!slice) return;
+    state[slice] = data;
+    const directListeners = listeners.get(slice);
+    if (directListeners) {
+      directListeners.forEach((cb) => {
+        try {
+          cb(data);
+        } catch (err) {
+          console.error(`Error in VigilLiveStore listener for '${slice}':`, err);
+        }
+      });
+    }
+    const wildcardListeners = listeners.get("*");
+    if (wildcardListeners) {
+      wildcardListeners.forEach((cb) => {
+        try {
+          cb(slice, data);
+        } catch (err) {
+          console.error("Error in VigilLiveStore wildcard listener:", err);
+        }
+      });
+    }
+  }
+
+  return { subscribe, getState, dispatch };
+})();
+
+if (typeof window !== "undefined") {
+  window.VigilLiveStore = VigilLiveStore;
+}
+if (typeof globalThis !== "undefined") {
+  globalThis.VigilLiveStore = VigilLiveStore;
+}
+
+/**
  * Retrieve stored session token if present.
  */
 function getStoredToken() {
@@ -549,7 +624,7 @@ function renderMemoryHistoryChart(history) {
  * Renders multiple core series simultaneously with vibrant colors and interactive hover focus.
  */
 function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null) {
-  if (!canvas) return;
+  if (!canvas || typeof canvas.getContext !== "function") return;
 
   const render = () => {
     const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
@@ -2970,6 +3045,10 @@ function updateVersionBadge(versionInfo) {
  */
 async function refreshDashboard({ manual = false } = {}) {
   if (isFetching || !isAuthenticated) return;
+  const isLive = sseConnected || (typeof VigilLiveStore !== "undefined" && VigilLiveStore.getState("connection") === "live");
+  if (!manual && isLive) {
+    return;
+  }
   isFetching = true;
 
   const refreshBtn = document.getElementById("refresh-btn");
@@ -3060,11 +3139,14 @@ function stopPolling() {
 
 function startPolling({ immediate = true } = {}) {
   stopPolling();
+  const isLive = sseConnected || (typeof VigilLiveStore !== "undefined" && VigilLiveStore.getState("connection") === "live");
+  if (isLive) {
+    return;
+  }
   if (immediate) {
     refreshDashboard();
   }
-  const interval = sseConnected ? SSE_ADAPTIVE_POLL_INTERVAL_MS : AUTO_REFRESH_INTERVAL_MS;
-  refreshTimerId = window.setInterval(refreshDashboard, interval);
+  refreshTimerId = window.setInterval(refreshDashboard, AUTO_REFRESH_INTERVAL_MS);
 }
 
 function pollSystemStatus() {
@@ -3081,11 +3163,12 @@ function pollDockerUpdates() {
 }
 
 function adjustAdaptivePolling(isSSEActive) {
-  if (refreshTimerId) {
-    window.clearInterval(refreshTimerId);
+  if (isSSEActive) {
+    stopPolling();
+  } else {
+    stopPolling();
+    refreshTimerId = window.setInterval(refreshDashboard, AUTO_REFRESH_INTERVAL_MS);
   }
-  const interval = isSSEActive ? SSE_ADAPTIVE_POLL_INTERVAL_MS : AUTO_REFRESH_INTERVAL_MS;
-  refreshTimerId = window.setInterval(refreshDashboard, interval);
 }
 
 /**
@@ -3168,6 +3251,9 @@ function closeSSEStream() {
     sseSource = null;
   }
   sseConnected = false;
+  if (typeof VigilLiveStore !== "undefined") {
+    VigilLiveStore.dispatch("connection", "disconnected");
+  }
 }
 
 const closeSSEConnection = closeSSEStream;
@@ -3337,18 +3423,131 @@ function handleSSETelemetry(data) {
     if (cpuCoresBadge) {
       setTextIfChanged(cpuCoresBadge, `${cores.length} ${cores.length === 1 ? "Core" : "Cores"}`);
     }
+
+    while (cpuCoresHistoryBuffers.length < cores.length) {
+      cpuCoresHistoryBuffers.push([]);
+    }
+    if (cpuCoresHistoryBuffers.length > cores.length) {
+      cpuCoresHistoryBuffers.length = cores.length;
+    }
+
     const coresGrid = document.getElementById("cpu-cores-grid");
+    const currentCoreValues = [];
     if (coresGrid) {
-      const items = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+      let items = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+      if (items.length !== cores.length) {
+        coresGrid.innerHTML = cores
+          .map((_, idx) => {
+            const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+            return `
+          <div class="cpu-core-item" data-core-idx="${idx}" title="Core ${idx}">
+            <div class="cpu-core-header">
+              <div class="cpu-core-legend-info">
+                <span class="cpu-core-color-dot" style="background-color: ${color};"></span>
+                <span class="cpu-core-label">Core ${idx}</span>
+              </div>
+              <span class="cpu-core-percent mono-text">0.0%</span>
+            </div>
+            <div class="progress-track cpu-core-track">
+              <div class="progress-fill" style="width: 0%; background-color: ${color};"></div>
+            </div>
+          </div>
+        `;
+          })
+          .join("");
+        items = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+
+        items.forEach((item) => {
+          const idx = parseInt(item.getAttribute("data-core-idx"), 10);
+          item.addEventListener("mouseenter", () => {
+            activeHoveredCoreIndex = idx;
+            const allChips = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+            allChips.forEach((chip, cIdx) => {
+              chip.classList.toggle("is-hovered", cIdx === idx);
+              chip.classList.toggle("is-dimmed", cIdx !== idx);
+            });
+            const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+            const unifiedCanvas =
+              document.getElementById("cpu-cores-unified-canvas") ||
+              document.querySelector(".cpu-core-canvas");
+            if (unifiedCanvas && typeof drawCpuCoreGraph === "function") {
+              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, activeHoveredCoreIndex);
+            }
+          });
+          item.addEventListener("mouseleave", () => {
+            activeHoveredCoreIndex = null;
+            const allChips = coresGrid.querySelectorAll ? coresGrid.querySelectorAll(".cpu-core-item") : [];
+            allChips.forEach((chip) => {
+              chip.classList.remove("is-hovered", "is-dimmed");
+            });
+            const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+            const unifiedCanvas =
+              document.getElementById("cpu-cores-unified-canvas") ||
+              document.querySelector(".cpu-core-canvas");
+            if (unifiedCanvas && typeof drawCpuCoreGraph === "function") {
+              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, null);
+            }
+          });
+        });
+      }
+
       cores.forEach((coreVal, idx) => {
+        const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
+        currentCoreValues.push(cPercent);
+        if (!cpuCoresHistoryBuffers[idx]) {
+          cpuCoresHistoryBuffers[idx] = [];
+        }
+        const buf = cpuCoresHistoryBuffers[idx];
+        buf.push(cPercent);
+        if (buf.length > CPU_CORE_HISTORY_LIMIT) {
+          buf.shift();
+        }
+
         const item = items[idx];
         if (item) {
-          const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
           const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
           if (pctEl) setTextIfChanged(pctEl, `${cPercent.toFixed(1)}%`);
           const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
-          if (fillEl) setWidthIfChanged(fillEl, cPercent.toFixed(1));
+          if (fillEl) {
+            const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+            setWidthIfChanged(fillEl, cPercent.toFixed(1));
+            if (fillEl.style && fillEl.style.backgroundColor !== color) {
+              fillEl.style.backgroundColor = color;
+            }
+          }
         }
+      });
+    } else {
+      cores.forEach((coreVal, idx) => {
+        const cPercent = Math.max(0, Math.min(100, Number(coreVal) || 0));
+        currentCoreValues.push(cPercent);
+        if (!cpuCoresHistoryBuffers[idx]) {
+          cpuCoresHistoryBuffers[idx] = [];
+        }
+        const buf = cpuCoresHistoryBuffers[idx];
+        buf.push(cPercent);
+        if (buf.length > CPU_CORE_HISTORY_LIMIT) {
+          buf.shift();
+        }
+      });
+    }
+
+    const unifiedCanvas =
+      document.getElementById("cpu-cores-unified-canvas") ||
+      document.querySelector(".cpu-core-canvas");
+    if (unifiedCanvas && typeof unifiedCanvas.getContext === "function" && typeof drawCpuCoreGraph === "function") {
+      const rAF = typeof window !== "undefined" && window.requestAnimationFrame
+        ? window.requestAnimationFrame
+        : typeof requestAnimationFrame === "function"
+          ? requestAnimationFrame
+          : (cb) => cb();
+      rAF(() => {
+        drawCpuCoreGraph(
+          unifiedCanvas,
+          cpuCoresHistoryBuffers,
+          currentCoreValues,
+          typeof activeHoveredCoreIndex !== "undefined" ? activeHoveredCoreIndex : null
+        );
       });
     }
   }
@@ -3395,6 +3594,15 @@ function handleSSETelemetry(data) {
     if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
     if (memBarEl && typeof updateProgressBar === "function") {
       updateProgressBar(memBarEl, memPercent);
+    }
+
+    // Memory rolling historical trend chart
+    memoryHistoryBuffer.push(memPercent);
+    if (memoryHistoryBuffer.length > MEMORY_HISTORY_LIMIT) {
+      memoryHistoryBuffer.shift();
+    }
+    if (typeof renderMemoryHistoryChart === "function") {
+      renderMemoryHistoryChart(memoryHistoryBuffer);
     }
   }
   if (mem.used !== undefined || mem.used_gb !== undefined || mem.total !== undefined || mem.total_gb !== undefined) {
@@ -3467,6 +3675,12 @@ function handleSSETelemetry(data) {
   if (lastUpdatedEl) {
     setTextIfChanged(lastUpdatedEl, `Updated ${new Date().toLocaleTimeString()}`);
   }
+}
+
+if (typeof VigilLiveStore !== "undefined") {
+  VigilLiveStore.subscribe("telemetry", (data) => {
+    handleSSETelemetry(data);
+  });
 }
 
 /**
@@ -3650,6 +3864,9 @@ function initSSEStream() {
   sseSource.onopen = () => {
     sseConnected = true;
     sseRetryCount = 0;
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("connection", "live");
+    }
     updateConnectionIndicator("live");
     adjustAdaptivePolling(true);
   };
@@ -3657,6 +3874,9 @@ function initSSEStream() {
   sseSource.onerror = () => {
     sseConnected = false;
     sseRetryCount += 1;
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("connection", "reconnecting");
+    }
     updateConnectionIndicator("reconnecting");
     adjustAdaptivePolling(false);
   };
@@ -3665,6 +3885,14 @@ function initSSEStream() {
     try {
       const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
       if (!data || typeof data !== "object") return;
+      if (typeof VigilLiveStore !== "undefined") {
+        VigilLiveStore.dispatch("snapshot", data);
+        if (data.system) VigilLiveStore.dispatch("system", data.system);
+        if (data.docker) VigilLiveStore.dispatch("docker", data.docker);
+        if (data.raid) VigilLiveStore.dispatch("raid", data.raid);
+        if (data.notifications || data.history) VigilLiveStore.dispatch("notifications", data.notifications || data.history);
+        if (data.telemetry) VigilLiveStore.dispatch("telemetry", data.telemetry);
+      }
       handleSSESnapshot(data);
     } catch (err) {
       console.warn("Failed to parse SSE snapshot payload:", err);
@@ -3675,7 +3903,11 @@ function initSSEStream() {
     try {
       const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
       if (!data || typeof data !== "object") return;
-      handleSSETelemetry(data);
+      if (typeof VigilLiveStore !== "undefined") {
+        VigilLiveStore.dispatch("telemetry", data);
+      } else {
+        handleSSETelemetry(data);
+      }
     } catch (err) {
       console.warn("Failed to parse SSE telemetry payload:", err);
     }
@@ -3685,6 +3917,9 @@ function initSSEStream() {
     try {
       const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
       if (!data || typeof data !== "object") return;
+      if (typeof VigilLiveStore !== "undefined") {
+        VigilLiveStore.dispatch("docker", data.docker || data);
+      }
       handleSSEDockerEvent(data);
     } catch (err) {
       console.warn("Failed to parse SSE docker_event payload:", err);
@@ -3695,6 +3930,13 @@ function initSSEStream() {
     try {
       const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
       if (!data || typeof data !== "object") return;
+      if (typeof VigilLiveStore !== "undefined") {
+        if (data.module) VigilLiveStore.dispatch(data.module, data);
+        if (data.module === "raid" || data.raid) VigilLiveStore.dispatch("raid", data.raid || data);
+        if (data.module === "system" || data.system) VigilLiveStore.dispatch("system", data.system || data);
+        if (data.module === "docker" || data.module === "containers" || data.docker) VigilLiveStore.dispatch("docker", data.docker || data);
+        if (data.module === "notifications" || data.history) VigilLiveStore.dispatch("notifications", data.history || data);
+      }
       handleSSEModuleUpdate(data);
     } catch (err) {
       console.warn("Failed to parse SSE module_update payload:", err);
@@ -3705,6 +3947,9 @@ function initSSEStream() {
     try {
       const data = typeof e.data === "string" ? JSON.parse(e.data) : e.data;
       if (!data || typeof data !== "object") return;
+      if (typeof VigilLiveStore !== "undefined") {
+        VigilLiveStore.dispatch("notifications", data);
+      }
       handleSSENotification(data);
     } catch (err) {
       console.warn("Failed to parse SSE notification payload:", err);
@@ -4182,12 +4427,26 @@ function handleWebSocketMessage(rawData) {
     return;
   }
 
+  if (msg.type === "telemetry" || msg.telemetry) {
+    const telem = msg.telemetry || msg;
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("telemetry", telem);
+    } else {
+      handleSSETelemetry(telem);
+    }
+  }
+
   if (msg.type === "module_update") {
+    if (typeof VigilLiveStore !== "undefined" && msg.module) {
+      VigilLiveStore.dispatch(msg.module, msg);
+    }
     if (msg.system || msg.module === "system") {
+      if (typeof VigilLiveStore !== "undefined") VigilLiveStore.dispatch("system", msg.system || msg);
       renderSystemMetrics(msg.system);
       setModuleLastUpdated("system");
     }
     if (msg.raid || msg.module === "raid") {
+      if (typeof VigilLiveStore !== "undefined") VigilLiveStore.dispatch("raid", msg.raid || msg);
       renderRaidDetails(msg.raid);
       setModuleLastUpdated("raid");
       const isAdaptive =
@@ -4203,6 +4462,7 @@ function handleWebSocketMessage(rawData) {
       msg.history ||
       msg.module === "notifications"
     ) {
+      if (typeof VigilLiveStore !== "undefined") VigilLiveStore.dispatch("notifications", msg.history || msg);
       if ("notification_state" in msg) {
         renderWeeklyNotificationState(msg.notification_state ?? null);
       }
@@ -4215,6 +4475,7 @@ function handleWebSocketMessage(rawData) {
       updateVersionBadge(msg.version_info || msg.version);
     }
     if (msg.docker || msg.module === "docker" || msg.module === "containers") {
+      if (typeof VigilLiveStore !== "undefined") VigilLiveStore.dispatch("docker", msg.docker || msg);
       if (msg.event || msg.action) {
         handleDockerEvent(msg);
       }
@@ -4316,6 +4577,14 @@ function handleWebSocketMessage(rawData) {
     }
   } else {
     // 'snapshot' or full payload
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("snapshot", msg);
+      if (msg.system) VigilLiveStore.dispatch("system", msg.system);
+      if (msg.raid) VigilLiveStore.dispatch("raid", msg.raid);
+      if (msg.docker) VigilLiveStore.dispatch("docker", msg.docker);
+      if (msg.notifications || msg.history) VigilLiveStore.dispatch("notifications", msg.notifications || msg.history);
+      if (msg.telemetry) VigilLiveStore.dispatch("telemetry", msg.telemetry);
+    }
     if (msg.refresh_intervals) {
       syncIntervalSelects(msg.refresh_intervals);
     }
@@ -4463,6 +4732,9 @@ function connectWebSocket() {
 
   wsConnection.onopen = () => {
     updateConnectionIndicator("live");
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("connection", "live");
+    }
     // Pause the 10s HTTP polling timer while WebSocket is open
     stopPolling();
     sendWsSubscription();
@@ -4485,6 +4757,9 @@ function connectWebSocket() {
 
   wsConnection.onclose = (event) => {
     wsConnection = null;
+    if (typeof VigilLiveStore !== "undefined") {
+      VigilLiveStore.dispatch("connection", "reconnecting");
+    }
     if (event && (event.code === 4401 || event.code === 1008)) {
       handleUnauthorized();
       return;
@@ -6564,6 +6839,17 @@ function switchViewTab(tabName, updateHash = true) {
       history.replaceState(null, "", `#containers/${currentDockerSubtab}`);
     }
 
+    const cachedDocker = typeof VigilLiveStore !== "undefined" ? VigilLiveStore.getState("docker") : null;
+    if (cachedDocker) {
+      renderDockerStatus(cachedDocker);
+      if (Array.isArray(cachedDocker.containers || cachedDocker)) {
+        renderDockerContainers(null, cachedDocker.containers || cachedDocker);
+      }
+      if (Array.isArray(cachedDocker.stacks)) {
+        renderDockerStacks(cachedDocker.stacks);
+      }
+    }
+
     if (isAuthenticated) {
       fetchDockerStatus();
       refreshDockerSubtab(currentDockerSubtab);
@@ -6579,6 +6865,11 @@ function switchViewTab(tabName, updateHash = true) {
 
     if (updateHash && window.location.hash !== "#storage" && window.location.hash !== "#raid" && window.location.hash !== "#disks") {
       history.replaceState(null, "", "#storage");
+    }
+
+    const cachedRaid = typeof VigilLiveStore !== "undefined" ? VigilLiveStore.getState("raid") : null;
+    if (cachedRaid) {
+      renderRaidDetails(cachedRaid);
     }
 
     renderStorageMounts(cachedStorageDisks);
@@ -6726,6 +7017,15 @@ function switchViewTab(tabName, updateHash = true) {
 
     if (updateHash && window.location.hash !== "" && window.location.hash !== "#overview") {
       history.replaceState(null, "", "#overview");
+    }
+
+    const cachedSys = typeof VigilLiveStore !== "undefined" ? VigilLiveStore.getState("system") : null;
+    if (cachedSys) {
+      renderSystemMetrics(cachedSys);
+    }
+    const cachedRaid = typeof VigilLiveStore !== "undefined" ? VigilLiveStore.getState("raid") : null;
+    if (cachedRaid) {
+      renderRaidDetails(cachedRaid);
     }
   }
 
@@ -17648,6 +17948,7 @@ function initDashboard() {
 document.addEventListener("DOMContentLoaded", initDashboard);
 
 if (typeof window !== "undefined") {
+  window.VigilLiveStore = VigilLiveStore;
   window.initSSEStream = initSSEStream;
   window.initSSEConnection = initSSEConnection;
   window.closeSSEStream = closeSSEStream;
