@@ -1,6 +1,6 @@
 [project]
 name = "systemalerts"
-version = "1.0.44"
+version = "1.0.45"
 description = "Vigil: Lightweight Linux Host Operations & Observability Suite"
 readme = "README.md"
 requires-python = ">=3.11"
