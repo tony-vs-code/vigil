@@ -124,10 +124,34 @@ _notifications_task: Optional[asyncio.Task] = None
 _sentinel_probes_task: Optional[asyncio.Task] = None
 _live_telemetry_task: Optional[asyncio.Task] = None
 _eval_loop_count: int = 0
+_last_live_telemetry_broadcast: float = 0.0
+
+
+def get_live_telemetry_tick() -> dict[str, Any]:
+    """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming."""
+    return main.get_live_telemetry_tick()
+
+
+reset_live_telemetry_ewma = main.reset_live_telemetry_ewma
+
+
+def is_live_telemetry_streaming() -> bool:
+    """Return True if live_telemetry_stream_worker is actively streaming."""
+    if time.time() - _last_live_telemetry_broadcast < 2.0:
+        return True
+    if _live_telemetry_task and not _live_telemetry_task.done():
+        if "live_state_hub" in globals() and live_state_hub is not None:
+            return live_state_hub.has_active_subscribers
+        active_subs = getattr(sse_manager, "active_subscribers", 0)
+        has_sse = bool(active_subs > 0 if isinstance(active_subs, (int, float)) else len(active_subs) > 0)
+        active_ws = getattr(ws_manager, "active_connections", [])
+        return has_sse or bool(active_ws)
+    return False
 
 
 async def live_telemetry_stream_worker(interval: float = 0.25) -> None:
     """Continuously stream 0.25s (250ms) high-speed non-blocking live telemetry to SSE and WebSocket clients."""
+    global _last_live_telemetry_broadcast
     while True:
         try:
             active_subs = getattr(sse_manager, "active_subscribers", 0)
@@ -143,8 +167,15 @@ async def live_telemetry_stream_worker(interval: float = 0.25) -> None:
                 sample = await asyncio.to_thread(main.get_live_telemetry_tick)
                 if "live_state_hub" in globals() and live_state_hub is not None:
                     live_state_hub._last_sample = sample
-                await sse_manager.broadcast("telemetry", sample)
-                await ws_manager.broadcast({"type": "telemetry_sample", "sample": sample})
+                payload = {
+                    "type": "telemetry",
+                    "data": sample,
+                    "sample": sample,
+                    **sample,
+                }
+                _last_live_telemetry_broadcast = time.time()
+                await sse_manager.broadcast("telemetry", payload)
+                await ws_manager.broadcast(payload)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -168,10 +199,16 @@ async def notifications_evaluator_loop() -> None:
         except Exception as exc:
             logging.debug(f"Telemetry collector in evaluator loop error: {exc}")
 
-        if sample is not None:
+        if sample is not None and not is_live_telemetry_streaming():
             try:
-                await ws_manager.broadcast({"type": "telemetry_sample", "sample": sample})
-                await sse_manager.broadcast("telemetry", sample)
+                payload = {
+                    "type": "telemetry",
+                    "data": sample,
+                    "sample": sample,
+                    **sample,
+                }
+                await ws_manager.broadcast(payload)
+                await sse_manager.broadcast("telemetry", payload)
             except Exception:
                 pass
 
@@ -426,8 +463,14 @@ class LiveStateHub:
 
     async def broadcast_telemetry(self, sample: dict[str, Any]) -> None:
         self._last_sample = sample
-        await self.sse.broadcast("telemetry", sample)
-        await self.ws.broadcast({"type": "telemetry_sample", "sample": sample})
+        payload = {
+            "type": "telemetry",
+            "data": sample,
+            "sample": sample,
+            **sample,
+        }
+        await self.sse.broadcast("telemetry", payload)
+        await self.ws.broadcast(payload)
 
     def get_latest_sample(self) -> Optional[dict[str, Any]]:
         return self._last_sample or getattr(main.live_state_hub, "latest_tick", None)

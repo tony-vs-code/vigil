@@ -1,32 +1,31 @@
-# Release v1.0.47: True Live View 60 FPS Render Loop & 250ms Telemetry Stream
+# Release v1.0.48: Fluid Telemetry Streaming, GPU Transitions & WebSocket Routing Fix
 
 ## Overview
-Vigil v1.0.47 introduces the True Live View architecture, delivering sub-second real-time host observability. By combining a high-frequency 250ms Server-Sent Events (SSE) telemetry stream with a decoupled 60 FPS `requestAnimationFrame` render loop featuring physics-based LERP value interpolation and sub-pixel continuous oscilloscope rolling, system metrics glide fluidly without layout thrashing, digit jitter, or artificial animation lags.
+Vigil v1.0.48 delivers critical stability and visual fluidization refinements to high-frequency live telemetry streaming. This release resolves a WebSocket message routing bug that triggered full snapshot re-renders on telemetry packets, introduces GPU-accelerated cubic-bezier transitions for utilization meters, applies EWMA CPU smoothing to eliminate Linux jiffy oscillations, introduces Catmull-Rom cubic Bezier path interpolation for multi-core oscilloscope waveforms, and throttles header timestamp updates during live streaming.
 
 ## Highlights & Enhancements
 
-### 1. High-Frequency 250ms Live SSE Telemetry Streaming
-- **Sub-Second Telemetry Worker**: Upgraded `live_telemetry_stream_worker` in `api.py` from 1.0s to 250ms (0.25s) sampling cycles, streaming ultra-fresh CPU, per-core breakdown, memory, swap, and Linux load averages.
-- **Client-Aware Non-Blocking Polling**: Maintains lightweight non-blocking `<0.2ms` execution when clients are connected, automatically idling when zero SSE subscribers are active.
+### 1. WebSocket Telemetry Message Routing Fix
+- **Early Return on Telemetry Dispatch**: Fixed message flow in `handleWebSocketMessage` (`static/app.js`) by adding an early `return;` immediately after dispatching real-time telemetry events.
+- **Eliminated Snapshot Re-renders**: Prevents 4 Hz telemetry packets from falling through to full snapshot re-rendering logic, avoiding unnecessary DOM repainting and CPU churn.
 
-### 2. Decoupled 60 FPS `requestAnimationFrame` Render Loop & LERP Interpolation
-- **Decoupled Architecture**: Separated backend network packet arrival from display refresh rates using an autonomous 60 FPS `requestAnimationFrame` rendering pipeline.
-- **Physics-Based LERP Smoothing**: Applied Linear Interpolation (`animVal += (targetVal - animVal) * factor`) across CPU percentages, RAM gauges, and per-core utilization bars for natural, organic motion.
-- **Micro-Responsive Transitions**: Replaced artificial 1.0s linear transitions with rapid `0.05s ease-out` curves, eliminating delayed gauge responses.
+### 2. Fluid GPU Hardware-Accelerated Transitions
+- **Optimized Progress Transitions**: Updated `.progress-fill` transitions to `0.25s cubic-bezier(0.2, 0.8, 0.2, 1)`.
+- **Zero Layout Thrashing**: Matches the 250ms telemetry streaming interval with hardware-accelerated easing curves, eliminating main-thread layout thrashing and delivering butter-smooth gauge movements.
 
-### 3. Continuous Sub-Pixel Rolling Multi-Core Oscilloscope
-- **Fluid Wave Translation**: Enhanced `drawCpuCoreGraph` with continuous sub-step scroll offsets (`scrollOffset = (now - lastDataTimestamp) / sampleIntervalMs`), translating waveform lines smoothly across the canvas at 60 FPS between telemetry data points.
-- **Task Manager Style Visuals**: Replicates hardware monitor oscilloscopes with zero jerky horizontal stepping.
+### 3. EWMA CPU Smoothing (alpha = 0.5)
+- **Linux Jiffy Fluctuation Damping**: Implemented Exponential Weighted Moving Average (EWMA with $\alpha = 0.5$) smoothing across aggregate and per-core CPU usage calculations in `main.py` and `api.py`.
+- **Stable High-Frequency Sampling**: Prevents wild fractional jiffy oscillations on 250ms sampling intervals while preserving sub-second responsiveness to real CPU load spikes.
 
-### 4. Continuous Hardware Clock & Precision Uptime Ticking
-- **Independent Ticking**: Decoupled uptime display from network telemetry ticks; system uptime advances smoothly second-by-second at 60 FPS.
-- **Exact Boot Time Synchronization**: Computes elapsed uptime directly from host boot time timestamps.
+### 4. Catmull-Rom Cubic Bezier Oscilloscope Interpolation
+- **Smooth Waveform Curves**: Implemented `drawSmoothPath` utilizing Catmull-Rom cubic Bezier spline interpolation in `drawCpuCoreGraph`.
+- **Eliminated Twitching**: Replaced jagged polyline segments with organic, hardware-monitor curves, removing abrupt visual twitching upon packet arrival.
 
-### 5. Tabular Numerals & Anti-Jitter Layout Stabilization
-- **Fixed-Width Numeric Alignment**: Applied `font-variant-numeric: tabular-nums` and `font-feature-settings: "tnum"` across metric values, uptime clocks, core percentages, and status counters.
-- **Zero Layout Thrashing**: Eliminates horizontal digit jitter and card resizing as values fluctuate rapidly.
+### 5. Throttled Header `last-updated` Display
+- **Calm UI Experience**: Throttled header `last-updated` indicator updates to a 5-second interval during active live streaming sessions.
+- **Reduced Visual Churn**: Prevents text shaking and rapid 4 times/sec timestamp flickering while keeping timestamp accuracy reliably fresh.
 
 ## Reliability & Fixes
 - **100% Contract & Backward Compatibility**: Fully preserves all 63 REST API endpoints and 718 client DOM element contracts.
-- **Expanded Test Suite**: Added `tests/test_ui_live_rendering.py` with comprehensive DOM, CSS, and Node VM execution tests validating 60 FPS LERP convergence, continuous uptime ticking, and canvas oscilloscope rendering.
-- **QA Gate Verification**: Automated cross-tier quality gate passed with **419/419 tests passing** and 0 failures.
+- **Comprehensive Test Suite**: All 422 unit and cross-tier tests passing cleanly in `tests/test_sse_stream.py`, `tests/test_ui_live_rendering.py`, `tests/test_main.py`, and across all test suites.
+- **Cross-Tier QA Gate Verification**: Automated requirements validation passed with 0 failures, 0 syntax errors, and 100% contract compliance.

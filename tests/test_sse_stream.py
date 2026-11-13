@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import urlsplit
 
 import api
@@ -528,6 +529,139 @@ class TestSSEStreaming(unittest.TestCase):
         self.assertIn("memory", data)
         self.assertIn("load_avg", data)
         self.assertIn("timestamp", data)
+
+    def test_get_live_telemetry_tick_ewma_smoothing(self):
+        main.reset_live_telemetry_ewma()
+        try:
+            # 1. First tick sets initial baseline without prior history
+            with (
+                patch("psutil.cpu_percent", side_effect=[100.0, [100.0, 80.0]]),
+                patch("psutil.virtual_memory", return_value=MagicMock(percent=50.0, used=100, total=200, available=100, free=50, cached=50)),
+                patch("os.getloadavg", return_value=[1.0, 1.0, 1.0]),
+            ):
+                tick1 = api.get_live_telemetry_tick()
+                self.assertEqual(tick1["cpu"]["percent"], 100.0)
+                self.assertEqual(tick1["cpu"]["cores"], [100.0, 80.0])
+
+            # 2. Second tick raw values: 0.0% and [0.0, 0.0]
+            # EWMA (alpha = 0.5):
+            # cpu_percent: 0.5 * 0.0 + 0.5 * 100.0 = 50.0
+            # cores: [0.5 * 0.0 + 0.5 * 100.0, 0.5 * 0.0 + 0.5 * 80.0] = [50.0, 40.0]
+            with (
+                patch("psutil.cpu_percent", side_effect=[0.0, [0.0, 0.0]]),
+                patch("psutil.virtual_memory", return_value=MagicMock(percent=50.0, used=100, total=200, available=100, free=50, cached=50)),
+                patch("os.getloadavg", return_value=[1.0, 1.0, 1.0]),
+            ):
+                tick2 = api.get_live_telemetry_tick()
+                self.assertEqual(tick2["cpu"]["percent"], 50.0)
+                self.assertEqual(tick2["cpu"]["cores"], [50.0, 40.0])
+
+            # 3. Third tick raw values: 0.0% and [0.0, 0.0]
+            # EWMA (alpha = 0.5):
+            # cpu_percent: 0.5 * 0.0 + 0.5 * 50.0 = 25.0
+            # cores: [0.5 * 0.0 + 0.5 * 50.0, 0.5 * 0.0 + 0.5 * 40.0] = [25.0, 20.0]
+            with (
+                patch("psutil.cpu_percent", side_effect=[0.0, [0.0, 0.0]]),
+                patch("psutil.virtual_memory", return_value=MagicMock(percent=50.0, used=100, total=200, available=100, free=50, cached=50)),
+                patch("os.getloadavg", return_value=[1.0, 1.0, 1.0]),
+            ):
+                tick3 = api.get_live_telemetry_tick()
+                self.assertEqual(tick3["cpu"]["percent"], 25.0)
+                self.assertEqual(tick3["cpu"]["cores"], [25.0, 20.0])
+        finally:
+            main.reset_live_telemetry_ewma()
+
+    def test_live_telemetry_stream_worker_broadcasts_consistent_payload(self):
+        async def _test():
+            q = api.sse_manager.subscribe()
+            mock_ws = AsyncMock()
+            api.ws_manager.active_connections.append(mock_ws)
+            task = asyncio.create_task(api.live_telemetry_stream_worker(interval=0.03))
+            try:
+                # 1. SSE received payload
+                event, sse_payload = await asyncio.wait_for(q.get(), timeout=1.5)
+                self.assertEqual(event, "telemetry")
+                self.assertEqual(sse_payload["type"], "telemetry")
+                self.assertIn("data", sse_payload)
+                self.assertIn("sample", sse_payload)
+                self.assertIn("cpu", sse_payload)
+                self.assertIn("memory", sse_payload)
+
+                # 2. WS received payload
+                await asyncio.sleep(0.06)
+                mock_ws.send_json.assert_called()
+                ws_payload = mock_ws.send_json.call_args[0][0]
+                self.assertEqual(ws_payload["type"], "telemetry")
+                self.assertIn("data", ws_payload)
+                self.assertIn("sample", ws_payload)
+                self.assertEqual(ws_payload["data"], ws_payload["sample"])
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                api.sse_manager.unsubscribe(q)
+                api.ws_manager.disconnect(mock_ws)
+
+        asyncio.run(_test())
+
+    def test_notifications_evaluator_loop_skips_telemetry_when_live_worker_streaming(self):
+        async def _test():
+            mock_ws = AsyncMock()
+            api.ws_manager.active_connections.append(mock_ws)
+            q = api.sse_manager.subscribe()
+
+            fake_sample = {
+                "timestamp": 123456789.0,
+                "cpu_percent": 15.0,
+                "memory_percent": 30.0,
+            }
+
+            try:
+                # Case 1: When actively streaming, notifications_evaluator_loop should NOT broadcast telemetry
+                with (
+                    patch.object(main, "record_telemetry_sample", return_value=fake_sample),
+                    patch.object(main, "evaluate_threshold_alerts", return_value=None),
+                    patch.object(main, "evaluate_scheduled_reports", return_value=None),
+                    patch.object(main, "evaluate_due_cron_jobs", return_value=[]),
+                    patch.object(api, "is_live_telemetry_streaming", return_value=True),
+                    patch("asyncio.sleep", side_effect=asyncio.CancelledError),
+                ):
+                    try:
+                        await api.notifications_evaluator_loop()
+                    except asyncio.CancelledError:
+                        pass
+
+                mock_ws.send_json.assert_not_called()
+                self.assertTrue(q.empty())
+
+                # Case 2: When NOT actively streaming, notifications_evaluator_loop DOES broadcast telemetry
+                with (
+                    patch.object(main, "record_telemetry_sample", return_value=fake_sample),
+                    patch.object(main, "evaluate_threshold_alerts", return_value=None),
+                    patch.object(main, "evaluate_scheduled_reports", return_value=None),
+                    patch.object(main, "evaluate_due_cron_jobs", return_value=[]),
+                    patch.object(api, "is_live_telemetry_streaming", return_value=False),
+                    patch("asyncio.sleep", side_effect=asyncio.CancelledError),
+                ):
+                    try:
+                        await api.notifications_evaluator_loop()
+                    except asyncio.CancelledError:
+                        pass
+
+                mock_ws.send_json.assert_called()
+                sent_msg = mock_ws.send_json.call_args[0][0]
+                self.assertEqual(sent_msg["type"], "telemetry")
+                self.assertIn("data", sent_msg)
+                self.assertFalse(q.empty())
+                event, data = q.get_nowait()
+                self.assertEqual(event, "telemetry")
+            finally:
+                api.sse_manager.unsubscribe(q)
+                api.ws_manager.disconnect(mock_ws)
+
+        asyncio.run(_test())
 
     # -------------------------------------------------------------------------
     # 5. Frontend Node VM SSE Stream Execution & In-Place DOM Patching Tests

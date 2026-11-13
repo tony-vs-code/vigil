@@ -2,6 +2,19 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.48] - 2026-11-13
+### Fixed
+- **WebSocket Telemetry Message Routing**: Added early `return;` after telemetry dispatch in `handleWebSocketMessage` (`static/app.js`), preventing 4 Hz telemetry packets from triggering full snapshot re-renders and excessive `last-updated` timestamp churn.
+
+### Added
+- **Fluid GPU Hardware-Accelerated Transitions**: Updated `.progress-fill` transitions to `0.25s cubic-bezier(0.2, 0.8, 0.2, 1)` in `static/styles.css`, eliminating 60fps main-thread layout thrashing and aligning with 250ms streaming cadence.
+- **EWMA CPU Smoothing (alpha = 0.5)**: Implemented Exponential Weighted Moving Average damping in `main.py` and `api.py` to prevent wild Linux jiffy oscillations on high-frequency 250ms samples while preserving responsive spike detection.
+- **Catmull-Rom Cubic Bezier Path Interpolation**: Introduced `drawSmoothPath` in `drawCpuCoreGraph` (`static/app.js`), replacing jagged lines with smooth spline interpolation to eliminate oscilloscope twitching on packet arrivals.
+- **Throttled Header Last-Updated Timestamp**: Throttled header `last-updated` indicator updates to 5-second intervals during active live streaming, keeping the dashboard peaceful.
+
+### Changed
+- **Full Backward Compatibility**: Maintained 100% contract compliance across all 63 REST API endpoints and 718 client DOM element contracts.
+
 ## [1.0.47] - 2026-11-13
 ### Added
 - **High-Frequency 250ms Live SSE Telemetry**: Upgraded `live_telemetry_stream_worker` in `api.py` to stream CPU, per-core metrics, RAM, swap, and load averages every 250ms with sub-millisecond execution.

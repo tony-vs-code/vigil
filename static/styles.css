@@ -2416,7 +2416,7 @@ hr.overview-flow-divider {
   height: 100%;
   background: linear-gradient(90deg, #38bdf8, #3b82f6);
   border-radius: 999px;
-  transition: width 0.05s ease-out, background-color 0.4s ease;
+  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), background-color 0.4s ease;
   will-change: width;
 }
 
@@ -2601,7 +2601,7 @@ hr.overview-flow-divider {
 
 .cpu-core-track .progress-fill {
   height: 100%;
-  transition: width 0.05s ease-out;
+  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
   will-change: width;
 }
 

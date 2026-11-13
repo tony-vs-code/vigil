@@ -209,11 +209,7 @@ function liveRenderTick(frameTime) {
   liveAnimState.currentCpu = lerpValue(liveAnimState.currentCpu, liveAnimState.targetCpu, factor);
   if (Math.abs(liveAnimState.currentCpu - liveAnimState.renderedCpu) > 0.05) {
     const cpuValEl = document.getElementById("cpu-percent-value");
-    const cpuBarEl = document.getElementById("cpu-progress-bar");
     if (cpuValEl) setTextIfChanged(cpuValEl, `${liveAnimState.currentCpu.toFixed(1)}%`);
-    if (cpuBarEl && typeof updateProgressBar === "function") {
-      updateProgressBar(cpuBarEl, liveAnimState.currentCpu);
-    }
     liveAnimState.renderedCpu = liveAnimState.currentCpu;
   }
 
@@ -221,11 +217,7 @@ function liveRenderTick(frameTime) {
   liveAnimState.currentRam = lerpValue(liveAnimState.currentRam, liveAnimState.targetRam, factor);
   if (Math.abs(liveAnimState.currentRam - liveAnimState.renderedRam) > 0.05) {
     const memValEl = document.getElementById("memory-percent-value");
-    const memBarEl = document.getElementById("memory-progress-bar");
     if (memValEl) setTextIfChanged(memValEl, `${liveAnimState.currentRam.toFixed(1)}%`);
-    if (memBarEl && typeof updateProgressBar === "function") {
-      updateProgressBar(memBarEl, liveAnimState.currentRam);
-    }
     liveAnimState.renderedRam = liveAnimState.currentRam;
   }
 
@@ -253,10 +245,6 @@ function liveRenderTick(frameTime) {
           const item = items[idx];
           const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
           if (pctEl) setTextIfChanged(pctEl, `${liveAnimState.currentCores[idx].toFixed(1)}%`);
-          const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
-          if (fillEl) {
-            setWidthIfChanged(fillEl, liveAnimState.currentCores[idx].toFixed(1));
-          }
         }
         liveAnimState.renderedCores[idx] = liveAnimState.currentCores[idx];
       }
@@ -722,6 +710,24 @@ function formatTimeOnly(val) {
   });
 }
 
+let lastHeaderUpdatedTimestamp = 0;
+
+/**
+ * Throttle header last-updated timestamp updates to at least 5s intervals during live streams,
+ * while allowing forced instant updates on full snapshots and manual refreshes.
+ */
+function updateHeaderLastUpdated(forced = false) {
+  const now = Date.now();
+  if (forced || now - lastHeaderUpdatedTimestamp >= 5000) {
+    const lastUpdatedEl = document.getElementById("last-updated");
+    if (lastUpdatedEl) {
+      const timeStr = typeof formatTimeOnly === "function" ? formatTimeOnly(new Date()) : new Date().toLocaleTimeString();
+      setTextIfChanged(lastUpdatedEl, `Updated ${timeStr}`);
+    }
+    lastHeaderUpdatedTimestamp = now;
+  }
+}
+
 /**
  * Format unix timestamp seconds into local date-time string.
  */
@@ -839,8 +845,12 @@ function updateProgressBar(barEl, percent) {
 
 /**
  * Render rolling historical SVG trend line & area chart for memory usage.
+ * Debounced using requestAnimationFrame to prevent layout reflows on high-frequency streaming.
  */
-function renderMemoryHistoryChart(history) {
+let memoryChartRafPending = false;
+let latestMemoryHistorySnapshot = null;
+
+function _renderMemoryHistoryChartInternal(history) {
   const chartEl = document.getElementById("memory-history-chart");
   if (!chartEl) return;
   if (!Array.isArray(history) || history.length === 0) return;
@@ -866,10 +876,32 @@ function renderMemoryHistoryChart(history) {
 
   const areaEl = document.getElementById("memory-chart-area");
   const lineEl = document.getElementById("memory-chart-line");
-  if (areaEl && lineEl) {
+  if (areaEl && areaEl.getAttribute("d") !== pathArea) {
     areaEl.setAttribute("d", pathArea);
+  }
+  if (lineEl && lineEl.getAttribute("d") !== pathLine) {
     lineEl.setAttribute("d", pathLine);
   }
+}
+
+function renderMemoryHistoryChart(history, direct = false) {
+  if (!Array.isArray(history) || history.length === 0) return;
+  latestMemoryHistorySnapshot = history;
+
+  if (direct || typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+    _renderMemoryHistoryChartInternal(history);
+    return;
+  }
+
+  if (memoryChartRafPending) return;
+  memoryChartRafPending = true;
+
+  window.requestAnimationFrame(() => {
+    memoryChartRafPending = false;
+    if (latestMemoryHistorySnapshot) {
+      _renderMemoryHistoryChartInternal(latestMemoryHistorySnapshot);
+    }
+  });
 }
 
 /**
@@ -958,17 +990,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
     const maxSamples = CPU_CORE_HISTORY_LIMIT;
     const stepX = plotW / Math.max(1, maxSamples - 1);
 
-    // Oscilloscope continuous rolling sub-step offset
-    let scrollOffset = 0;
-    if (typeof liveAnimState !== "undefined" && liveAnimState.lastSampleTime > 0) {
-      const now = typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
-      const elapsed = Math.max(0, now - liveAnimState.lastSampleTime);
-      const interval = Math.max(50, liveAnimState.estimatedSampleInterval || 250);
-      const progress = Math.min(1.0, elapsed / interval);
-      scrollOffset = progress * stepX;
-    }
-
-    // Prepare points for each core
+    // Prepare points for each core using smooth interpolation without jerky scrollOffset reset
     const coreSeries = [];
     for (let idx = 0; idx < allBuffers.length; idx++) {
       const buf = allBuffers[idx];
@@ -977,20 +999,23 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
       const pts = [];
       for (let i = 0; i < n; i++) {
         const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
-        const x = (w - padRight) - (n - 1 - i) * stepX - scrollOffset;
+        const x = (w - padRight) - (n - 1 - i) * stepX;
         const y = padTop + plotH * (1 - sample / 100);
         pts.push({ x, y });
       }
 
-      // Live trailing point pinned to the right edge
-      const liveVal = (Array.isArray(coresData) && coresData[idx] !== undefined)
-        ? Number(coresData[idx])
-        : (typeof liveAnimState !== "undefined" && liveAnimState.currentCores[idx] !== undefined)
-          ? Number(liveAnimState.currentCores[idx])
-          : (buf.length > 0 ? buf[buf.length - 1] : 0);
-      const liveY = padTop + plotH * (1 - Math.max(0, Math.min(100, liveVal)) / 100);
+      // Smooth trailing live point gliding cleanly to current interpolated telemetry
+      const liveVal = (typeof liveAnimState !== "undefined" && liveAnimState.currentCores[idx] !== undefined)
+        ? Number(liveAnimState.currentCores[idx])
+        : ((Array.isArray(coresData) && coresData[idx] !== undefined)
+          ? Number(coresData[idx])
+          : (buf.length > 0 ? buf[buf.length - 1] : 0));
+      const clampedLive = Math.max(0, Math.min(100, liveVal));
+      const liveY = padTop + plotH * (1 - clampedLive / 100);
 
-      if (scrollOffset > 0 || pts.length === 0) {
+      if (pts.length > 0) {
+        pts[pts.length - 1].y = liveY;
+      } else {
         pts.push({ x: w - padRight, y: liveY });
       }
 
@@ -1009,6 +1034,36 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
       activeHoverIndex !== undefined &&
       activeHoverIndex >= 0;
 
+    // Helper: draw smooth cubic interpolation through series points
+    const drawSmoothPath = (pts, startWithMove = true) => {
+      if (!pts || pts.length === 0) return;
+      if (startWithMove) {
+        ctx.moveTo(pts[0].x, pts[0].y);
+      } else {
+        ctx.lineTo(pts[0].x, pts[0].y);
+      }
+      if (pts.length === 1) return;
+      if (pts.length === 2 || typeof ctx.bezierCurveTo !== "function") {
+        for (let i = 1; i < pts.length; i++) {
+          ctx.lineTo(pts[i].x, pts[i].y);
+        }
+        return;
+      }
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p0 = pts[Math.max(0, i - 1)];
+        const p1 = pts[i];
+        const p2 = pts[i + 1];
+        const p3 = pts[Math.min(pts.length - 1, i + 2)];
+
+        const cp1x = p1.x + (p2.x - p0.x) / 6;
+        const cp1y = p1.y + (p2.y - p0.y) / 6;
+        const cp2x = p2.x - (p3.x - p1.x) / 6;
+        const cp2y = p2.y - (p3.y - p1.y) / 6;
+
+        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+      }
+    };
+
     // Render function for a core series
     const renderSeriesLine = (series, isEmphasized, isDimmed) => {
       const { color, pts } = series;
@@ -1025,10 +1080,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
         ctx.lineJoin = "round";
         ctx.globalAlpha = 1.0;
         ctx.beginPath();
-        pts.forEach((pt, i) => {
-          if (i === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        });
+        drawSmoothPath(pts, true);
         ctx.stroke();
         ctx.restore();
 
@@ -1039,7 +1091,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
         areaGrad.addColorStop(1, `${color}00`);
         ctx.beginPath();
         ctx.moveTo(pts[0].x, padTop + plotH);
-        pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+        drawSmoothPath(pts, false);
         ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
         ctx.closePath();
         ctx.fillStyle = areaGrad;
@@ -1065,10 +1117,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
         ctx.beginPath();
-        pts.forEach((pt, i) => {
-          if (i === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        });
+        drawSmoothPath(pts, true);
         ctx.stroke();
 
         const last = series.livePt || pts[pts.length - 1];
@@ -1085,7 +1134,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
         stdGrad.addColorStop(1, `${color}04`);
         ctx.beginPath();
         ctx.moveTo(pts[0].x, padTop + plotH);
-        pts.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+        drawSmoothPath(pts, false);
         ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
         ctx.closePath();
         ctx.fillStyle = stdGrad;
@@ -1102,10 +1151,7 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
         ctx.lineJoin = "round";
         ctx.globalAlpha = 0.92;
         ctx.beginPath();
-        pts.forEach((pt, i) => {
-          if (i === 0) ctx.moveTo(pt.x, pt.y);
-          else ctx.lineTo(pt.x, pt.y);
-        });
+        drawSmoothPath(pts, true);
         ctx.stroke();
         ctx.restore();
 
@@ -3431,11 +3477,7 @@ async function refreshDashboard({ manual = false } = {}) {
     }
 
     setErrorState(null);
-
-    const lastUpdatedEl = document.getElementById("last-updated");
-    if (lastUpdatedEl) {
-      setTextIfChanged(lastUpdatedEl, `Updated ${new Date().toLocaleTimeString()}`);
-    }
+    updateHeaderLastUpdated(true);
   } catch (err) {
     console.error("Dashboard refresh error:", err);
     setErrorState(
@@ -3746,13 +3788,13 @@ function handleSSETelemetry(data) {
       liveAnimState.currentCpu = cpuPercent;
       liveAnimState.renderedCpu = cpuPercent;
     }
-    const cpuValEl = document.getElementById("cpu-percent-value");
     const cpuBarEl = document.getElementById("cpu-progress-bar");
+    if (cpuBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(cpuBarEl, cpuPercent);
+    }
     if (!liveAnimState.isRunning) {
+      const cpuValEl = document.getElementById("cpu-percent-value");
       if (cpuValEl) setTextIfChanged(cpuValEl, `${cpuPercent.toFixed(1)}%`);
-      if (cpuBarEl && typeof updateProgressBar === "function") {
-        updateProgressBar(cpuBarEl, cpuPercent);
-      }
     }
   }
 
@@ -3858,19 +3900,19 @@ function handleSSETelemetry(data) {
           buf.shift();
         }
 
-        if (!liveAnimState.isRunning) {
-          const item = items[idx];
-          if (item) {
+        const item = items[idx];
+        if (item) {
+          const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
+          if (fillEl) {
+            const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+            setWidthIfChanged(fillEl, cPercent.toFixed(1));
+            if (fillEl.style && fillEl.style.backgroundColor !== color) {
+              fillEl.style.backgroundColor = color;
+            }
+          }
+          if (!liveAnimState.isRunning) {
             const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
             if (pctEl) setTextIfChanged(pctEl, `${cPercent.toFixed(1)}%`);
-            const fillEl = item.querySelector ? item.querySelector(".cpu-core-track .progress-fill") : null;
-            if (fillEl) {
-              const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
-              setWidthIfChanged(fillEl, cPercent.toFixed(1));
-              if (fillEl.style && fillEl.style.backgroundColor !== color) {
-                fillEl.style.backgroundColor = color;
-              }
-            }
           }
         }
       });
@@ -3951,13 +3993,13 @@ function handleSSETelemetry(data) {
       liveAnimState.currentRam = memPercent;
       liveAnimState.renderedRam = memPercent;
     }
-    const memValEl = document.getElementById("memory-percent-value");
     const memBarEl = document.getElementById("memory-progress-bar");
+    if (memBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(memBarEl, memPercent);
+    }
     if (!liveAnimState.isRunning) {
+      const memValEl = document.getElementById("memory-percent-value");
       if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
-      if (memBarEl && typeof updateProgressBar === "function") {
-        updateProgressBar(memBarEl, memPercent);
-      }
     }
 
     // Memory rolling historical trend chart
@@ -4017,13 +4059,13 @@ function handleSSETelemetry(data) {
       liveAnimState.currentDisk = diskPercent;
       liveAnimState.renderedDisk = diskPercent;
     }
-    const diskValEl = document.getElementById("disk-percent-value");
     const diskBarEl = document.getElementById("disk-progress-bar");
+    if (diskBarEl && typeof updateProgressBar === "function") {
+      updateProgressBar(diskBarEl, diskPercent);
+    }
     if (!liveAnimState.isRunning) {
+      const diskValEl = document.getElementById("disk-percent-value");
       if (diskValEl) setTextIfChanged(diskValEl, `${diskPercent.toFixed(1)}%`);
-      if (diskBarEl && typeof updateProgressBar === "function") {
-        updateProgressBar(diskBarEl, diskPercent);
-      }
     }
   }
   if (disk.used !== undefined || disk.used_gb !== undefined || disk.total !== undefined || disk.total_gb !== undefined) {
@@ -4041,11 +4083,8 @@ function handleSSETelemetry(data) {
     }
   }
 
-  // 4. Update Header Timestamp
-  const lastUpdatedEl = document.getElementById("last-updated");
-  if (lastUpdatedEl) {
-    setTextIfChanged(lastUpdatedEl, `Updated ${new Date().toLocaleTimeString()}`);
-  }
+  // 4. Update Header Timestamp (throttled to at least 5 seconds during telemetry stream)
+  updateHeaderLastUpdated(false);
 }
 
 if (typeof VigilLiveStore !== "undefined") {
@@ -4098,10 +4137,7 @@ function handleSSESnapshot(data) {
   if (data.version || data.version_info) {
     updateVersionBadge(data.version_info || data.version);
   }
-  const lastUpdatedEl = document.getElementById("last-updated");
-  if (lastUpdatedEl) {
-    lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
-  }
+  updateHeaderLastUpdated(true);
 }
 
 /**
@@ -4330,7 +4366,7 @@ function initSSEStream() {
   sseSource.addEventListener("ping", () => {
     const lastUpdatedEl = document.getElementById("last-updated");
     if (lastUpdatedEl && (!lastUpdatedEl.textContent || lastUpdatedEl.textContent === "Never updated")) {
-      lastUpdatedEl.textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      updateHeaderLastUpdated(true);
     }
   });
 }
@@ -4798,13 +4834,19 @@ function handleWebSocketMessage(rawData) {
     return;
   }
 
-  if (msg.type === "telemetry" || msg.telemetry) {
-    const telem = msg.telemetry || msg;
+  if (
+    msg.type === "telemetry" ||
+    msg.type === "telemetry_sample" ||
+    msg.telemetry ||
+    msg.sample
+  ) {
+    const telem = msg.telemetry || msg.sample || msg;
     if (typeof VigilLiveStore !== "undefined") {
       VigilLiveStore.dispatch("telemetry", telem);
     } else {
       handleSSETelemetry(telem);
     }
+    return;
   }
 
   if (msg.type === "module_update") {
@@ -5068,11 +5110,7 @@ function handleWebSocketMessage(rawData) {
   }
 
   setErrorState(null);
-
-  const lastUpdatedEl = document.getElementById("last-updated");
-  if (lastUpdatedEl) {
-    lastUpdatedEl.textContent = `Updated ${formatTimeOnly(new Date())}`;
-  }
+  updateHeaderLastUpdated(true);
 }
 
 /**
