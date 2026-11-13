@@ -126,8 +126,8 @@ _live_telemetry_task: Optional[asyncio.Task] = None
 _eval_loop_count: int = 0
 
 
-async def live_telemetry_stream_worker(interval: float = 1.0) -> None:
-    """Continuously stream 1.0s non-blocking live telemetry to SSE and WebSocket clients."""
+async def live_telemetry_stream_worker(interval: float = 0.25) -> None:
+    """Continuously stream 0.25s (250ms) high-speed non-blocking live telemetry to SSE and WebSocket clients."""
     while True:
         try:
             active_subs = getattr(sse_manager, "active_subscribers", 0)
@@ -206,7 +206,7 @@ async def lifespan(app: FastAPI):
     if _sentinel_probes_task is None or _sentinel_probes_task.done():
         _sentinel_probes_task = asyncio.create_task(main.sentinel_probes_worker())
     if _live_telemetry_task is None or _live_telemetry_task.done():
-        _live_telemetry_task = asyncio.create_task(live_telemetry_stream_worker())
+        _live_telemetry_task = asyncio.create_task(live_telemetry_stream_worker(0.25))
     try:
         yield
     finally:

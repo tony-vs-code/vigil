@@ -484,6 +484,24 @@ class TestSSEStreaming(unittest.TestCase):
 
         asyncio.run(_test())
 
+    def test_live_telemetry_stream_worker_default_interval(self):
+        import inspect
+        sig = inspect.signature(api.live_telemetry_stream_worker)
+        self.assertEqual(sig.parameters["interval"].default, 0.25)
+
+    def test_get_live_telemetry_tick_non_blocking_latency(self):
+        # Warmup
+        main.get_live_telemetry_tick()
+        start = time.perf_counter()
+        for _ in range(20):
+            tick = main.get_live_telemetry_tick()
+            self.assertIn("cpu", tick)
+            self.assertIn("memory", tick)
+        elapsed = time.perf_counter() - start
+        avg_ms = (elapsed / 20) * 1000
+        # Must be fast and non-blocking (<10ms per tick even on loaded CI)
+        self.assertLess(avg_ms, 10.0, f"Average tick duration {avg_ms:.2f}ms exceeds threshold")
+
     def test_live_state_hub_coordination(self):
         # Test main.live_state_hub
         hub_tick = main.live_state_hub.tick()
