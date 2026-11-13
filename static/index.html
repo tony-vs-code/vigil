@@ -410,6 +410,16 @@
           </div>
 
           <div class="topbar-right">
+            <div class="taskmgr-speed-control" id="taskmgr-speed-control" title="Task Manager Update Speed">
+              <label for="taskmgr-update-speed-select" class="taskmgr-speed-label">Update speed:</label>
+              <select id="taskmgr-update-speed-select" class="taskmgr-speed-select" aria-label="Task Manager Update Speed">
+                <option value="high">High (0.5s)</option>
+                <option value="normal" selected>Normal (1s)</option>
+                <option value="low">Low (2s)</option>
+                <option value="paused">Paused</option>
+              </select>
+            </div>
+
             <span id="last-updated" class="last-updated">Never updated</span>
 
             <button id="btn-topbar-notifications" class="btn-topbar-notif" type="button" title="View Notifications &amp; Alerts" aria-label="Open notifications and alerts drawer">
@@ -695,8 +705,14 @@
                   <!-- 1. Unified Multi-Core Graph Spanning Full Width at Top -->
                   <div class="cpu-unified-chart-container">
                     <div class="cpu-chart-header-row">
-                      <span class="cpu-chart-title">CPU Processor Cores Utilization</span>
-                      <span class="cpu-chart-hint">Rolling real-time time-series</span>
+                      <div class="cpu-chart-title-group">
+                        <span class="cpu-chart-title">CPU Utilization</span>
+                        <span class="cpu-chart-hint" id="cpu-chart-subtext">60-second rolling grid (% utilization)</span>
+                      </div>
+                      <div class="cpu-view-toggle-group" id="cpu-view-toggle-group" role="group" aria-label="CPU View Mode">
+                        <button type="button" class="btn-cpu-view active" id="btn-cpu-view-overall" data-cpu-view="overall" title="Overall CPU Utilization">Overall</button>
+                        <button type="button" class="btn-cpu-view" id="btn-cpu-view-cores" data-cpu-view="cores" title="Logical Processors Utilization">Logical Processors</button>
+                      </div>
                     </div>
                     <canvas id="cpu-cores-unified-canvas" class="cpu-core-canvas cpu-unified-chart-canvas" width="600" height="150" aria-label="Unified CPU cores utilization time-series graph"></canvas>
                   </div>
@@ -751,12 +767,12 @@
                   <svg id="memory-history-chart" class="metric-trend-chart" viewBox="0 0 240 44" preserveAspectRatio="none" aria-label="Memory usage historical trend">
                     <defs>
                       <linearGradient id="memChartGrad" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.35"></stop>
-                        <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.0"></stop>
+                        <stop offset="0%" stop-color="#00d2ff" stop-opacity="0.18"></stop>
+                        <stop offset="100%" stop-color="#00d2ff" stop-opacity="0.0"></stop>
                       </linearGradient>
                     </defs>
                     <path id="memory-chart-area" class="trend-area" fill="url(#memChartGrad)" d=""></path>
-                    <path id="memory-chart-line" class="trend-line" fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d=""></path>
+                    <path id="memory-chart-line" class="trend-line" fill="none" stroke="#00d2ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d=""></path>
                   </svg>
                 </div>
                 <div class="metric-footer memory-metric-footer">

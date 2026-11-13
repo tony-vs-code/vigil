@@ -643,6 +643,48 @@ body {
   gap: 14px;
 }
 
+/* Task Manager Update Speed Selector */
+.taskmgr-speed-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 6px;
+  font-size: 0.74rem;
+  color: #94a3b8;
+  transition: border-color 0.2s ease;
+}
+
+.taskmgr-speed-control:hover,
+.taskmgr-speed-control:focus-within {
+  border-color: rgba(0, 210, 255, 0.4);
+}
+
+.taskmgr-speed-label {
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.taskmgr-speed-select {
+  background: transparent;
+  color: #00d2ff;
+  border: none;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+  padding: 0 2px;
+}
+
+.taskmgr-speed-select option {
+  background: #090d16;
+  color: #f8fafc;
+}
+
 .main-content-scroll {
   flex: 1;
   padding: 24px 28px 48px;
@@ -2247,9 +2289,15 @@ hr.overview-flow-divider {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px 4px 12px;
-  background: rgba(15, 23, 42, 0.4);
-  border-bottom: 1px solid rgba(71, 85, 105, 0.15);
+  padding: 8px 12px 6px 12px;
+  background: rgba(9, 13, 22, 0.95);
+  border-bottom: 1px solid rgba(0, 210, 255, 0.15);
+}
+
+.cpu-chart-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .cpu-chart-title {
@@ -2261,8 +2309,43 @@ hr.overview-flow-divider {
 }
 
 .cpu-chart-hint {
-  font-size: 0.72rem;
+  font-size: 0.70rem;
   color: var(--text-muted);
+}
+
+.cpu-view-toggle-group {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 6px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.btn-cpu-view {
+  background: transparent;
+  color: #94a3b8;
+  border: none;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.btn-cpu-view:hover {
+  color: #f8fafc;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-cpu-view.active {
+  background: rgba(0, 210, 255, 0.2);
+  color: #00d2ff;
+  font-weight: 600;
+  box-shadow: 0 0 6px rgba(0, 210, 255, 0.25);
 }
 
 /* Memory Chunk Cards */
@@ -2402,6 +2485,7 @@ hr.overview-flow-divider {
 .cpu-percent-value,
 #cpu-percent-value,
 #ram-percent-value,
+#memory-percent-value,
 #disk-percent-value,
 #uptime-value,
 .host-telemetry-val,
@@ -2416,7 +2500,7 @@ hr.overview-flow-divider {
   height: 100%;
   background: linear-gradient(90deg, #38bdf8, #3b82f6);
   border-radius: 999px;
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1), background-color 0.4s ease;
+  transition: width 0.4s cubic-bezier(0.25, 0.1, 0.25, 1), background-color 0.4s ease;
   will-change: width;
 }
 
@@ -2491,11 +2575,11 @@ hr.overview-flow-divider {
   flex-direction: column;
   margin-bottom: 10px;
   border-radius: var(--radius-sm);
-  background: rgba(4, 9, 20, 0.8);
-  border: 1px solid rgba(71, 85, 105, 0.25);
+  background: #090d16;
+  border: 1px solid rgba(0, 210, 255, 0.18);
   overflow: hidden;
   position: relative;
-  box-shadow: inset 0 0 12px rgba(0, 0, 0, 0.5);
+  box-shadow: inset 0 0 16px rgba(0, 0, 0, 0.6);
 }
 
 .cpu-unified-chart-canvas {
@@ -2601,7 +2685,7 @@ hr.overview-flow-divider {
 
 .cpu-core-track .progress-fill {
   height: 100%;
-  transition: width 0.25s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: width 0.4s cubic-bezier(0.25, 0.1, 0.25, 1);
   will-change: width;
 }
 
@@ -2611,8 +2695,8 @@ hr.overview-flow-divider {
   height: 44px;
   margin: 6px 0;
   border-radius: var(--radius-sm);
-  background: rgba(15, 23, 42, 0.45);
-  border: 1px solid var(--border-subtle);
+  background: #090d16;
+  border: 1px solid rgba(0, 210, 255, 0.18);
   overflow: hidden;
   position: relative;
 }
@@ -2624,7 +2708,7 @@ hr.overview-flow-divider {
 }
 
 .metric-trend-chart .trend-line {
-  stroke: var(--accent-primary, #38bdf8);
+  stroke: #00d2ff;
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
@@ -6038,9 +6122,12 @@ hr.overview-flow-divider {
   border-color: rgba(34, 197, 94, 0.4);
 }
 
-/* Process Explorer Mini Progress Bars */
+/* Process Explorer Mini Progress Bars & Task Manager Heatmap */
 .proc-metric-cell {
   min-width: 110px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  transition: background-color 0.25s ease;
 }
 
 .proc-metric-row {

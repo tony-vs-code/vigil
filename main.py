@@ -11076,7 +11076,7 @@ def reset_live_telemetry_ewma() -> None:
 
 
 def get_live_telemetry_tick() -> dict[str, Any]:
-    """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming with EWMA smoothing."""
+    """Collect non-blocking real-time metrics (<2ms) for steady live telemetry streaming with EWMA smoothing."""
     global _last_ewma_cpu_percent, _last_ewma_cpu_cores
     cpu_err = False
     try:
@@ -11111,6 +11111,17 @@ def get_live_telemetry_tick() -> dict[str, Any]:
         smoothed_cpu_percent = 0.0
         smoothed_cores = [0.0]
     else:
+        # Over the steady 1.0s / 0.5s window, cross-validate aggregate CPU against per-core readings:
+        # If aggregate reported 0.0 due to an intervening global psutil state reset while per-core metrics show load,
+        # fallback accurately to the per-core average.
+        if raw_cpu_percent == 0.0 and raw_cpu_cores and any(c > 0.0 for c in raw_cpu_cores):
+            raw_cpu_percent = sum(raw_cpu_cores) / len(raw_cpu_cores)
+        elif raw_cpu_percent > 0.0 and (not raw_cpu_cores or all(c == 0.0 for c in raw_cpu_cores)):
+            raw_cpu_cores = [raw_cpu_percent]
+
+        raw_cpu_percent = max(0.0, min(100.0, raw_cpu_percent))
+        raw_cpu_cores = [max(0.0, min(100.0, c)) for c in raw_cpu_cores]
+
         alpha = _LIVE_TELEMETRY_EWMA_ALPHA
         if _last_ewma_cpu_percent is None:
             smoothed_cpu_percent = raw_cpu_percent

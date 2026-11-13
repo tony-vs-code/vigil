@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import api
 import main
-from test_main import asgi_delete, asgi_post, asgi_put, asgi_ws
+from test_main import asgi_delete, asgi_get, asgi_post, asgi_put, asgi_ws
 
 
 class TestLiveStreamsBackend(unittest.TestCase):
@@ -352,6 +352,116 @@ class TestLiveStreamsBackend(unittest.TestCase):
         sent_payload = mock_ws.send_json.call_args[0][0]
         self.assertEqual(sent_payload["type"], "module_update")
         self.assertEqual(sent_payload["module"], "docker")
+
+    # =========================================================================
+    # 3e. Task Manager Live Telemetry Streaming Cadence & Dynamic Interval
+    # =========================================================================
+    def test_task_manager_telemetry_interval_endpoints(self):
+        try:
+            api.reset_telemetry_stream_interval()
+            # 1. Default interval is 1.0s (Normal Task Manager cadence)
+            res = asgi_get(api.app, "/api/stream/interval", cookies=self.auth_cookies)
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["interval"], 1.0)
+            self.assertEqual(data["speed"], "normal")
+            self.assertIn("presets", data)
+
+            # 2. Update to High speed (0.5s)
+            res = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                json_body={"speed": "high"},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["interval"], 0.5)
+            self.assertEqual(data["speed"], "high")
+            self.assertEqual(api.get_telemetry_stream_interval(), 0.5)
+
+            # 3. Update to Low speed (2.0s)
+            res = asgi_put(
+                api.app,
+                "/api/stream/interval",
+                json_body={"interval": 2.0},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["interval"], 2.0)
+            self.assertEqual(data["speed"], "low")
+            self.assertEqual(api.get_telemetry_stream_interval(), 2.0)
+
+            # 4. Invalid speed returns 400
+            res = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                json_body={"speed": "warp_speed"},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(res.status_code, 400)
+
+            # 5. Missing payload returns 400
+            res = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(res.status_code, 400)
+
+            # 6. Unauthorized returns 401
+            res = asgi_get(api.app, "/api/stream/interval")
+            self.assertEqual(res.status_code, 401)
+        finally:
+            api.reset_telemetry_stream_interval()
+
+    def test_websocket_telemetry_interval_cadence_adjustment(self):
+        try:
+            api.reset_telemetry_stream_interval()
+            fake_snapshot = {
+                "type": "snapshot",
+                "raid": {"status": "clean"},
+                "system": {"timestamp": time.time(), "cpu_percent": 10.0},
+            }
+            client_msgs = [
+                {"action": "set_interval", "interval": 0.5},
+                {"action": "set_speed", "speed": "low"},
+            ]
+            with patch.object(api, "_build_full_snapshot", return_value=fake_snapshot):
+                ws_res = asgi_ws(
+                    api.app,
+                    f"/api/ws?token={self.session_token}",
+                    client_messages=client_msgs,
+                )
+
+            self.assertTrue(ws_res.accepted)
+            interval_msgs = [m for m in ws_res.messages if m.get("type") == "telemetry_interval_updated"]
+            self.assertEqual(len(interval_msgs), 2)
+            self.assertEqual(interval_msgs[0]["interval"], 0.5)
+            self.assertEqual(interval_msgs[0]["speed"], "high")
+            self.assertEqual(interval_msgs[1]["interval"], 2.0)
+            self.assertEqual(interval_msgs[1]["speed"], "low")
+            self.assertEqual(api.get_telemetry_stream_interval(), 2.0)
+        finally:
+            api.reset_telemetry_stream_interval()
+
+    def test_get_live_telemetry_tick_steady_window_cpu_accuracy(self):
+        main.reset_live_telemetry_ewma()
+        try:
+            # When raw aggregate CPU returns 0.0 due to a psutil state reset, but per-core readings are active,
+            # get_live_telemetry_tick accurately falls back to the per-core average.
+            with (
+                patch("psutil.cpu_percent", side_effect=[0.0, [40.0, 60.0]]),
+                patch("psutil.virtual_memory", return_value=MagicMock(percent=45.0, used=1000, total=2000, available=1000, free=500, cached=500)),
+                patch("os.getloadavg", return_value=[0.5, 0.5, 0.5]),
+            ):
+                tick = main.get_live_telemetry_tick()
+                # Average of [40.0, 60.0] is 50.0%
+                self.assertEqual(tick["cpu"]["percent"], 50.0)
+                self.assertEqual(tick["cpu"]["cores"], [40.0, 60.0])
+        finally:
+            main.reset_live_telemetry_ewma()
 
 
 class TestLiveStreamsZeroClutterAndNodeVM(unittest.TestCase):

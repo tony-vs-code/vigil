@@ -488,7 +488,138 @@ class TestSSEStreaming(unittest.TestCase):
     def test_live_telemetry_stream_worker_default_interval(self):
         import inspect
         sig = inspect.signature(api.live_telemetry_stream_worker)
-        self.assertEqual(sig.parameters["interval"].default, 0.25)
+        self.assertEqual(sig.parameters["interval"].default, 1.0)
+
+    def test_parse_telemetry_interval(self):
+        self.assertEqual(api.parse_telemetry_interval(0.5), 0.5)
+        self.assertEqual(api.parse_telemetry_interval(1.0), 1.0)
+        self.assertEqual(api.parse_telemetry_interval(2.0), 2.0)
+        self.assertEqual(api.parse_telemetry_interval("0.5"), 0.5)
+        self.assertEqual(api.parse_telemetry_interval("1.0"), 1.0)
+        self.assertEqual(api.parse_telemetry_interval("2.0"), 2.0)
+        # Named speed presets
+        self.assertEqual(api.parse_telemetry_interval("high"), 0.5)
+        self.assertEqual(api.parse_telemetry_interval("normal"), 1.0)
+        self.assertEqual(api.parse_telemetry_interval("low"), 2.0)
+        self.assertEqual(api.parse_telemetry_interval("fast"), 0.5)
+        self.assertEqual(api.parse_telemetry_interval("slow"), 2.0)
+        # Clamping
+        self.assertEqual(api.parse_telemetry_interval(0.01), 0.1)
+        self.assertEqual(api.parse_telemetry_interval(50.0), 10.0)
+        # Invalid
+        self.assertIsNone(api.parse_telemetry_interval(None))
+        self.assertIsNone(api.parse_telemetry_interval(""))
+        self.assertIsNone(api.parse_telemetry_interval("invalid_cadence"))
+
+    def test_telemetry_speed_presets_and_names(self):
+        self.assertEqual(api.get_telemetry_speed_name(0.5), "high")
+        self.assertEqual(api.get_telemetry_speed_name(1.0), "normal")
+        self.assertEqual(api.get_telemetry_speed_name(2.0), "low")
+        self.assertEqual(api.get_telemetry_speed_name(0.05), "custom")
+
+    def test_dynamic_telemetry_interval_configuration(self):
+        try:
+            api.reset_telemetry_stream_interval()
+            self.assertEqual(api.get_telemetry_stream_interval(), 1.0)
+
+            api.set_telemetry_stream_interval(0.5)
+            self.assertEqual(api.get_telemetry_stream_interval(), 0.5)
+
+            api.set_telemetry_stream_interval(2.0)
+            self.assertEqual(api.get_telemetry_stream_interval(), 2.0)
+        finally:
+            api.reset_telemetry_stream_interval()
+
+    def test_stream_interval_endpoints(self):
+        from test_main import asgi_post, asgi_put
+        try:
+            api.reset_telemetry_stream_interval()
+            # 1. GET current interval
+            resp = asgi_get(api.app, "/api/stream/interval", cookies=self.auth_cookies)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["interval"], 1.0)
+            self.assertEqual(data["speed"], "normal")
+            self.assertIn("presets", data)
+
+            # 2. POST new interval via JSON payload
+            resp = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                json_body={"interval": 0.5},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["status"], "ok")
+            self.assertEqual(data["interval"], 0.5)
+            self.assertEqual(data["speed"], "high")
+            self.assertEqual(api.get_telemetry_stream_interval(), 0.5)
+
+            # 3. POST speed preset "low"
+            resp = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                json_body={"speed": "low"},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["interval"], 2.0)
+            self.assertEqual(data["speed"], "low")
+            self.assertEqual(api.get_telemetry_stream_interval(), 2.0)
+
+            # 4. PUT via query parameter
+            resp = asgi_put(
+                api.app,
+                "/api/stream/interval?interval=normal",
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data["interval"], 1.0)
+            self.assertEqual(data["speed"], "normal")
+            self.assertEqual(api.get_telemetry_stream_interval(), 1.0)
+
+            # 5. Invalid interval returns 400
+            resp = asgi_post(
+                api.app,
+                "/api/stream/interval",
+                json_body={"speed": "nonsense"},
+                cookies=self.auth_cookies,
+            )
+            self.assertEqual(resp.status_code, 400)
+
+            # 6. Unauthenticated requests return 401
+            resp = asgi_get(api.app, "/api/stream/interval")
+            self.assertEqual(resp.status_code, 401)
+        finally:
+            api.reset_telemetry_stream_interval()
+
+    def test_sse_stream_query_param_interval(self):
+        async def _test():
+            try:
+                api.reset_telemetry_stream_interval()
+                self.assertEqual(api.get_telemetry_stream_interval(), 1.0)
+
+                # Connect with interval=0.5
+                status_code, headers, events = await asgi_sse_client(
+                    api.app,
+                    "/api/stream/events?interval=0.5",
+                    cookies=self.auth_cookies,
+                    max_events=1,
+                    timeout=2.0,
+                )
+                self.assertEqual(status_code, 200)
+                self.assertGreaterEqual(len(events), 1)
+
+                # After client disconnects, subscriber interval preference is removed
+                self.assertEqual(len(api._subscriber_intervals), 0)
+                self.assertEqual(api.get_telemetry_stream_interval(), 1.0)
+            finally:
+                api.reset_telemetry_stream_interval()
+
+        asyncio.run(_test())
 
     def test_get_live_telemetry_tick_non_blocking_latency(self):
         # Warmup
