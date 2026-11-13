@@ -67,12 +67,23 @@ let currentAppCatalogCategory = "All";
 let activeStackEditorTab = "compose";
 let cachedStorageDisks = null;
 
-const MEMORY_HISTORY_LIMIT = 30;
+const MEMORY_HISTORY_LIMIT = 60;
 const memoryHistoryBuffer = [];
 
 const CPU_CORE_HISTORY_LIMIT = 60;
+const cpuOverallHistoryBuffer = [];
 const cpuCoresHistoryBuffers = [];
 let activeHoveredCoreIndex = null;
+let currentCpuViewMode = (typeof localStorage !== "undefined" && localStorage.getItem("systemalerts_cpu_view_mode")) || "overall";
+
+const TASKMGR_SPEED_SETTINGS = {
+  high: { intervalMs: 500, label: "High (0.5s)" },
+  normal: { intervalMs: 1000, label: "Normal (1s)" },
+  low: { intervalMs: 2000, label: "Low (2s)" },
+  paused: { intervalMs: 0, label: "Paused" },
+};
+let currentTaskMgrSpeed = (typeof localStorage !== "undefined" && localStorage.getItem("systemalerts_update_speed")) || "normal";
+let lastTelemetryProcessedTime = 0;
 const CPU_CORE_COLORS = [
   "#00f0ff",
   "#10b981",
@@ -273,10 +284,12 @@ function liveRenderTick(frameTime) {
   updateContinuousUptimeAndClocks(now);
 }
 
-let isSchedulingLiveFrame = false;
+let liveUptimeTimerId = null;
 
 /**
- * Start the 60 FPS Decoupled Live Telemetry Render Loop
+ * Start the Live Telemetry & Hardware Clock Loop
+ * Removed hyperactive 60 FPS RAF DOM mutation loop to eliminate DOM thrashing.
+ * System uptime and countdown indicators update calmly on a 1-second cadence.
  */
 function startLiveRenderLoop() {
   if (liveAnimState.isRunning) return;
@@ -285,32 +298,17 @@ function startLiveRenderLoop() {
     ? performance.now()
     : Date.now();
 
-  function scheduleNextLiveFrame() {
-    if (!liveAnimState.isRunning || isSchedulingLiveFrame) return;
-    isSchedulingLiveFrame = true;
-    try {
-      const raf = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
-        ? window.requestAnimationFrame
-        : (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null);
-
-      if (raf) {
-        liveAnimState.rafId = raf((frameTime) => {
-          liveRenderTick(frameTime);
-          if (liveAnimState.isRunning && !isSchedulingLiveFrame) {
-            scheduleNextLiveFrame();
-          }
-        });
+  if (!liveUptimeTimerId && typeof window !== "undefined" && typeof window.setInterval === "function") {
+    liveUptimeTimerId = window.setInterval(() => {
+      if (liveAnimState.isRunning) {
+        updateContinuousUptimeAndClocks(Date.now());
       }
-    } finally {
-      isSchedulingLiveFrame = false;
-    }
+    }, 1000);
   }
-
-  scheduleNextLiveFrame();
 }
 
 /**
- * Stop the 60 FPS Decoupled Live Telemetry Render Loop
+ * Stop the Live Telemetry & Hardware Clock Loop
  */
 function stopLiveRenderLoop() {
   liveAnimState.isRunning = false;
@@ -320,6 +318,12 @@ function stopLiveRenderLoop() {
       : (typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : null);
     if (caf) caf(liveAnimState.rafId);
     liveAnimState.rafId = null;
+  }
+  if (liveUptimeTimerId) {
+    if (typeof window !== "undefined" && typeof window.clearInterval === "function") {
+      window.clearInterval(liveUptimeTimerId);
+    }
+    liveUptimeTimerId = null;
   }
 }
 
@@ -905,9 +909,50 @@ function renderMemoryHistoryChart(history, direct = false) {
 }
 
 /**
- * Render Windows Task Manager style rolling time-series graph on the unified CPU cores canvas.
- * Handles window.devicePixelRatio for crisp HiDPI / Retina rendering.
- * Renders multiple core series simultaneously with vibrant colors and interactive hover focus.
+ * Switch CPU View Mode between "overall" (unified 60-second Task Manager grid) and "cores" (logical processor cores).
+ */
+function setCpuViewMode(mode) {
+  if (mode !== "overall" && mode !== "cores") return;
+  currentCpuViewMode = mode;
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.setItem("systemalerts_cpu_view_mode", mode);
+    } catch (_) {}
+  }
+  const btnOverall = document.getElementById("btn-cpu-view-overall");
+  const btnCores = document.getElementById("btn-cpu-view-cores");
+  if (btnOverall) {
+    btnOverall.classList.toggle("active", mode === "overall");
+    btnOverall.setAttribute("aria-checked", mode === "overall" ? "true" : "false");
+  }
+  if (btnCores) {
+    btnCores.classList.toggle("active", mode === "cores");
+    btnCores.setAttribute("aria-checked", mode === "cores" ? "true" : "false");
+  }
+  const subtextEl = document.getElementById("cpu-chart-subtext");
+  if (subtextEl) {
+    subtextEl.textContent = mode === "overall"
+      ? "60-second rolling grid (% utilization)"
+      : "Logical processors utilization";
+  }
+
+  const unifiedCanvas =
+    document.getElementById("cpu-cores-unified-canvas") ||
+    (document.querySelector && document.querySelector(".cpu-core-canvas"));
+  if (unifiedCanvas && typeof drawCpuCoreGraph === "function") {
+    const currentValues = cpuCoresHistoryBuffers.map((b) => (b.length > 0 ? b[b.length - 1] : 0));
+    drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, typeof activeHoveredCoreIndex !== "undefined" ? activeHoveredCoreIndex : null, true);
+  }
+}
+
+/**
+ * Render Windows Task Manager 60-Second Rolling Grid Canvas.
+ * - 60 fixed points representing the last 60 seconds (1 sample/sec).
+ * - Dark background (#090d16).
+ * - Fine subtle grid lines (0%, 25%, 50%, 75%, 100% horizontal; 60s, 45s, 30s, 15s, 0s vertical).
+ * - Labels: "% utilization" on top, "100%" top-left, "0%" bottom-left, "60 seconds" bottom-left, "0" bottom-right.
+ * - Crisp 2px solid cyan/blue stroke (#00d2ff), with gradient area fill underneath.
+ * - Supports overall utilization and per-core logical processors.
  */
 function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, direct = false) {
   if (!canvas || typeof canvas.getContext !== "function") return;
@@ -938,8 +983,8 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
-    // 1. Task-manager style dark background
-    ctx.fillStyle = "rgba(4, 9, 20, 0.8)";
+    // 1. Classic Windows Task Manager dark background
+    ctx.fillStyle = "#090d16";
     ctx.fillRect(0, 0, w, h);
 
     // 2. Padding and usable plot geometry
@@ -949,257 +994,218 @@ function drawCpuCoreGraph(canvas, buffers, coresData, activeHoverIndex = null, d
     const padBottom = 18;
     const plotW = Math.max(10, w - padLeft - padRight);
     const plotH = Math.max(10, h - padTop - padBottom);
+    const plotX = padLeft;
+    const plotY = padTop;
 
-    // 3. Subtle horizontal grid lines & percentage labels (100%, 75%, 50%, 25%, 0%)
-    const gridPcts = [100, 75, 50, 25, 0];
+    // 3. Grid Styling
+    // Outer border around grid box
+    ctx.strokeStyle = "rgba(0, 210, 255, 0.22)";
     ctx.lineWidth = 1;
-    gridPcts.forEach((pct) => {
-      const y = Math.round(padTop + plotH * (1 - pct / 100)) + 0.5;
-      ctx.strokeStyle = pct === 0 ? "rgba(148, 163, 184, 0.35)" : "rgba(71, 85, 105, 0.24)";
+    if (typeof ctx.strokeRect === "function") {
+      ctx.strokeRect(plotX + 0.5, plotY + 0.5, plotW, plotH);
+    }
+
+    // Fine subtle horizontal grid lines (0%, 25%, 50%, 75%, 100%)
+    const horizPcts = [100, 75, 50, 25, 0];
+    ctx.font = "10px 'Segoe UI', -apple-system, BlinkMacSystemFont, 'JetBrains Mono', monospace";
+    horizPcts.forEach((pct) => {
+      const y = Math.round(plotY + plotH * (1 - pct / 100)) + 0.5;
+      ctx.strokeStyle = (pct === 0 || pct === 100)
+        ? "rgba(0, 210, 255, 0.22)"
+        : "rgba(0, 210, 255, 0.10)";
       ctx.beginPath();
-      ctx.moveTo(padLeft, y);
-      ctx.lineTo(w - padRight, y);
+      ctx.moveTo(plotX, y);
+      ctx.lineTo(plotX + plotW, y);
       ctx.stroke();
 
-      ctx.fillStyle = "rgba(148, 163, 184, 0.72)";
-      ctx.font = "9px 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace";
+      ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
-      ctx.fillText(`${pct}%`, padLeft - 5, y);
+      ctx.fillText(`${pct}%`, plotX - 5, y);
     });
 
-    // Vertical time ticks
-    const numVDivs = 6;
-    ctx.strokeStyle = "rgba(71, 85, 105, 0.16)";
-    ctx.beginPath();
-    for (let d = 1; d < numVDivs; d++) {
-      const x = Math.round(padLeft + (plotW / numVDivs) * d) + 0.5;
-      ctx.moveTo(x, padTop);
-      ctx.lineTo(x, padTop + plotH);
+    // Fine subtle vertical grid lines (60s, 45s, 30s, 15s, 0s)
+    for (let d = 1; d < 4; d++) {
+      const x = Math.round(plotX + (plotW / 4) * d) + 0.5;
+      ctx.strokeStyle = "rgba(0, 210, 255, 0.10)";
+      ctx.beginPath();
+      ctx.moveTo(x, plotY);
+      ctx.lineTo(x, plotY + plotH);
+      ctx.stroke();
     }
-    ctx.stroke();
 
-    // Handle normalization of buffers (support single buffer or array of buffers)
-    if (!buffers || buffers.length === 0) {
-      ctx.restore();
-      return;
-    }
-    const isSingleBuffer = Array.isArray(buffers) && typeof buffers[0] === "number";
-    const allBuffers = isSingleBuffer ? [buffers] : buffers;
+    // Task Manager Text labels
+    ctx.fillStyle = "rgba(148, 163, 184, 0.85)";
+    // Top label: "% utilization"
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.fillText("% utilization", plotX, plotY - 4);
 
-    const maxSamples = CPU_CORE_HISTORY_LIMIT;
+    // Bottom-left label: "60 seconds"
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText("60 seconds", plotX, plotY + plotH + 4);
+
+    // Bottom-right label: "0"
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    ctx.fillText("0", plotX + plotW, plotY + plotH + 4);
+
+    // 4. Data Series Waveform Rendering
+    const maxSamples = (typeof CPU_CORE_HISTORY_LIMIT !== "undefined" ? CPU_CORE_HISTORY_LIMIT : 60);
     const stepX = plotW / Math.max(1, maxSamples - 1);
 
-    // Prepare points for each core using smooth interpolation without jerky scrollOffset reset
-    const coreSeries = [];
-    for (let idx = 0; idx < allBuffers.length; idx++) {
-      const buf = allBuffers[idx];
-      if (!buf || buf.length === 0) continue;
-      const n = buf.length;
-      const pts = [];
-      for (let i = 0; i < n; i++) {
-        const sample = Math.max(0, Math.min(100, Number(buf[i]) || 0));
-        const x = (w - padRight) - (n - 1 - i) * stepX;
-        const y = padTop + plotH * (1 - sample / 100);
-        pts.push({ x, y });
-      }
+    const isSingleBuffer = Array.isArray(buffers) && (buffers.length === 0 || typeof buffers[0] === "number");
+    const allBuffers = isSingleBuffer ? [buffers] : (Array.isArray(buffers) ? buffers : []);
 
-      // Smooth trailing live point gliding cleanly to current interpolated telemetry
-      const liveVal = (typeof liveAnimState !== "undefined" && liveAnimState.currentCores[idx] !== undefined)
-        ? Number(liveAnimState.currentCores[idx])
-        : ((Array.isArray(coresData) && coresData[idx] !== undefined)
-          ? Number(coresData[idx])
-          : (buf.length > 0 ? buf[buf.length - 1] : 0));
-      const clampedLive = Math.max(0, Math.min(100, liveVal));
-      const liveY = padTop + plotH * (1 - clampedLive / 100);
+    const showCores = (typeof currentCpuViewMode !== "undefined" && currentCpuViewMode === "cores") || (allBuffers.length > 1 && (typeof cpuOverallHistoryBuffer === "undefined" || cpuOverallHistoryBuffer.length === 0));
 
-      if (pts.length > 0) {
-        pts[pts.length - 1].y = liveY;
-      } else {
-        pts.push({ x: w - padRight, y: liveY });
-      }
-
-      if (pts.length === 1) {
-        pts.unshift({ x: padLeft, y: pts[0].y });
-      } else if (pts[0].x > padLeft) {
-        pts.unshift({ x: padLeft, y: pts[0].y });
-      }
-
-      const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
-      coreSeries.push({ idx, color, pts, livePt: { x: w - padRight, y: liveY } });
-    }
-
-    const hasHover =
-      activeHoverIndex !== null &&
-      activeHoverIndex !== undefined &&
-      activeHoverIndex >= 0;
-
-    // Helper: draw smooth cubic interpolation through series points
-    const drawSmoothPath = (pts, startWithMove = true) => {
-      if (!pts || pts.length === 0) return;
-      if (startWithMove) {
-        ctx.moveTo(pts[0].x, pts[0].y);
-      } else {
-        ctx.lineTo(pts[0].x, pts[0].y);
-      }
-      if (pts.length === 1) return;
-      if (pts.length === 2 || typeof ctx.bezierCurveTo !== "function") {
-        for (let i = 1; i < pts.length; i++) {
-          ctx.lineTo(pts[i].x, pts[i].y);
-        }
-        return;
-      }
-      for (let i = 0; i < pts.length - 1; i++) {
-        const p0 = pts[Math.max(0, i - 1)];
-        const p1 = pts[i];
-        const p2 = pts[i + 1];
-        const p3 = pts[Math.min(pts.length - 1, i + 2)];
-
-        const cp1x = p1.x + (p2.x - p0.x) / 6;
-        const cp1y = p1.y + (p2.y - p0.y) / 6;
-        const cp2x = p2.x - (p3.x - p1.x) / 6;
-        const cp2y = p2.y - (p3.y - p1.y) / 6;
-
-        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
-      }
-    };
-
-    // Render function for a core series
-    const renderSeriesLine = (series, isEmphasized, isDimmed) => {
-      const { color, pts } = series;
-      if (!pts || pts.length === 0) return;
-
-      if (isEmphasized) {
-        // Glow and thicker line
-        ctx.save();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2.4;
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 8;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.globalAlpha = 1.0;
-        ctx.beginPath();
-        drawSmoothPath(pts, true);
-        ctx.stroke();
-        ctx.restore();
-
-        // Subtle gradient underlay for emphasized line
-        ctx.save();
-        const areaGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-        areaGrad.addColorStop(0, `${color}33`);
-        areaGrad.addColorStop(1, `${color}00`);
-        ctx.beginPath();
-        ctx.moveTo(pts[0].x, padTop + plotH);
-        drawSmoothPath(pts, false);
-        ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
-        ctx.closePath();
-        ctx.fillStyle = areaGrad;
-        ctx.fill();
-        ctx.restore();
-
-        // Rightmost current utilization pulse dot
-        const last = series.livePt || pts[pts.length - 1];
-        ctx.save();
-        ctx.fillStyle = color;
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 8;
-        ctx.beginPath();
-        ctx.arc(last.x, last.y, 3.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      } else if (isDimmed) {
-        // Dimmed line
-        ctx.save();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.0;
-        ctx.globalAlpha = 0.2;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        drawSmoothPath(pts, true);
-        ctx.stroke();
-
-        const last = series.livePt || pts[pts.length - 1];
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(last.x, last.y, 1.5, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      } else {
-        // Subtle area fill under standard series line
-        ctx.save();
-        const stdGrad = ctx.createLinearGradient(0, padTop, 0, padTop + plotH);
-        stdGrad.addColorStop(0, `${color}18`);
-        stdGrad.addColorStop(1, `${color}04`);
-        ctx.beginPath();
-        ctx.moveTo(pts[0].x, padTop + plotH);
-        drawSmoothPath(pts, false);
-        ctx.lineTo(pts[pts.length - 1].x, padTop + plotH);
-        ctx.closePath();
-        ctx.fillStyle = stdGrad;
-        ctx.fill();
-        ctx.restore();
-
-        // Clean standard line
-        ctx.save();
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.8;
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 3;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.globalAlpha = 0.92;
-        ctx.beginPath();
-        drawSmoothPath(pts, true);
-        ctx.stroke();
-        ctx.restore();
-
-        // Rightmost edge dot
-        const last = series.livePt || pts[pts.length - 1];
-        ctx.save();
-        ctx.fillStyle = color;
-        ctx.shadowColor = color;
-        ctx.shadowBlur = 4;
-        ctx.beginPath();
-        ctx.arc(last.x, last.y, 2.2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
-    };
-
-    // Clip lines strictly to the plot area so scrolling wave leaves the left cleanly
+    // Strict clipping to grid plot area
     const canClip = typeof ctx.rect === "function" && typeof ctx.clip === "function";
     if (canClip) {
       ctx.save();
       ctx.beginPath();
-      ctx.rect(padLeft, padTop - 2, plotW, plotH + 4);
+      ctx.rect(plotX, plotY, plotW, plotH + 2);
       ctx.clip();
     }
 
-    if (hasHover) {
-      // Draw non-hovered (dimmed) lines first
-      coreSeries
-        .filter((s) => s.idx !== activeHoverIndex)
-        .forEach((s) => renderSeriesLine(s, false, true));
+    if (!showCores) {
+      // OVERALL UTILIZATION VIEW
+      let rawData = [];
+      if (cpuOverallHistoryBuffer.length > 0) {
+        rawData = cpuOverallHistoryBuffer;
+      } else if (allBuffers.length > 0 && Array.isArray(allBuffers[0]) && allBuffers[0].length > 0) {
+        rawData = allBuffers[0];
+      } else if (isSingleBuffer && buffers.length > 0) {
+        rawData = buffers;
+      }
 
-      // Draw active hovered (emphasized) line on top
-      const hoveredSeries = coreSeries.find((s) => s.idx === activeHoverIndex);
-      if (hoveredSeries) {
-        renderSeriesLine(hoveredSeries, true, false);
+      if (rawData.length > 0) {
+        const n = rawData.length;
+        const offset = Math.max(0, maxSamples - n);
+        const pts = [];
+
+        for (let i = 0; i < n; i++) {
+          const col = offset + i;
+          const val = Math.max(0, Math.min(100, Number(rawData[i]) || 0));
+          const x = plotX + col * stepX;
+          const y = plotY + plotH * (1 - val / 100);
+          pts.push({ x, y });
+        }
+
+        if (pts.length > 0 && pts[0].x > plotX) {
+          pts.unshift({ x: plotX, y: pts[0].y });
+        }
+
+        if (pts.length >= 2) {
+          // Gradient area fill underneath (rgba(0, 210, 255, 0.18) fading to rgba(0, 210, 255, 0.0))
+          const areaGrad = ctx.createLinearGradient(0, plotY, 0, plotY + plotH);
+          areaGrad.addColorStop(0, "rgba(0, 210, 255, 0.18)");
+          areaGrad.addColorStop(1, "rgba(0, 210, 255, 0.0)");
+
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, plotY + plotH);
+          for (let i = 0; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+          }
+          ctx.lineTo(pts[pts.length - 1].x, plotY + plotH);
+          ctx.closePath();
+          ctx.fillStyle = areaGrad;
+          ctx.fill();
+
+          // Crisp 2px solid cyan/blue stroke (#00d2ff)
+          ctx.beginPath();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "#00d2ff";
+          ctx.lineCap = "square";
+          ctx.lineJoin = "miter";
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+          }
+          ctx.stroke();
+        }
       }
     } else {
-      // Draw all lines cleanly
-      coreSeries.forEach((s) => renderSeriesLine(s, false, false));
+      // LOGICAL PROCESSORS VIEW
+      const hasHover = activeHoverIndex !== null && activeHoverIndex !== undefined && activeHoverIndex >= 0;
+
+      for (let idx = 0; idx < allBuffers.length; idx++) {
+        const buf = allBuffers[idx];
+        if (!buf || buf.length === 0) continue;
+
+        const isEmphasized = hasHover && activeHoverIndex === idx;
+        const isDimmed = hasHover && !isEmphasized;
+        const color = CPU_CORE_COLORS[idx % CPU_CORE_COLORS.length];
+
+        const n = buf.length;
+        const offset = Math.max(0, maxSamples - n);
+        const pts = [];
+
+        for (let i = 0; i < n; i++) {
+          const col = offset + i;
+          const val = Math.max(0, Math.min(100, Number(buf[i]) || 0));
+          const x = plotX + col * stepX;
+          const y = plotY + plotH * (1 - val / 100);
+          pts.push({ x, y });
+        }
+
+        if (pts.length > 0 && pts[0].x > plotX) {
+          pts.unshift({ x: plotX, y: pts[0].y });
+        }
+
+        if (pts.length >= 2) {
+          if (isEmphasized) {
+            const areaGrad = ctx.createLinearGradient(0, plotY, 0, plotY + plotH);
+            areaGrad.addColorStop(0, `${color}33`);
+            areaGrad.addColorStop(1, `${color}00`);
+
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, plotY + plotH);
+            for (let i = 0; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.lineTo(pts[pts.length - 1].x, plotY + plotH);
+            ctx.closePath();
+            ctx.fillStyle = areaGrad;
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.lineWidth = 2.4;
+            ctx.strokeStyle = color;
+            ctx.lineJoin = "miter";
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.stroke();
+          } else if (isDimmed) {
+            ctx.save();
+            ctx.globalAlpha = 0.2;
+            ctx.beginPath();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = color;
+            ctx.lineJoin = "miter";
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.stroke();
+            ctx.restore();
+          } else {
+            ctx.beginPath();
+            ctx.lineWidth = 1.6;
+            ctx.strokeStyle = color;
+            ctx.lineJoin = "miter";
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+            ctx.stroke();
+          }
+        }
+      }
     }
 
     if (canClip) {
-      ctx.restore(); // unclip
+      ctx.restore();
     }
-    ctx.restore(); // outer restore
+    ctx.restore();
   };
 
-  if (direct || (typeof liveAnimState !== "undefined" && liveAnimState.isRunning)) {
+  if (direct) {
     render();
   } else if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
     if (canvas._cpuRafId) {
@@ -3537,12 +3543,51 @@ function pollDockerUpdates() {
   }
 }
 
+/**
+ * Apply Task Manager update speed setting (high: 0.5s, normal: 1s, low: 2s, paused: 0).
+ * Persists selection to localStorage and adjusts SSE/WS cadence and polling fallback.
+ */
+function applyTaskMgrSpeed(speed) {
+  if (!TASKMGR_SPEED_SETTINGS[speed]) {
+    speed = "normal";
+  }
+  currentTaskMgrSpeed = speed;
+  if (typeof localStorage !== "undefined") {
+    try {
+      localStorage.setItem("systemalerts_update_speed", speed);
+    } catch (_) {}
+  }
+  const select = document.getElementById("taskmgr-update-speed-select");
+  if (select && select.value !== speed) {
+    select.value = speed;
+  }
+  if (currentTaskMgrSpeed === "paused") {
+    stopPolling();
+  } else if (!sseConnected) {
+    stopPolling();
+    const ms = TASKMGR_SPEED_SETTINGS[currentTaskMgrSpeed]?.intervalMs || AUTO_REFRESH_INTERVAL_MS;
+    refreshTimerId = window.setInterval(refreshDashboard, ms);
+  }
+
+  // Notify backend live telemetry worker of requested Task Manager cadence
+  if (currentTaskMgrSpeed !== "paused" && typeof apiFetch === "function" && isAuthenticated) {
+    apiFetch("/api/stream/interval", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ speed: currentTaskMgrSpeed }),
+    }).catch(() => {});
+  }
+}
+
 function adjustAdaptivePolling(isSSEActive) {
   if (isSSEActive) {
     stopPolling();
   } else {
     stopPolling();
-    refreshTimerId = window.setInterval(refreshDashboard, AUTO_REFRESH_INTERVAL_MS);
+    if (currentTaskMgrSpeed !== "paused") {
+      const ms = TASKMGR_SPEED_SETTINGS[currentTaskMgrSpeed]?.intervalMs || AUTO_REFRESH_INTERVAL_MS;
+      refreshTimerId = window.setInterval(refreshDashboard, ms);
+    }
   }
 }
 
@@ -3774,9 +3819,17 @@ function prependNotificationRow(entry) {
 
 /**
  * Handle fine-grained SSE telemetry data.
+ * Zero DOM Thrashing & Calm In-Place Updates:
+ * - Direct in-place DOM updates with smooth CSS transitions.
+ * - Respects Task Manager update speed setting (high: 0.5s, normal: 1s, low: 2s, paused: 0).
+ * - Does not flash header last-updated timestamp.
  */
 function handleSSETelemetry(data) {
   if (!data || typeof data !== "object") return;
+
+  if (currentTaskMgrSpeed === "paused") {
+    return;
+  }
 
   // 1. CPU Telemetry
   const cpuPercent = Number(
@@ -3784,18 +3837,20 @@ function handleSSETelemetry(data) {
   );
   if (!Number.isNaN(cpuPercent)) {
     liveAnimState.targetCpu = cpuPercent;
-    if (!liveAnimState.initialized) {
-      liveAnimState.currentCpu = cpuPercent;
-      liveAnimState.renderedCpu = cpuPercent;
+    liveAnimState.currentCpu = cpuPercent;
+    liveAnimState.renderedCpu = cpuPercent;
+
+    cpuOverallHistoryBuffer.push(cpuPercent);
+    if (cpuOverallHistoryBuffer.length > CPU_CORE_HISTORY_LIMIT) {
+      cpuOverallHistoryBuffer.shift();
     }
+
     const cpuBarEl = document.getElementById("cpu-progress-bar");
     if (cpuBarEl && typeof updateProgressBar === "function") {
       updateProgressBar(cpuBarEl, cpuPercent);
     }
-    if (!liveAnimState.isRunning) {
-      const cpuValEl = document.getElementById("cpu-percent-value");
-      if (cpuValEl) setTextIfChanged(cpuValEl, `${cpuPercent.toFixed(1)}%`);
-    }
+    const cpuValEl = document.getElementById("cpu-percent-value");
+    if (cpuValEl) setTextIfChanged(cpuValEl, `${cpuPercent.toFixed(1)}%`);
   }
 
   // CPU Cores Badge and grid
@@ -3814,19 +3869,8 @@ function handleSSETelemetry(data) {
     }
 
     liveAnimState.targetCores = cores.map((c) => Math.max(0, Math.min(100, Number(c) || 0)));
-    if (!liveAnimState.initialized || liveAnimState.currentCores.length !== cores.length) {
-      liveAnimState.currentCores = [...liveAnimState.targetCores];
-      liveAnimState.renderedCores = [...liveAnimState.targetCores];
-    }
-
-    const nowTs = typeof performance !== "undefined" && typeof performance.now === "function" ? performance.now() : Date.now();
-    if (liveAnimState.lastSampleTime > 0) {
-      const dt = nowTs - liveAnimState.lastSampleTime;
-      if (dt > 30 && dt < 5000) {
-        liveAnimState.estimatedSampleInterval = liveAnimState.estimatedSampleInterval * 0.7 + dt * 0.3;
-      }
-    }
-    liveAnimState.lastSampleTime = nowTs;
+    liveAnimState.currentCores = [...liveAnimState.targetCores];
+    liveAnimState.renderedCores = [...liveAnimState.targetCores];
 
     const coresGrid = document.getElementById("cpu-cores-grid");
     const currentCoreValues = [];
@@ -3868,7 +3912,7 @@ function handleSSETelemetry(data) {
               document.getElementById("cpu-cores-unified-canvas") ||
               document.querySelector(".cpu-core-canvas");
             if (unifiedCanvas && typeof drawCpuCoreGraph === "function") {
-              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, activeHoveredCoreIndex);
+              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, activeHoveredCoreIndex, true);
             }
           });
           item.addEventListener("mouseleave", () => {
@@ -3882,7 +3926,7 @@ function handleSSETelemetry(data) {
               document.getElementById("cpu-cores-unified-canvas") ||
               document.querySelector(".cpu-core-canvas");
             if (unifiedCanvas && typeof drawCpuCoreGraph === "function") {
-              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, null);
+              drawCpuCoreGraph(unifiedCanvas, cpuCoresHistoryBuffers, currentValues, null, true);
             }
           });
         });
@@ -3910,10 +3954,8 @@ function handleSSETelemetry(data) {
               fillEl.style.backgroundColor = color;
             }
           }
-          if (!liveAnimState.isRunning) {
-            const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
-            if (pctEl) setTextIfChanged(pctEl, `${cPercent.toFixed(1)}%`);
-          }
+          const pctEl = item.querySelector ? item.querySelector(".cpu-core-percent") : null;
+          if (pctEl) setTextIfChanged(pctEl, `${cPercent.toFixed(1)}%`);
         }
       });
     } else {
@@ -3934,20 +3976,14 @@ function handleSSETelemetry(data) {
     const unifiedCanvas =
       document.getElementById("cpu-cores-unified-canvas") ||
       document.querySelector(".cpu-core-canvas");
-    if (!liveAnimState.isRunning && unifiedCanvas && typeof unifiedCanvas.getContext === "function" && typeof drawCpuCoreGraph === "function") {
-      const rAF = typeof window !== "undefined" && window.requestAnimationFrame
-        ? window.requestAnimationFrame
-        : typeof requestAnimationFrame === "function"
-          ? requestAnimationFrame
-          : (cb) => cb();
-      rAF(() => {
-        drawCpuCoreGraph(
-          unifiedCanvas,
-          cpuCoresHistoryBuffers,
-          currentCoreValues,
-          typeof activeHoveredCoreIndex !== "undefined" ? activeHoveredCoreIndex : null
-        );
-      });
+    if (unifiedCanvas && typeof unifiedCanvas.getContext === "function" && typeof drawCpuCoreGraph === "function") {
+      drawCpuCoreGraph(
+        unifiedCanvas,
+        cpuCoresHistoryBuffers,
+        currentCoreValues,
+        typeof activeHoveredCoreIndex !== "undefined" ? activeHoveredCoreIndex : null,
+        true
+      );
     }
   }
 
@@ -3989,18 +4025,15 @@ function handleSSETelemetry(data) {
   );
   if (!Number.isNaN(memPercent)) {
     liveAnimState.targetRam = memPercent;
-    if (!liveAnimState.initialized) {
-      liveAnimState.currentRam = memPercent;
-      liveAnimState.renderedRam = memPercent;
-    }
+    liveAnimState.currentRam = memPercent;
+    liveAnimState.renderedRam = memPercent;
+
     const memBarEl = document.getElementById("memory-progress-bar");
     if (memBarEl && typeof updateProgressBar === "function") {
       updateProgressBar(memBarEl, memPercent);
     }
-    if (!liveAnimState.isRunning) {
-      const memValEl = document.getElementById("memory-percent-value");
-      if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
-    }
+    const memValEl = document.getElementById("memory-percent-value");
+    if (memValEl) setTextIfChanged(memValEl, `${memPercent.toFixed(1)}%`);
 
     // Memory rolling historical trend chart
     memoryHistoryBuffer.push(memPercent);
@@ -4008,7 +4041,7 @@ function handleSSETelemetry(data) {
       memoryHistoryBuffer.shift();
     }
     if (typeof renderMemoryHistoryChart === "function") {
-      renderMemoryHistoryChart(memoryHistoryBuffer);
+      renderMemoryHistoryChart(memoryHistoryBuffer, true);
     }
   }
   if (mem.used !== undefined || mem.used_gb !== undefined || mem.total !== undefined || mem.total_gb !== undefined) {
@@ -4055,18 +4088,15 @@ function handleSSETelemetry(data) {
   );
   if (!Number.isNaN(diskPercent)) {
     liveAnimState.targetDisk = diskPercent;
-    if (!liveAnimState.initialized) {
-      liveAnimState.currentDisk = diskPercent;
-      liveAnimState.renderedDisk = diskPercent;
-    }
+    liveAnimState.currentDisk = diskPercent;
+    liveAnimState.renderedDisk = diskPercent;
+
     const diskBarEl = document.getElementById("disk-progress-bar");
     if (diskBarEl && typeof updateProgressBar === "function") {
       updateProgressBar(diskBarEl, diskPercent);
     }
-    if (!liveAnimState.isRunning) {
-      const diskValEl = document.getElementById("disk-percent-value");
-      if (diskValEl) setTextIfChanged(diskValEl, `${diskPercent.toFixed(1)}%`);
-    }
+    const diskValEl = document.getElementById("disk-percent-value");
+    if (diskValEl) setTextIfChanged(diskValEl, `${diskPercent.toFixed(1)}%`);
   }
   if (disk.used !== undefined || disk.used_gb !== undefined || disk.total !== undefined || disk.total_gb !== undefined) {
     const diskDetailEl = document.getElementById("disk-detail");
@@ -4083,8 +4113,8 @@ function handleSSETelemetry(data) {
     }
   }
 
-  // 4. Update Header Timestamp (throttled to at least 5 seconds during telemetry stream)
-  updateHeaderLastUpdated(false);
+  // Header last-updated timestamp is intentionally NOT updated here to stop rapid flashing.
+  // Full snapshots and manual clicks refresh the header timestamp instead.
 }
 
 if (typeof VigilLiveStore !== "undefined") {
@@ -4255,7 +4285,12 @@ function initSSEStream() {
   closeSSEStream();
 
   const authToken = getStoredToken();
-  const query = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const params = [];
+  if (authToken) params.push(`token=${encodeURIComponent(authToken)}`);
+  if (currentTaskMgrSpeed && currentTaskMgrSpeed !== "paused") {
+    params.push(`interval=${encodeURIComponent(currentTaskMgrSpeed)}`);
+  }
+  const query = params.length > 0 ? `?${params.join("&")}` : "";
   const sseUrl = `/api/events${query}`;
 
   try {
@@ -7790,6 +7825,21 @@ async function fetchProcesses() {
   }
 }
 
+/**
+ * Compute Windows Task Manager style pastel heat-shading for CPU% and Memory% cells.
+ * Returns subtle background color proportional to percentage (yellow/amber/orange heat).
+ */
+function getTaskMgrProcessHeatStyle(pct) {
+  if (!pct || pct < 0.1) return "";
+  const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+  const intensity = clamped / 100;
+  // Blend from warm amber/yellow (45, 95%, 52%) to orange-red (14, 95%, 45%)
+  const hue = 45 - intensity * 31;
+  const lightness = 52 - intensity * 8;
+  const alpha = (0.12 + intensity * 0.55).toFixed(2);
+  return `background-color: hsla(${hue.toFixed(0)}, 95%, ${lightness.toFixed(0)}%, ${alpha});`;
+}
+
 function renderProcesses(data) {
   if (!data) return;
 
@@ -7842,12 +7892,15 @@ function renderProcesses(data) {
     const isRunning = (p.status || "").toLowerCase() === "running";
     const statusBadgeClass = isRunning ? "status-badge status-ok" : "status-badge status-muted";
 
+    const cpuHeatStyle = getTaskMgrProcessHeatStyle(cpuPct);
+    const memHeatStyle = getTaskMgrProcessHeatStyle(memPct);
+
     return `
       <tr>
         <td class="mono-text font-bold">${p.pid}</td>
         <td class="font-bold">${escapeHtml(p.name || "unknown")}</td>
         <td class="text-secondary mono-text">${escapeHtml(p.username || "-")}</td>
-        <td class="proc-metric-cell">
+        <td class="proc-metric-cell" style="${cpuHeatStyle}">
           <div class="proc-metric-row">
             <span class="mono-text">${cpuPct.toFixed(1)}%</span>
           </div>
@@ -7855,7 +7908,7 @@ function renderProcesses(data) {
             <div class="${cpuBarClass}" style="width: ${cpuPct.toFixed(1)}%"></div>
           </div>
         </td>
-        <td class="proc-metric-cell">
+        <td class="proc-metric-cell" style="${memHeatStyle}">
           <div class="proc-metric-row">
             <span class="mono-text">${memPct.toFixed(1)}%</span>
           </div>
@@ -18347,6 +18400,26 @@ function initDashboard() {
 
   updateCronFormTaskConfigVisibility();
 
+  // Task Manager Update Speed Selector
+  const speedSelect = document.getElementById("taskmgr-update-speed-select");
+  if (speedSelect) {
+    speedSelect.value = currentTaskMgrSpeed;
+    speedSelect.addEventListener("change", (e) => {
+      applyTaskMgrSpeed(e.target.value);
+    });
+  }
+
+  // CPU Graph View Mode Selector (Overall vs Logical Processors)
+  const btnCpuOverall = document.getElementById("btn-cpu-view-overall");
+  const btnCpuCores = document.getElementById("btn-cpu-view-cores");
+  if (btnCpuOverall) {
+    btnCpuOverall.addEventListener("click", () => setCpuViewMode("overall"));
+  }
+  if (btnCpuCores) {
+    btnCpuCores.addEventListener("click", () => setCpuViewMode("cores"));
+  }
+  setCpuViewMode(currentCpuViewMode);
+
   initTelemetryTimeMachine();
 
   initActionsDropdowns();
@@ -18364,6 +18437,9 @@ if (typeof window !== "undefined") {
   window.startLiveRenderLoop = startLiveRenderLoop;
   window.stopLiveRenderLoop = stopLiveRenderLoop;
   window.drawCpuCoreGraph = drawCpuCoreGraph;
+  window.setCpuViewMode = setCpuViewMode;
+  window.applyTaskMgrSpeed = applyTaskMgrSpeed;
+  window.getTaskMgrProcessHeatStyle = getTaskMgrProcessHeatStyle;
   window.initSSEStream = initSSEStream;
   window.initSSEConnection = initSSEConnection;
   window.closeSSEStream = closeSSEStream;

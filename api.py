@@ -9,7 +9,7 @@ import sqlite3
 from subprocess import CalledProcessError
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -126,6 +126,70 @@ _live_telemetry_task: Optional[asyncio.Task] = None
 _eval_loop_count: int = 0
 _last_live_telemetry_broadcast: float = 0.0
 
+DEFAULT_TELEMETRY_INTERVAL: float = 1.0
+TELEMETRY_SPEED_PRESETS: dict[str, float] = {
+    "high": 0.5,
+    "normal": 1.0,
+    "low": 2.0,
+}
+_current_telemetry_interval: float = DEFAULT_TELEMETRY_INTERVAL
+_subscriber_intervals: dict[Any, float] = {}
+
+
+def parse_telemetry_interval(val: Optional[Union[float, str]]) -> Optional[float]:
+    """Parse a requested telemetry interval or preset speed name into seconds."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return max(0.1, min(10.0, float(val)))
+    val_str = str(val).strip().lower()
+    if not val_str:
+        return None
+    if val_str in TELEMETRY_SPEED_PRESETS:
+        return TELEMETRY_SPEED_PRESETS[val_str]
+    aliases = {
+        "fast": 0.5,
+        "medium": 1.0,
+        "default": 1.0,
+        "slow": 2.0,
+    }
+    if val_str in aliases:
+        return aliases[val_str]
+    try:
+        parsed = float(val_str)
+        return max(0.1, min(10.0, parsed))
+    except (ValueError, TypeError):
+        return None
+
+
+def get_telemetry_speed_name(interval: float) -> str:
+    """Return standard Task Manager speed label ('high', 'normal', 'low', or 'custom')."""
+    for speed, target in TELEMETRY_SPEED_PRESETS.items():
+        if abs(interval - target) < 0.05:
+            return speed
+    return "custom"
+
+
+def get_telemetry_stream_interval() -> float:
+    """Get the active telemetry streaming interval, respecting any subscriber requests."""
+    global _current_telemetry_interval, _subscriber_intervals
+    if _subscriber_intervals:
+        return min(min(_subscriber_intervals.values()), _current_telemetry_interval)
+    return _current_telemetry_interval
+
+
+def set_telemetry_stream_interval(interval: float) -> None:
+    """Set the dynamic telemetry streaming interval."""
+    global _current_telemetry_interval
+    _current_telemetry_interval = max(0.1, min(10.0, float(interval)))
+
+
+def reset_telemetry_stream_interval() -> None:
+    """Reset dynamic telemetry interval and subscriber overrides to default 1.0s."""
+    global _current_telemetry_interval, _subscriber_intervals
+    _current_telemetry_interval = DEFAULT_TELEMETRY_INTERVAL
+    _subscriber_intervals.clear()
+
 
 def get_live_telemetry_tick() -> dict[str, Any]:
     """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming."""
@@ -137,7 +201,9 @@ reset_live_telemetry_ewma = main.reset_live_telemetry_ewma
 
 def is_live_telemetry_streaming() -> bool:
     """Return True if live_telemetry_stream_worker is actively streaming."""
-    if time.time() - _last_live_telemetry_broadcast < 2.0:
+    curr_interval = get_telemetry_stream_interval()
+    threshold = max(3.0, curr_interval * 2.5)
+    if time.time() - _last_live_telemetry_broadcast < threshold:
         return True
     if _live_telemetry_task and not _live_telemetry_task.done():
         if "live_state_hub" in globals() and live_state_hub is not None:
@@ -149,9 +215,10 @@ def is_live_telemetry_streaming() -> bool:
     return False
 
 
-async def live_telemetry_stream_worker(interval: float = 0.25) -> None:
-    """Continuously stream 0.25s (250ms) high-speed non-blocking live telemetry to SSE and WebSocket clients."""
-    global _last_live_telemetry_broadcast
+async def live_telemetry_stream_worker(interval: float = 1.0) -> None:
+    """Continuously stream 1.0s (Normal Task Manager cadence) non-blocking live telemetry to SSE and WebSocket clients."""
+    global _last_live_telemetry_broadcast, _current_telemetry_interval
+    _current_telemetry_interval = interval
     while True:
         try:
             active_subs = getattr(sse_manager, "active_subscribers", 0)
@@ -182,7 +249,8 @@ async def live_telemetry_stream_worker(interval: float = 0.25) -> None:
             logging.debug(f"Live telemetry stream worker error: {exc}")
 
         try:
-            await asyncio.sleep(interval)
+            current_sleep = get_telemetry_stream_interval()
+            await asyncio.sleep(current_sleep)
         except asyncio.CancelledError:
             break
 
@@ -243,7 +311,7 @@ async def lifespan(app: FastAPI):
     if _sentinel_probes_task is None or _sentinel_probes_task.done():
         _sentinel_probes_task = asyncio.create_task(main.sentinel_probes_worker())
     if _live_telemetry_task is None or _live_telemetry_task.done():
-        _live_telemetry_task = asyncio.create_task(live_telemetry_stream_worker(0.25))
+        _live_telemetry_task = asyncio.create_task(live_telemetry_stream_worker(1.0))
     try:
         yield
     finally:
@@ -499,6 +567,11 @@ def format_sse(event: str, data: Any) -> str:
         except Exception:
             payload_str = str(data)
     return f"event: {event}\ndata: {payload_str}\n\n"
+
+
+class StreamIntervalRequest(BaseModel):
+    interval: Optional[Union[float, str]] = None
+    speed: Optional[str] = None
 
 
 class SetupRequest(BaseModel):
@@ -1394,10 +1467,18 @@ async def sse_event_generator(
         logging.debug(f"SSE generator error: {exc}")
     finally:
         sse_manager.unsubscribe(queue)
+        _subscriber_intervals.pop(queue, None)
 
 
-async def _sse_stream_response(request: Request, ping_interval: float = 15.0) -> StreamingResponse:
+async def _sse_stream_response(
+    request: Request,
+    ping_interval: float = 15.0,
+    interval: Optional[Union[float, str]] = None,
+) -> StreamingResponse:
     queue = sse_manager.subscribe()
+    parsed_interval = parse_telemetry_interval(interval)
+    if parsed_interval is not None:
+        _subscriber_intervals[queue] = parsed_interval
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -1414,18 +1495,70 @@ async def _sse_stream_response(request: Request, ping_interval: float = 15.0) ->
 async def api_events_stream(
     request: Request,
     ping_interval: float = Query(default=15.0, ge=0.01, le=120.0),
+    interval: Optional[str] = Query(default=None),
+    speed: Optional[str] = Query(default=None),
     _user: str = Depends(require_auth),
 ) -> StreamingResponse:
-    return await _sse_stream_response(request, ping_interval=ping_interval)
+    req_interval = interval if interval is not None else speed
+    return await _sse_stream_response(request, ping_interval=ping_interval, interval=req_interval)
 
 
 @app.get("/api/stream/events")
 async def api_stream_events_alias(
     request: Request,
     ping_interval: float = Query(default=15.0, ge=0.01, le=120.0),
+    interval: Optional[str] = Query(default=None),
+    speed: Optional[str] = Query(default=None),
     _user: str = Depends(require_auth),
 ) -> StreamingResponse:
-    return await _sse_stream_response(request, ping_interval=ping_interval)
+    req_interval = interval if interval is not None else speed
+    return await _sse_stream_response(request, ping_interval=ping_interval, interval=req_interval)
+
+
+@app.get("/api/stream/interval")
+async def get_stream_interval_endpoint(_user: str = Depends(require_auth)) -> dict[str, Any]:
+    curr = get_telemetry_stream_interval()
+    return {
+        "interval": curr,
+        "speed": get_telemetry_speed_name(curr),
+        "presets": TELEMETRY_SPEED_PRESETS,
+    }
+
+
+@app.post("/api/stream/interval")
+@app.put("/api/stream/interval")
+async def set_stream_interval_endpoint(
+    payload: Optional[StreamIntervalRequest] = None,
+    interval: Optional[str] = Query(default=None),
+    speed: Optional[str] = Query(default=None),
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    req_val = None
+    if payload:
+        req_val = payload.interval if payload.interval is not None else payload.speed
+    if req_val is None:
+        req_val = interval if interval is not None else speed
+
+    if req_val is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing interval or speed parameter.",
+        )
+
+    parsed = parse_telemetry_interval(req_val)
+    if parsed is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid interval or speed preset. Expected 0.5 (high), 1.0 (normal), or 2.0 (low).",
+        )
+
+    set_telemetry_stream_interval(parsed)
+    return {
+        "status": "ok",
+        "interval": parsed,
+        "speed": get_telemetry_speed_name(parsed),
+        "presets": TELEMETRY_SPEED_PRESETS,
+    }
 
 
 @app.websocket("/ws")
@@ -1560,6 +1693,18 @@ async def api_websocket(websocket: WebSocket) -> None:
                                 "refresh_intervals": main.get_refresh_intervals(),
                             }
                         )
+                    elif action in ("set_interval", "set_telemetry_interval", "set_speed"):
+                        req_val = data.get("interval") if data.get("interval") is not None else data.get("speed")
+                        parsed = parse_telemetry_interval(req_val)
+                        if parsed is not None:
+                            set_telemetry_stream_interval(parsed)
+                            await websocket.send_json(
+                                {
+                                    "type": "telemetry_interval_updated",
+                                    "interval": parsed,
+                                    "speed": get_telemetry_speed_name(parsed),
+                                }
+                            )
             except asyncio.TimeoutError:
                 tick_count += 1
                 intervals = main.get_refresh_intervals()

@@ -2,6 +2,19 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.49] - 2026-11-13
+### Added
+- **Iconic Task Manager 60-Second Rolling Grid Canvas**: Dark grid palette (`#1a2634` grid, `#0d131a` background) with a 60-point rolling buffer and cyan gradient fill (`#00d2ff`) rendering continuous CPU and per-core oscilloscope charts.
+- **Task Manager Update Speed Selector**: Topbar control offering `High (0.5s) | Normal (1s) | Low (2s) | Paused (0s)` connected to backend `/api/stream/interval` for dynamic SSE stream frequency tuning.
+- **Calm Meter Easing Transitions**: Replaced hyperactive RAF DOM mutation loops with calm `0.4s cubic-bezier(0.25, 0.1, 0.25, 1)` transitions, ensuring gauges settle gracefully before subsequent ticks.
+- **Tabular Numerals Across Metrics**: Standardized `font-variant-numeric: tabular-nums` across CPU, RAM, swap, and disk metrics eliminating digit jitter.
+- **Overall CPU vs Logical Processors Multi-Core Toggle**: View mode selector with `localStorage` persistence switching between single aggregate graph and multi-core logical processor grids.
+- **Task Manager Process Explorer Heatmap Shading**: Dynamic subtle pastel heatmap tinting on CPU% and Memory% cells for instantaneous hotspot detection.
+
+### Changed
+- **Full Backward Compatibility**: Retained 100% contract compliance across all 64 REST API endpoints and 722 client DOM element contracts.
+- **Zero DOM Thrashing**: Streamlined telemetry dispatch to eliminate redundant DOM mutation loops.
+
 ## [1.0.48] - 2026-11-13
 ### Fixed
 - **WebSocket Telemetry Message Routing**: Added early `return;` after telemetry dispatch in `handleWebSocketMessage` (`static/app.js`), preventing 4 Hz telemetry packets from triggering full snapshot re-renders and excessive `last-updated` timestamp churn.
