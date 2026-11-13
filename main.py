@@ -11063,6 +11063,74 @@ def get_system_metrics_data() -> dict[str, Any]:
     }
 
 
+def get_live_telemetry_tick() -> dict[str, Any]:
+    """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming."""
+    try:
+        cpu_percent = psutil.cpu_percent(interval=None)
+    except Exception:
+        cpu_percent = 0.0
+
+    try:
+        cpu_cores = psutil.cpu_percent(percpu=True)
+    except Exception:
+        cpu_cores = [cpu_percent]
+
+    try:
+        vm = psutil.virtual_memory()
+    except Exception:
+        vm = None
+
+    try:
+        load_avg = list(os.getloadavg()) if hasattr(os, "getloadavg") else []
+    except Exception:
+        load_avg = []
+
+    cores_list = [
+        round(float(c or 0.0), 1)
+        for c in (cpu_cores if isinstance(cpu_cores, list) else [cpu_percent])
+    ]
+
+    tick = {
+        "cpu": {
+            "percent": round(float(cpu_percent or 0.0), 1),
+            "cores": cores_list,
+        },
+        "memory": {
+            "percent": round(float(getattr(vm, "percent", 0.0) or 0.0), 1) if vm else 0.0,
+            "used": int(getattr(vm, "used", 0) or 0) if vm else 0,
+            "total": int(getattr(vm, "total", 0) or 0) if vm else 0,
+            "available": int(getattr(vm, "available", 0) or 0) if vm else 0,
+            "free": int(getattr(vm, "free", 0) or 0) if vm else 0,
+            "cached": int(getattr(vm, "cached", 0) or 0) if vm else 0,
+        },
+        "load_avg": [round(float(x), 2) for x in load_avg],
+        "timestamp": time.time(),
+    }
+    if "live_state_hub" in globals() and globals()["live_state_hub"] is not None:
+        globals()["live_state_hub"]._last_tick = tick
+    return tick
+
+
+class LiveStateHub:
+    """Central State Hub maintaining real-time telemetry and system status."""
+
+    def __init__(self) -> None:
+        self._last_tick: Optional[dict[str, Any]] = None
+
+    def tick(self) -> dict[str, Any]:
+        """Generate and store a new live telemetry tick."""
+        tick = get_live_telemetry_tick()
+        self._last_tick = tick
+        return tick
+
+    @property
+    def latest_tick(self) -> Optional[dict[str, Any]]:
+        return self._last_tick
+
+
+live_state_hub = LiveStateHub()
+
+
 _last_telemetry_net_sample: Optional[tuple[float, int, int]] = None
 TELEMETRY_RANGE_SECONDS: dict[str, int] = {
     "1h": 3600,

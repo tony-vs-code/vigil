@@ -381,6 +381,137 @@ class TestSSEStreaming(unittest.TestCase):
         asyncio.run(_test())
 
     # -------------------------------------------------------------------------
+    # 4. Live Telemetry Tick & Dedicated Streaming Worker Tests
+    # -------------------------------------------------------------------------
+    def test_get_live_telemetry_tick_schema(self):
+        tick = main.get_live_telemetry_tick()
+        self.assertIsInstance(tick, dict)
+        self.assertIn("cpu", tick)
+        self.assertIn("memory", tick)
+        self.assertIn("load_avg", tick)
+        self.assertIn("timestamp", tick)
+
+        # CPU block
+        self.assertIn("percent", tick["cpu"])
+        self.assertIsInstance(tick["cpu"]["percent"], (int, float))
+        self.assertIn("cores", tick["cpu"])
+        self.assertIsInstance(tick["cpu"]["cores"], list)
+        self.assertGreater(len(tick["cpu"]["cores"]), 0)
+        for core_val in tick["cpu"]["cores"]:
+            self.assertIsInstance(core_val, (int, float))
+
+        # Memory block
+        mem = tick["memory"]
+        for key in ("percent", "used", "total", "available", "free", "cached"):
+            self.assertIn(key, mem)
+        self.assertIsInstance(mem["percent"], (int, float))
+        self.assertIsInstance(mem["used"], int)
+        self.assertIsInstance(mem["total"], int)
+        self.assertIsInstance(mem["available"], int)
+        self.assertIsInstance(mem["free"], int)
+        self.assertIsInstance(mem["cached"], int)
+
+        # Load avg and timestamp
+        self.assertIsInstance(tick["load_avg"], list)
+        self.assertIsInstance(tick["timestamp"], float)
+        self.assertGreater(tick["timestamp"], 0.0)
+
+    def test_get_live_telemetry_tick_non_blocking_performance(self):
+        # Warmup
+        main.get_live_telemetry_tick()
+
+        iterations = 25
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            tick = main.get_live_telemetry_tick()
+            self.assertIn("cpu", tick)
+        duration = time.perf_counter() - t0
+        avg_ms = (duration / iterations) * 1000.0
+        # Must execute non-blocking, well below 5.0ms per tick (typically <0.5ms)
+        self.assertLess(avg_ms, 5.0, f"Tick collection took too long: {avg_ms:.2f}ms")
+
+    def test_get_live_telemetry_tick_error_fallbacks(self):
+        from unittest.mock import patch
+        with patch("psutil.cpu_percent", side_effect=RuntimeError("psutil cpu error")):
+            with patch("psutil.virtual_memory", side_effect=RuntimeError("psutil mem error")):
+                with patch("os.getloadavg", side_effect=OSError("loadavg unsupported")):
+                    tick = main.get_live_telemetry_tick()
+                    self.assertEqual(tick["cpu"]["percent"], 0.0)
+                    self.assertEqual(tick["cpu"]["cores"], [0.0])
+                    self.assertEqual(tick["memory"]["percent"], 0.0)
+                    self.assertEqual(tick["memory"]["used"], 0)
+                    self.assertEqual(tick["load_avg"], [])
+                    self.assertGreater(tick["timestamp"], 0.0)
+
+    def test_live_telemetry_stream_worker_broadcasts_when_subscribers_exist(self):
+        async def _test():
+            q = api.sse_manager.subscribe()
+            task = asyncio.create_task(api.live_telemetry_stream_worker(interval=0.05))
+            try:
+                event, sample = await asyncio.wait_for(q.get(), timeout=1.5)
+                self.assertEqual(event, "telemetry")
+                self.assertIn("cpu", sample)
+                self.assertIn("memory", sample)
+                self.assertIn("timestamp", sample)
+                self.assertIsInstance(sample["cpu"]["percent"], (int, float))
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                api.sse_manager.unsubscribe(q)
+
+        asyncio.run(_test())
+
+    def test_live_telemetry_stream_worker_idle_when_no_subscribers(self):
+        async def _test():
+            from unittest.mock import patch
+            # Ensure subscribers set is clear
+            for q in list(api.sse_manager.subscribers):
+                api.sse_manager.unsubscribe(q)
+            api.ws_manager.active_connections.clear()
+
+            with patch.object(main, "get_live_telemetry_tick") as mock_tick:
+                task = asyncio.create_task(api.live_telemetry_stream_worker(interval=0.03))
+                await asyncio.sleep(0.1)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                mock_tick.assert_not_called()
+
+        asyncio.run(_test())
+
+    def test_live_state_hub_coordination(self):
+        # Test main.live_state_hub
+        hub_tick = main.live_state_hub.tick()
+        self.assertIsNotNone(hub_tick)
+        self.assertEqual(main.live_state_hub.latest_tick, hub_tick)
+
+        # Test api.live_state_hub
+        for q in list(api.sse_manager.subscribers):
+            api.sse_manager.unsubscribe(q)
+        api.ws_manager.active_connections.clear()
+        self.assertFalse(api.live_state_hub.has_active_subscribers)
+
+        q = api.sse_manager.subscribe()
+        try:
+            self.assertTrue(api.live_state_hub.has_active_subscribers)
+        finally:
+            api.sse_manager.unsubscribe(q)
+
+    def test_api_telemetry_live_endpoint(self):
+        resp = asgi_get(api.app, "/api/telemetry/live", headers=self.auth_headers)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertIn("cpu", data)
+        self.assertIn("memory", data)
+        self.assertIn("load_avg", data)
+        self.assertIn("timestamp", data)
+
+    # -------------------------------------------------------------------------
     # 5. Frontend Node VM SSE Stream Execution & In-Place DOM Patching Tests
     # -------------------------------------------------------------------------
     def test_frontend_node_vm_sse_stream_initialization_and_handlers(self):
@@ -578,6 +709,7 @@ const ctx = vm.createContext({{
   requestAnimationFrame: (cb) => cb(),
   TextDecoder: TextDecoder,
   TextEncoder: TextEncoder,
+  Headers: Headers,
   URLSearchParams: URLSearchParams,
   fetch: async () => ({{ ok: true, status: 200, json: async () => ({{}}) }})
 }});
@@ -607,16 +739,20 @@ for (const ev of reqEvents) {{
 // 3. Trigger open event
 instance.trigger('open');
 if (!vm.runInContext('sseConnected', ctx)) throw new Error("Expected sseConnected to be true on open");
+if (vm.runInContext('VigilLiveStore.getState("connection")', ctx) !== 'live') throw new Error("Expected live connection in VigilLiveStore");
 if (!indicator.classList.contains('stream-active')) throw new Error("Expected stream-active on indicator");
 if (streamText.textContent !== 'Live Stream') throw new Error("Expected 'Live Stream' text, got: " + streamText.textContent);
-if (lastIntervalMs !== 60000) throw new Error("Expected adaptive polling watchdog interval of 60000ms, got: " + lastIntervalMs);
+// Background polling completely eliminated when live
+if (vm.runInContext('refreshTimerId', ctx) !== null) throw new Error("Expected refreshTimerId to be null when live stream connected, got: " + vm.runInContext('refreshTimerId', ctx));
 
 // 4. Trigger error event
 instance.trigger('error');
 if (vm.runInContext('sseConnected', ctx)) throw new Error("Expected sseConnected to be false on error");
+if (vm.runInContext('VigilLiveStore.getState("connection")', ctx) !== 'reconnecting') throw new Error("Expected reconnecting connection in VigilLiveStore");
 if (!indicator.classList.contains('stream-reconnecting')) throw new Error("Expected stream-reconnecting on indicator");
 if (!streamText.textContent.includes('Reconnecting')) throw new Error("Expected Reconnecting text, got: " + streamText.textContent);
 if (lastIntervalMs !== 10000) throw new Error("Expected normal polling safety interval of 10000ms, got: " + lastIntervalMs);
+if (vm.runInContext('refreshTimerId', ctx) === null) throw new Error("Expected refreshTimerId to be set on error for safety polling");
 
 console.log("SUCCESS_INIT_AND_HANDLERS");
 """
@@ -801,6 +937,7 @@ const ctx = vm.createContext({{
   requestAnimationFrame: (cb) => cb(),
   TextDecoder: TextDecoder,
   TextEncoder: TextEncoder,
+  Headers: Headers,
   URLSearchParams: URLSearchParams,
   fetch: async () => ({{ ok: true, status: 200, json: async () => ({{}}) }})
 }});
@@ -853,6 +990,25 @@ if (diskVal.textContent !== '78.9%') throw new Error("diskVal mismatch: " + disk
 if (diskBar.style.width !== '78.9%') throw new Error("diskBar mismatch: " + diskBar.style.width);
 if (!diskDetail.textContent.includes('394.5 GB') || !diskDetail.textContent.includes('500.0 GB')) {{
   throw new Error("diskDetail mismatch: " + diskDetail.textContent);
+}}
+
+// Validate VigilLiveStore and telemetry rolling buffers
+const storeTelem = vm.runInContext('VigilLiveStore.getState("telemetry")', ctx);
+if (!storeTelem || storeTelem.cpu.percent !== 45.2) {{
+  throw new Error("VigilLiveStore telemetry state mismatch");
+}}
+
+const coreBuffers = vm.runInContext('cpuCoresHistoryBuffers', ctx);
+if (!Array.isArray(coreBuffers) || coreBuffers.length !== 2) {{
+  throw new Error("Expected 2 core buffers, got: " + JSON.stringify(coreBuffers));
+}}
+if (coreBuffers[0][coreBuffers[0].length - 1] !== 42.1 || coreBuffers[1][coreBuffers[1].length - 1] !== 48.3) {{
+  throw new Error("Core buffer values mismatch: " + JSON.stringify(coreBuffers));
+}}
+
+const memBuffer = vm.runInContext('memoryHistoryBuffer', ctx);
+if (!Array.isArray(memBuffer) || memBuffer[memBuffer.length - 1] !== 62.4) {{
+  throw new Error("Memory history buffer mismatch: " + JSON.stringify(memBuffer));
 }}
 
 console.log("SUCCESS_TELEMETRY_PATCHING");
@@ -1040,6 +1196,7 @@ const ctx = vm.createContext({{
   requestAnimationFrame: (cb) => cb(),
   TextDecoder: TextDecoder,
   TextEncoder: TextEncoder,
+  Headers: Headers,
   URLSearchParams: URLSearchParams,
   fetch: async () => ({{ ok: true, status: 200, json: async () => ({{}}) }})
 }});
@@ -1125,6 +1282,331 @@ console.log("SUCCESS_DOCKER_AND_NOTIFICATION");
         res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"Node script failed: {res.stderr}\nOutput: {res.stdout}")
         self.assertIn("SUCCESS_DOCKER_AND_NOTIFICATION", res.stdout)
+
+    def test_frontend_node_vm_vigil_live_store_pubsub_and_graph_rolling(self):
+        root = Path(__file__).resolve().parent.parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function createMockElement(id, tagName = 'DIV') {{
+  const classes = new Set();
+  const attributes = {{}};
+  const children = [];
+  let _text = '';
+  const el = {{
+    id: id,
+    tagName: tagName.toUpperCase(),
+    style: {{}},
+    dataset: {{}},
+    children: children,
+    addEventListener: () => {{}},
+    appendChild: (child) => {{ children.push(child); child.parentElement = el; return child; }},
+    removeChild: (child) => {{
+      const idx = children.indexOf(child);
+      if (idx !== -1) children.splice(idx, 1);
+      child.parentElement = null;
+      return child;
+    }},
+    remove: () => {{ if (el.parentElement) el.parentElement.removeChild(el); }},
+    insertBefore: (child, ref) => {{
+      const idx = children.indexOf(ref);
+      if (idx !== -1) children.splice(idx, 0, child);
+      else children.push(child);
+      child.parentElement = el;
+      return child;
+    }},
+    get firstChild() {{ return children[0] || null; }},
+    querySelector: (sel) => findInTree(el, sel),
+    querySelectorAll: (sel) => findAllInTree(el, sel),
+    classList: {{
+      add: (...cls) => cls.forEach(c => classes.add(c)),
+      remove: (...cls) => cls.forEach(c => classes.delete(c)),
+      contains: (cls) => classes.has(cls),
+      toggle: (cls, force) => {{
+        if (force === undefined) {{
+          if (classes.has(cls)) {{ classes.delete(cls); return false; }}
+          classes.add(cls); return true;
+        }}
+        if (force) classes.add(cls); else classes.delete(cls);
+        return Boolean(force);
+      }}
+    }},
+    get className() {{ return Array.from(classes).join(' '); }},
+    set className(val) {{
+      classes.clear();
+      (val || '').split(/\\s+/).filter(Boolean).forEach(c => classes.add(c));
+    }},
+    setAttribute: (name, val) => {{ attributes[name] = String(val); }},
+    getAttribute: (name) => attributes[name] !== undefined ? attributes[name] : null,
+    removeAttribute: (name) => {{ delete attributes[name]; }},
+    value: '',
+    disabled: false,
+    parentElement: null,
+    get textContent() {{
+      if (children.length > 0) return children.map(c => c.textContent).join(' ');
+      return _text;
+    }},
+    set textContent(val) {{
+      _text = String(val);
+      children.length = 0;
+    }},
+    get innerHTML() {{ return _text; }},
+    set innerHTML(val) {{ _text = String(val); }}
+  }};
+  return el;
+}}
+
+function matchesSel(el, sel) {{
+  if (!el) return false;
+  if (sel.startsWith('#')) return el.id === sel.slice(1);
+  if (sel.startsWith('.')) return el.classList && el.classList.contains(sel.slice(1));
+  if (el.tagName && el.tagName.toLowerCase() === sel.toLowerCase()) return true;
+  return false;
+}}
+
+function findInTree(root, sel) {{
+  for (const ch of root.children) {{
+    if (matchesSel(ch, sel)) return ch;
+    const found = findInTree(ch, sel);
+    if (found) return found;
+  }}
+  return null;
+}}
+
+function findAllInTree(root, sel, out = []) {{
+  for (const ch of root.children) {{
+    if (matchesSel(ch, sel)) out.push(ch);
+    findAllInTree(ch, sel, out);
+  }}
+  return out;
+}}
+
+const elements = {{}};
+function getEl(id) {{
+  if (!elements[id]) {{
+    elements[id] = createMockElement(id);
+  }}
+  return elements[id];
+}}
+
+const mockDoc = {{
+  getElementById: getEl,
+  createElement: (tag) => createMockElement('', tag),
+  querySelector: (sel) => {{
+    for (const k of Object.keys(elements)) {{
+      if (matchesSel(elements[k], sel)) return elements[k];
+      const found = findInTree(elements[k], sel);
+      if (found) return found;
+    }}
+    return null;
+  }},
+  querySelectorAll: (sel) => {{
+    const res = [];
+    for (const k of Object.keys(elements)) {{
+      if (matchesSel(elements[k], sel)) res.push(elements[k]);
+      findAllInTree(elements[k], sel, res);
+    }}
+    return res;
+  }},
+  addEventListener: () => {{}}
+}};
+
+class MockEventSource {{
+  constructor(url) {{
+    this.url = url;
+    this.listeners = {{}};
+    MockEventSource.instances.push(this);
+  }}
+  addEventListener(evt, fn) {{
+    if (!this.listeners[evt]) this.listeners[evt] = [];
+    this.listeners[evt].push(fn);
+  }}
+  removeEventListener(evt, fn) {{
+    if (this.listeners[evt]) {{
+      this.listeners[evt] = this.listeners[evt].filter(f => f !== fn);
+    }}
+  }}
+  close() {{
+    this.closed = true;
+  }}
+  trigger(evt, data) {{
+    if (evt === 'open' && this.onopen) this.onopen({{ type: 'open' }});
+    if (evt === 'error' && this.onerror) this.onerror({{ type: 'error' }});
+    const list = this.listeners[evt] || [];
+    for (const fn of list) {{
+      fn({{ type: evt, data: typeof data === 'string' ? data : JSON.stringify(data) }});
+    }}
+  }}
+}}
+MockEventSource.instances = [];
+
+let fetchCalls = 0;
+const appJs = fs.readFileSync({json.dumps(str(js_path))}, 'utf-8');
+
+const ctx = vm.createContext({{
+  document: mockDoc,
+  window: {{
+    location: {{ protocol: 'http:', host: 'localhost:8000', hash: '', pathname: '/' }},
+    addEventListener: () => {{}},
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (id) => clearTimeout(id),
+    setInterval: () => 1,
+    clearInterval: () => {{}},
+    requestAnimationFrame: (cb) => cb(),
+    EventSource: MockEventSource,
+  }},
+  localStorage: {{ getItem: () => 'token', setItem: () => {{}}, removeItem: () => {{}} }},
+  history: {{ replaceState: () => {{}} }},
+  console: console,
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout,
+  setInterval: () => 1,
+  clearInterval: () => {{}},
+  requestAnimationFrame: (cb) => cb(),
+  TextDecoder: TextDecoder,
+  TextEncoder: TextEncoder,
+  Headers: Headers,
+  URLSearchParams: URLSearchParams,
+  fetch: async (url) => {{
+    fetchCalls++;
+    return {{
+      ok: true,
+      status: 200,
+      json: async () => ({{ raid: {{ status: 'clean' }}, system: {{ cpu_percent: 10 }} }})
+    }};
+  }}
+}});
+
+vm.runInContext(appJs, ctx);
+
+(async () => {{
+  // 1. Verify VigilLiveStore global interface
+  const store = vm.runInContext('VigilLiveStore', ctx);
+  if (!store || typeof store.subscribe !== 'function' || typeof store.getState !== 'function' || typeof store.dispatch !== 'function') {{
+    throw new Error("VigilLiveStore interface is incomplete");
+  }}
+
+  if (store.getState('connection') !== 'disconnected') {{
+    throw new Error("Initial connection state should be disconnected, got: " + store.getState('connection'));
+  }}
+
+  // 2. Test Pub/Sub & Replay & Wildcard
+  let directReceived = null;
+  const unsub = store.subscribe('custom_slice', (data) => {{
+    directReceived = data;
+  }});
+
+  let wildcardReceived = null;
+  store.subscribe('*', (slice, data) => {{
+    wildcardReceived = {{ slice, data }};
+  }});
+
+  store.dispatch('custom_slice', {{ count: 42 }});
+  if (!directReceived || directReceived.count !== 42) {{
+    throw new Error("Direct subscriber failed to receive dispatched value");
+  }}
+  if (!wildcardReceived || wildcardReceived.slice !== 'custom_slice' || wildcardReceived.data.count !== 42) {{
+    throw new Error("Wildcard subscriber failed to receive dispatched value");
+  }}
+
+  // Immediate replay for new subscriber
+  let replayReceived = null;
+  store.subscribe('custom_slice', (data) => {{
+    replayReceived = data;
+  }});
+  if (!replayReceived || replayReceived.count !== 42) {{
+    throw new Error("Immediate replay failed on existing state");
+  }}
+
+  // Unsubscribe test
+  unsub();
+  directReceived = null;
+  store.dispatch('custom_slice', {{ count: 99 }});
+  if (directReceived !== null) {{
+    throw new Error("Unsubscribed listener still received event");
+  }}
+
+  // 3. Test Continuous Telemetry Waveform Rolling
+  store.dispatch('telemetry', {{
+    cpu: {{ percent: 20.0, cores: [10.0, 30.0] }},
+    memory: {{ percent: 40.0, used: 4000, total: 10000 }},
+    disk: {{ percent: 50.0 }}
+  }});
+  store.dispatch('telemetry', {{
+    cpu: {{ percent: 25.0, cores: [15.0, 35.0] }},
+    memory: {{ percent: 45.0, used: 4500, total: 10000 }},
+    disk: {{ percent: 50.0 }}
+  }});
+  store.dispatch('telemetry', {{
+    cpu: {{ percent: 30.0, cores: [20.0, 40.0] }},
+    memory: {{ percent: 50.0, used: 5000, total: 10000 }},
+    disk: {{ percent: 50.0 }}
+  }});
+
+  const coreBufs = vm.runInContext('cpuCoresHistoryBuffers', ctx);
+  if (coreBufs.length !== 2) throw new Error("Expected 2 core buffers, got: " + coreBufs.length);
+  if (coreBufs[0].slice(-3).join(',') !== '10,15,20') {{
+    throw new Error("Core 0 buffer waveform mismatch: " + coreBufs[0]);
+  }}
+  if (coreBufs[1].slice(-3).join(',') !== '30,35,40') {{
+    throw new Error("Core 1 buffer waveform mismatch: " + coreBufs[1]);
+  }}
+
+  const memBuf = vm.runInContext('memoryHistoryBuffer', ctx);
+  if (memBuf.slice(-3).join(',') !== '40,45,50') {{
+    throw new Error("Memory history buffer waveform mismatch: " + memBuf);
+  }}
+
+  // 4. Test Background Polling Elimination when Connection is Live
+  store.dispatch('connection', 'live');
+  const initialFetchCount = fetchCalls;
+  await vm.runInContext('isAuthenticated = true; refreshDashboard({{ manual: false }});', ctx);
+  if (fetchCalls !== initialFetchCount) {{
+    throw new Error("Background polling refreshDashboard executed fetch even though live stream connected!");
+  }}
+
+  // But manual refresh STILL works:
+  await vm.runInContext('refreshDashboard({{ manual: true }});', ctx);
+  if (fetchCalls <= initialFetchCount) {{
+    throw new Error("Manual refresh failed to execute fetch");
+  }}
+
+  // 5. Test Instant Tab Switching (Zero Spinners)
+  store.dispatch('docker', {{
+    containers: [
+      {{ id: 'cont1', name: 'app_prod', status: 'running', state: 'running' }}
+    ],
+    stacks: []
+  }});
+  store.dispatch('raid', {{
+    status: 'clean',
+    level: 'raid1'
+  }});
+
+  vm.runInContext('switchViewTab("containers", false);', ctx);
+  const contTbody = getEl('docker-containers-tbody');
+  if (!contTbody || !contTbody.innerHTML.includes('app_prod')) {{
+    throw new Error("Containers view was not instantly rendered from VigilLiveStore cache");
+  }}
+
+  vm.runInContext('switchViewTab("storage", false);', ctx);
+  const raidStatusText = getEl('raid-status-text') || getEl('raid-status-badge');
+  if (!raidStatusText || !raidStatusText.textContent.toUpperCase().includes('CLEAN')) {{
+    throw new Error("Storage view was not instantly rendered from VigilLiveStore cache: " + raidStatusText.textContent);
+  }}
+
+  console.log("SUCCESS_VIGIL_LIVE_STORE_AND_GRAPH_ROLLING");
+}})().catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"""
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node script failed: {res.stderr}\nOutput: {res.stdout}")
+        self.assertIn("SUCCESS_VIGIL_LIVE_STORE_AND_GRAPH_ROLLING", res.stdout)
 
     def test_app_js_syntax_validity(self):
         root = Path(__file__).resolve().parent.parent

@@ -122,7 +122,38 @@ async def docker_events_listener(
 
 _notifications_task: Optional[asyncio.Task] = None
 _sentinel_probes_task: Optional[asyncio.Task] = None
+_live_telemetry_task: Optional[asyncio.Task] = None
 _eval_loop_count: int = 0
+
+
+async def live_telemetry_stream_worker(interval: float = 1.0) -> None:
+    """Continuously stream 1.0s non-blocking live telemetry to SSE and WebSocket clients."""
+    while True:
+        try:
+            active_subs = getattr(sse_manager, "active_subscribers", 0)
+            try:
+                has_sse = bool(active_subs > 0)
+            except TypeError:
+                has_sse = bool(len(active_subs) > 0 if hasattr(active_subs, "__len__") else active_subs)
+
+            active_ws = getattr(ws_manager, "active_connections", [])
+            has_ws = bool(len(active_ws) > 0 if hasattr(active_ws, "__len__") else active_ws)
+
+            if has_sse or has_ws:
+                sample = await asyncio.to_thread(main.get_live_telemetry_tick)
+                if "live_state_hub" in globals() and live_state_hub is not None:
+                    live_state_hub._last_sample = sample
+                await sse_manager.broadcast("telemetry", sample)
+                await ws_manager.broadcast({"type": "telemetry_sample", "sample": sample})
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logging.debug(f"Live telemetry stream worker error: {exc}")
+
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
 
 
 async def notifications_evaluator_loop() -> None:
@@ -162,7 +193,7 @@ async def notifications_evaluator_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _docker_events_task, _notifications_task, _sentinel_probes_task
+    global _docker_events_task, _notifications_task, _sentinel_probes_task, _live_telemetry_task
     sse_manager.set_loop(asyncio.get_running_loop())
     try:
         main.init_state_db()
@@ -174,6 +205,8 @@ async def lifespan(app: FastAPI):
         _notifications_task = asyncio.create_task(notifications_evaluator_loop())
     if _sentinel_probes_task is None or _sentinel_probes_task.done():
         _sentinel_probes_task = asyncio.create_task(main.sentinel_probes_worker())
+    if _live_telemetry_task is None or _live_telemetry_task.done():
+        _live_telemetry_task = asyncio.create_task(live_telemetry_stream_worker())
     try:
         yield
     finally:
@@ -193,6 +226,12 @@ async def lifespan(app: FastAPI):
             _sentinel_probes_task.cancel()
             try:
                 await _sentinel_probes_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if _live_telemetry_task and not _live_telemetry_task.done():
+            _live_telemetry_task.cancel()
+            try:
+                await _live_telemetry_task
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -227,6 +266,33 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 
+class SubscriberSet(set):
+    """Set wrapper that supports numeric comparisons against subscriber counts."""
+
+    def __gt__(self, other: Any) -> bool:
+        if isinstance(other, (int, float)):
+            return len(self) > other
+        return super().__gt__(other)
+
+    def __ge__(self, other: Any) -> bool:
+        if isinstance(other, (int, float)):
+            return len(self) >= other
+        return super().__ge__(other)
+
+    def __lt__(self, other: Any) -> bool:
+        if isinstance(other, (int, float)):
+            return len(self) < other
+        return super().__lt__(other)
+
+    def __le__(self, other: Any) -> bool:
+        if isinstance(other, (int, float)):
+            return len(self) <= other
+        return super().__le__(other)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+
 class SSEManager:
     """Manages active Server-Sent Events subscriber queues and real-time broadcasts."""
 
@@ -247,10 +313,10 @@ class SSEManager:
             return set(self._subscribers)
 
     @property
-    def active_subscribers(self) -> set[asyncio.Queue]:
-        """Alias for subscribers set."""
+    def active_subscribers(self) -> SubscriberSet:
+        """Alias for subscribers set supporting numeric comparison."""
         with self._lock:
-            return set(self._subscribers)
+            return SubscriberSet(self._subscribers)
 
     @property
     def subscriber_count(self) -> int:
@@ -328,6 +394,46 @@ class SSEManager:
 SSEBroadcaster = SSEManager
 sse_manager = SSEManager()
 sse_broadcaster = sse_manager
+
+
+class LiveStateHub:
+    """Central State Hub coordinating live telemetry streaming and state broadcasts."""
+
+    def __init__(self, sse_mgr: Optional[SSEManager] = None, ws_mgr: Optional[ConnectionManager] = None) -> None:
+        self._sse_mgr = sse_mgr
+        self._ws_mgr = ws_mgr
+        self._last_sample: Optional[dict[str, Any]] = None
+
+    @property
+    def sse(self) -> SSEManager:
+        return self._sse_mgr or sse_manager
+
+    @property
+    def ws(self) -> ConnectionManager:
+        return self._ws_mgr or ws_manager
+
+    @property
+    def has_active_subscribers(self) -> bool:
+        active_subs = getattr(self.sse, "active_subscribers", 0)
+        try:
+            has_sse = bool(active_subs > 0)
+        except TypeError:
+            has_sse = bool(len(active_subs) > 0 if hasattr(active_subs, "__len__") else active_subs)
+
+        active_ws = getattr(self.ws, "active_connections", [])
+        has_ws = bool(len(active_ws) > 0 if hasattr(active_ws, "__len__") else active_ws)
+        return has_sse or has_ws
+
+    async def broadcast_telemetry(self, sample: dict[str, Any]) -> None:
+        self._last_sample = sample
+        await self.sse.broadcast("telemetry", sample)
+        await self.ws.broadcast({"type": "telemetry_sample", "sample": sample})
+
+    def get_latest_sample(self) -> Optional[dict[str, Any]]:
+        return self._last_sample or getattr(main.live_state_hub, "latest_tick", None)
+
+
+live_state_hub = LiveStateHub()
 
 
 def _on_notification_logged(payload: dict[str, Any]) -> None:
@@ -1127,6 +1233,19 @@ def api_telemetry_sample(
     except Exception as exc:
         raise HTTPException(
             status_code=500, detail=f"Error recording telemetry sample: {exc}"
+        )
+
+
+@app.get("/api/telemetry/live")
+def api_telemetry_live(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Return an instant non-blocking live telemetry tick (<2ms)."""
+    try:
+        return main.get_live_telemetry_tick()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Error fetching live telemetry tick: {exc}"
         )
 
 

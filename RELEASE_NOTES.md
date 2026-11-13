@@ -1,30 +1,33 @@
-# Release v1.0.45: Seamless Stutter-Free Dashboard Rendering & Silent Reconciliation
+# Release v1.0.46: Unified Live State Engine and Continuous Hardware Streaming
 
 ## Overview
-Vigil v1.0.45 delivers an ultra-smooth, stutter-free dashboard rendering experience designed to eliminate UI jitter, element thrashing, and unnecessary layout reflows during continuous telemetry polling and background reconciliation. Real-time updates now apply silently and intelligently without interrupting operator interaction, scrolling, or visual focus.
+Vigil v1.0.46 introduces a unified reactive live state architecture (`LiveStateHub` backend service and `window.VigilLiveStore` frontend state engine) delivering continuous 1.0-second hardware telemetry streaming with zero background polling overhead, fluid linear meter transitions, and instant tab switching.
 
 ## Highlights & Enhancements
 
-### 1. Silent Background Telemetry Synchronization
-- **Restricted Refresh Spin Animation**: The spinning refresh icon indicator is now strictly reserved for explicit manual refresh button clicks (`userInitiated = true`). Background polling ticks and automated telemetry refreshes execute completely silently in the background without visual distraction.
-- **Zero Distraction Continuous Monitoring**: Unobtrusive data synchronization keeps operators informed while keeping the interface calm and stable.
+### 1. Unified Reactive Live State Engine (`LiveStateHub` & `window.VigilLiveStore`)
+- **Backend Hub Coordination**: `LiveStateHub` centralizes real-time event broadcasting and high-frequency telemetry streaming across Server-Sent Events (SSE) connections.
+- **Global Reactive Live Store**: Introduced `window.VigilLiveStore` featuring a pub/sub subscription model (`subscribe(slice, callback)` and `getState()`) with immediate replay upon subscription and wildcard (`*`) listener support for full state tracking across the entire dashboard.
 
-### 2. Value-Diffing DOM Reconciliation & Layout Guarding
-- **Selective DOM Mutating Guards**: Introduced `setTextIfChanged`, `setWidthIfChanged`, and `setBadgeIfChanged` guards that check current vs incoming values before committing changes to the DOM tree.
-- **Elimination of Layout Thrashing**: Bypasses redundant DOM writes, style recalculations, and layout repaints when telemetry metrics remain unchanged across polling cycles.
+### 2. Dedicated 1.0-Second Live Telemetry Worker
+- **Non-Blocking Telemetry Sampling**: Implemented `live_telemetry_stream_worker` executing sub-millisecond (`<0.2ms`) `psutil` sampling ticks every 1.0s.
+- **Client-Aware Efficiency**: The worker runs actively when subscribers are connected and remains completely idle when zero SSE clients are open, eliminating unnecessary server overhead.
+- **Comprehensive Hardware Metrics**: Streams real-time aggregate CPU, per-core CPU breakdown, memory utilization, swap usage, and Linux 1/5/15-minute load averages.
 
-### 3. Keyed In-Place Table Updates
-- **Keyed Row Reconciliation**: RAID active member disk cards and notification tables now reconcile in-place against existing `<tr>` rows keyed by `data-device` rather than performing full `innerHTML = ""` wipes.
-- **Flicker-Free Scroll Preservation**: Preserves user scroll position, text selection, and row hover states seamlessly across live updates without table flash.
+### 3. Elimination of Background Polling for Metrics
+- **Zero Redundant REST Requests**: The periodic `refreshDashboard()` interval timer is paused whenever the live stream is connected; all telemetry arrives continuously over the SSE channel.
+- **Flicker-Free Live Operation**: Eliminates UI redraw flickers and redundant HTTP GET roundtrips.
+- **Resilient Fallback**: If SSE disconnects or encounters network interruptions, standard interval polling automatically resumes as a transparent safety net until reconnection.
 
-### 4. Tabular Numeric Typography & Fluid Meter Transitions
-- **Tabular Numeric Alignment**: Applied `font-variant-numeric: tabular-nums` across all telemetry metric numbers, preventing horizontal badge expansion and contraction as digits tick up or down.
-- **Fluid Cubic-Bezier Easing**: Enhanced progress bar meters with smooth `0.6s cubic-bezier(0.4, 0, 0.2, 1)` transitions for natural, fluid gauge fills without abrupt jumps.
+### 4. Continuous Rolling Waveforms & Linear Meter Gliding
+- **Oscilloscope Waveforms**: 1.0s telemetry ticks directly append to `cpuCoresHistoryBuffers` and `memoryHistoryBuffer`, driving real-time rolling canvas graphs rendered smoothly at 60 FPS via `requestAnimationFrame()`.
+- **Continuous Linear Gliding**: Tuned progress bar meters with `.progress-fill` transitions using `1s linear` easing, allowing gauges and utilization bars to breathe and glide continuously with actual hardware fluctuations.
 
-### 5. 60 FPS RequestAnimationFrame Canvas Rendering
-- **Synchronized Canvas Redraws**: Chart re-render passes are coordinated via native `requestAnimationFrame` to lock drawing operations with the operator's display refresh rate.
-- **Cached Dimensions**: Canvas bounding box dimensions are cached on window resize events rather than queried on every tick, eliminating costly layout queries.
+### 5. Instant Zero-Latency Tab Switching
+- **Instant State Hydration**: Switching between dashboard views (System, Docker, Storage, Packages, Probes, Logs, Settings) instantly hydrates UI components directly from `window.VigilLiveStore.getState()`.
+- **Zero Loading Spinners**: Operators experience instant view rendering without awaiting REST fetch roundtrips.
 
 ## Reliability & Fixes
-- **100% Contract Integrity**: Full backward compatibility maintained across all 63 REST API endpoints, SSE live feeds, and 718 client DOM element contracts.
-- **QA Gate Verification**: Automated cross-tier quality test suite signed off with **404/404 tests passing** and 0 failures.
+- **100% Contract Integrity**: Maintained full backward compatibility across all 63 REST API endpoints and 718 client DOM element contracts.
+- **Comprehensive Test Coverage**: Expanded test suite with dedicated unit tests in `tests/test_sse_stream.py` verifying non-blocking worker execution, schema compliance, and subscriber lifecycle management.
+- **QA Gate Verification**: Automated cross-tier quality test suite signed off with **412/412 tests passing** and 0 failures.

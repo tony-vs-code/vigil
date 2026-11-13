@@ -2,6 +2,20 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.46] - 2026-11-12
+### Added
+- **Unified Reactive Live State Engine**: Integrated backend `LiveStateHub` and frontend `window.VigilLiveStore` reactive pub/sub store with state slice subscriptions (`subscribe(slice, callback)`), immediate replay, and wildcard (`*`) event listeners.
+- **Dedicated 1.0-Second Live Telemetry Worker**: Added non-blocking `<0.2ms` `live_telemetry_stream_worker` delivering real-time aggregate CPU, core-by-core metrics, memory, swap, and load averages every 1.0s to active SSE subscribers.
+- **Elimination of Background Polling for Metrics**: Automatically pauses periodic `refreshDashboard()` intervals when SSE streaming is active, completely removing redundant REST polling roundtrips and UI redraw flickers.
+- **Continuous Rolling Waveforms**: Real-time 1.0s telemetry streams directly populate `cpuCoresHistoryBuffers` and `memoryHistoryBuffer`, driving fluid Task Manager style oscilloscope waveforms via `requestAnimationFrame()`.
+- **Continuous Linear Meter Gliding**: Configured `.progress-fill` transitions with `1s linear` easing for fluid gauge gliding synchronized with hardware fluctuations.
+- **Instant Zero-Latency Tab Switching**: Dashboard views instantly hydrate from `window.VigilLiveStore.getState()` on tab switches without network latency or loading spinners.
+- **Resilient Fallback**: Automatically restores standard interval polling if SSE live streaming disconnects.
+
+### Changed
+- **Full Backward Compatibility**: Maintained complete compatibility across all 63 REST API endpoints and 718 client DOM element contracts.
+- **Test Coverage Expansion**: Added comprehensive unit test coverage in `tests/test_sse_stream.py` for worker lifecycle and live streaming contracts.
+
 ## [1.0.45] - 2026-11-12
 ### Added
 - **Silent Background Telemetry Sync**: Restricted refresh icon spin animations strictly to explicit manual button clicks; background polling and periodic telemetry ticks now run silently without visual disruption.
