@@ -2,6 +2,18 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.47] - 2026-11-13
+### Added
+- **High-Frequency 250ms Live SSE Telemetry**: Upgraded `live_telemetry_stream_worker` in `api.py` to stream CPU, per-core metrics, RAM, swap, and load averages every 250ms with sub-millisecond execution.
+- **Decoupled 60 FPS Render Loop & LERP Interpolation**: Integrated autonomous `requestAnimationFrame` loop in `static/app.js` using physics-based Linear Interpolation (`animVal += (targetVal - animVal) * factor`) for organic value smoothing.
+- **Continuous Sub-Pixel Multi-Core Oscilloscope**: Enhanced `drawCpuCoreGraph` with continuous sub-step scroll translation, eliminating stepped jumps and producing a fluid rolling wave monitor.
+- **Continuous Hardware Clock & Precision Uptime**: Implemented 60 FPS hardware uptime advancement computing elapsed time from boot time without awaiting network ticks.
+- **Micro-Responsive Transitions & Tabular Numerals**: Applied `0.05s ease-out` meter transitions and `tabular-nums` formatting to stabilize layout and prevent digit jitter.
+- **Live Rendering Test Suite**: Added `tests/test_ui_live_rendering.py` with DOM, CSS, and Node VM execution validations.
+
+### Changed
+- **Full Backward Compatibility**: Retained 100% contract compliance across all 63 REST API endpoints and 718 client DOM element contracts.
+
 ## [1.0.46] - 2026-11-12
 ### Added
 - **Unified Reactive Live State Engine**: Integrated backend `LiveStateHub` and frontend `window.VigilLiveStore` reactive pub/sub store with state slice subscriptions (`subscribe(slice, callback)`), immediate replay, and wildcard (`*`) event listeners.

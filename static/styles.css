@@ -2395,11 +2395,19 @@ hr.overview-flow-divider {
 }
 
 .metric-value,
+.metric-value-uptime,
 .mono-text,
 .status-badge,
 .cpu-core-percent,
+.cpu-percent-value,
+#cpu-percent-value,
+#ram-percent-value,
+#disk-percent-value,
+#uptime-value,
+.host-telemetry-val,
 .status-ribbon-desc,
-.progress-label {
+.progress-label,
+.pill-counter {
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
 }
@@ -2408,7 +2416,7 @@ hr.overview-flow-divider {
   height: 100%;
   background: linear-gradient(90deg, #38bdf8, #3b82f6);
   border-radius: 999px;
-  transition: width 1s linear, background-color 0.4s ease;
+  transition: width 0.05s ease-out, background-color 0.4s ease;
   will-change: width;
 }
 
@@ -2593,7 +2601,7 @@ hr.overview-flow-divider {
 
 .cpu-core-track .progress-fill {
   height: 100%;
-  transition: width 1s linear;
+  transition: width 0.05s ease-out;
   will-change: width;
 }
 
