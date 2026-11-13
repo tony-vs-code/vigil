@@ -11063,17 +11063,37 @@ def get_system_metrics_data() -> dict[str, Any]:
     }
 
 
+_last_ewma_cpu_percent: Optional[float] = None
+_last_ewma_cpu_cores: Optional[list[float]] = None
+_LIVE_TELEMETRY_EWMA_ALPHA: float = 0.5
+
+
+def reset_live_telemetry_ewma() -> None:
+    """Reset EWMA filter state for live telemetry CPU metrics."""
+    global _last_ewma_cpu_percent, _last_ewma_cpu_cores
+    _last_ewma_cpu_percent = None
+    _last_ewma_cpu_cores = None
+
+
 def get_live_telemetry_tick() -> dict[str, Any]:
-    """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming."""
+    """Collect non-blocking real-time metrics (<2ms) for high-frequency live telemetry streaming with EWMA smoothing."""
+    global _last_ewma_cpu_percent, _last_ewma_cpu_cores
+    cpu_err = False
     try:
-        cpu_percent = psutil.cpu_percent(interval=None)
+        raw_cpu_percent = float(psutil.cpu_percent(interval=None) or 0.0)
     except Exception:
-        cpu_percent = 0.0
+        raw_cpu_percent = 0.0
+        cpu_err = True
 
     try:
-        cpu_cores = psutil.cpu_percent(percpu=True)
+        raw_cpu_cores = psutil.cpu_percent(percpu=True)
+        if not isinstance(raw_cpu_cores, list):
+            raw_cpu_cores = [raw_cpu_percent]
+        else:
+            raw_cpu_cores = [float(c or 0.0) for c in raw_cpu_cores]
     except Exception:
-        cpu_cores = [cpu_percent]
+        raw_cpu_cores = [raw_cpu_percent]
+        cpu_err = True
 
     try:
         vm = psutil.virtual_memory()
@@ -11085,14 +11105,36 @@ def get_live_telemetry_tick() -> dict[str, Any]:
     except Exception:
         load_avg = []
 
+    if cpu_err:
+        _last_ewma_cpu_percent = None
+        _last_ewma_cpu_cores = None
+        smoothed_cpu_percent = 0.0
+        smoothed_cores = [0.0]
+    else:
+        alpha = _LIVE_TELEMETRY_EWMA_ALPHA
+        if _last_ewma_cpu_percent is None:
+            smoothed_cpu_percent = raw_cpu_percent
+        else:
+            smoothed_cpu_percent = alpha * raw_cpu_percent + (1.0 - alpha) * _last_ewma_cpu_percent
+        _last_ewma_cpu_percent = smoothed_cpu_percent
+
+        if _last_ewma_cpu_cores is None or len(_last_ewma_cpu_cores) != len(raw_cpu_cores):
+            smoothed_cores = list(raw_cpu_cores)
+        else:
+            smoothed_cores = [
+                alpha * curr + (1.0 - alpha) * prev
+                for curr, prev in zip(raw_cpu_cores, _last_ewma_cpu_cores)
+            ]
+        _last_ewma_cpu_cores = smoothed_cores
+
     cores_list = [
-        round(float(c or 0.0), 1)
-        for c in (cpu_cores if isinstance(cpu_cores, list) else [cpu_percent])
+        round(max(0.0, min(100.0, float(c))), 1)
+        for c in smoothed_cores
     ]
 
     tick = {
         "cpu": {
-            "percent": round(float(cpu_percent or 0.0), 1),
+            "percent": round(max(0.0, min(100.0, float(smoothed_cpu_percent))), 1),
             "cores": cores_list,
         },
         "memory": {

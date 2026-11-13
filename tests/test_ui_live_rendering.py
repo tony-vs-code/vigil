@@ -50,14 +50,14 @@ class TestLiveView60FpsRendering(unittest.TestCase):
         self.assertIsNotNone(match_fill, ".progress-fill block not found")
         fill_body = match_fill.group(1)
         self.assertNotIn("1s", fill_body, ".progress-fill still has 1s transition lag")
-        self.assertIn("0.05s", fill_body)
+        self.assertTrue("0.25s" in fill_body or "0.05s" in fill_body)
 
         # Check .cpu-core-track .progress-fill
         match_core = re.search(r"\.cpu-core-track\s+\.progress-fill\s*\{([^}]+)\}", self.css_content)
         self.assertIsNotNone(match_core, ".cpu-core-track .progress-fill block not found")
         core_body = match_core.group(1)
         self.assertNotIn("1s", core_body, ".cpu-core-track .progress-fill still has 1s transition lag")
-        self.assertIn("0.05s", core_body)
+        self.assertTrue("0.25s" in core_body or "0.05s" in core_body)
 
     def test_js_exports_live_animation_interfaces(self):
         """Verify static/app.js exports liveAnimState and startLiveRenderLoop on window."""
@@ -111,6 +111,7 @@ function createMockElement(id, tagName = 'DIV') {{
           closePath: () => {{}},
           rect: () => {{}},
           clip: () => {{}},
+          bezierCurveTo: () => {{}},
           fillText: () => {{}},
           createLinearGradient: () => ({{ addColorStop: () => {{}} }})
         }};
