@@ -244,6 +244,15 @@ body {
   text-align: center;
 }
 
+.app-layout.sidebar-collapsed .sidebar-nav-group {
+  align-items: stretch;
+}
+
+.app-layout.sidebar-collapsed .sidebar-submenu,
+.app-layout.sidebar-collapsed .sidebar-submenu-chevron {
+  display: none !important;
+}
+
 .app-layout.sidebar-collapsed .sidebar-footer {
   padding: 12px 6px;
   align-items: center;
@@ -415,6 +424,126 @@ body {
 
 .sidebar-nav-item .nav-tab-badge {
   margin-left: auto;
+}
+
+/* Collapsible Sidebar Sub-Menus */
+.sidebar-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sidebar-nav-parent {
+  gap: 10px;
+}
+
+.sidebar-nav-parent > span:first-of-type {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-nav-parent .nav-tab-badge {
+  margin-left: 0;
+  flex-shrink: 0;
+}
+
+.sidebar-submenu-chevron {
+  flex-shrink: 0;
+  margin-left: 2px;
+  color: var(--text-muted);
+  transition: transform 0.2s ease, color 0.15s ease;
+}
+
+.sidebar-nav-parent:hover .sidebar-submenu-chevron,
+.sidebar-nav-parent.active .sidebar-submenu-chevron {
+  color: currentColor;
+}
+
+.sidebar-nav-group.expanded .sidebar-submenu-chevron,
+.sidebar-nav-parent[aria-expanded="true"] .sidebar-submenu-chevron {
+  transform: rotate(180deg);
+}
+
+.sidebar-submenu {
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px 0 4px 12px;
+  margin: 2px 0 4px 18px;
+  border-left: 1px solid rgba(56, 189, 248, 0.18);
+}
+
+.sidebar-nav-group.expanded > .sidebar-submenu,
+.sidebar-submenu.open {
+  display: flex;
+}
+
+.sidebar-submenu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  font-size: 0.81rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.sidebar-submenu-item:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sidebar-submenu-item.active {
+  color: var(--accent-primary);
+  background: rgba(56, 189, 248, 0.1);
+  border-color: rgba(56, 189, 248, 0.22);
+  font-weight: 600;
+}
+
+.sidebar-submenu-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-submenu-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.sidebar-submenu-item.active .sidebar-submenu-badge:not(.subnav-badge-warn) {
+  background: rgba(56, 189, 248, 0.18);
+  color: var(--accent-primary);
+}
+
+.sidebar-submenu-badge.subnav-badge-warn {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+}
+
+.sidebar-submenu-badge.hidden {
+  display: none;
 }
 
 /* Sidebar Footer */
@@ -4249,16 +4378,63 @@ hr.overview-flow-divider {
   right: 0;
   top: 100%;
   margin-top: 4px;
-  min-width: 140px;
+  min-width: 148px;
   background: var(--bg-card, #1e293b);
   border: 1px solid var(--border-color, #334155);
   border-radius: 6px;
-  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
-  z-index: 50;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.55);
+  z-index: 1050;
   display: none;
   flex-direction: column;
   padding: 4px;
   gap: 2px;
+}
+
+/* Container & Stack Table Layout Flow (6 columns: Container, Image, State, Ports, Stack, Actions) */
+#docker-containers-table td:nth-child(1) {
+  max-width: 220px;
+}
+
+#docker-containers-table td:nth-child(2),
+#docker-containers-table td:nth-child(4) {
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#docker-containers-table td:nth-child(5) {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.container-cell-primary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.container-cell-primary strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.container-cell-id {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#docker-containers-table .actions-col,
+#docker-stacks-table .actions-col {
+  width: 1%;
+  white-space: nowrap;
 }
 
 .actions-dropdown-menu.show {

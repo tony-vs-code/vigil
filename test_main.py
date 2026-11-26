@@ -12112,7 +12112,10 @@ class TestBackupsAndCronScheduler(unittest.TestCase):
         self.assertEqual(togg_missing.status_code, 404)
 
         # 5. POST /api/cron/jobs/{id}/run
-        with patch.object(main.DOCKER_MANAGER, "prune_images", return_value={"output": "done"}):
+        with (
+            patch.object(main.DOCKER_MANAGER, "prune_images", return_value={"output": "done"}),
+            patch.object(main.DOCKER_MANAGER, "prune_volumes", return_value={"output": "done"}),
+        ):
             run_resp = asgi_post(
                 api.app,
                 f"/api/cron/jobs/{jid}/run",
@@ -15668,6 +15671,635 @@ class TestOutboundNotificationDeliveryLog(unittest.TestCase):
             self.assertEqual(latest_raid[4], "raid_monitor")
             self.assertEqual(latest_raid[5], "RAID Array Degraded")
             self.assertEqual(latest_raid[6], "RAID check status: degraded")
+
+
+class SidebarSubmenuAndContainerLayoutTests(unittest.TestCase):
+    """Cross-tier QA validation for sidebar sub-menus and viewport-fixed container dropdowns."""
+
+    def test_no_duplicate_html_ids_and_sidebar_submenu_dom_contracts(self):
+        from collections import Counter
+        from html.parser import HTMLParser
+
+        root = Path(__file__).parent
+        html = (root / "static" / "index.html").read_text(encoding="utf-8")
+        css = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+        # 1. Verify zero duplicate HTML IDs across static/index.html
+        all_ids = re.findall(r'\bid=["\']([^"\']+)["\']', html)
+        duplicates = {k: v for k, v in Counter(all_ids).items() if v > 1}
+        self.assertEqual(duplicates, {}, f"Duplicate HTML IDs found: {duplicates}")
+
+        # 2. Parse HTML tree to verify exact hierarchy of sidebar submenus, views, and modals/drawers
+        class DOMTreeParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.root = {"tag": "root", "attrs": {}, "children": []}
+                self.stack = [self.root]
+                self.void_tags = {
+                    "area", "base", "br", "col", "embed", "hr", "img", "input",
+                    "link", "meta", "param", "source", "track", "wbr",
+                }
+
+            def handle_starttag(self, tag, attrs):
+                node = {"tag": tag, "attrs": dict(attrs), "children": []}
+                self.stack[-1]["children"].append(node)
+                if tag not in self.void_tags:
+                    self.stack.append(node)
+
+            def handle_endtag(self, tag):
+                for i in range(len(self.stack) - 1, 0, -1):
+                    if self.stack[i]["tag"] == tag:
+                        del self.stack[i:]
+                        break
+
+        parser = DOMTreeParser()
+        parser.feed(html)
+
+        def find_nodes(node, predicate):
+            matches = []
+            if predicate(node):
+                matches.append(node)
+            for child in node["children"]:
+                matches.extend(find_nodes(child, predicate))
+            return matches
+
+        def by_id(el_id):
+            found = find_nodes(parser.root, lambda n: n["attrs"].get("id") == el_id)
+            self.assertEqual(len(found), 1, f"Expected exactly 1 element with id='{el_id}'")
+            return found[0]
+
+        # 3. Verify all 4 sidebar sub-menu groups exist under their parent sidebar sections
+        expected_groups = {
+            "containers": {
+                "parent_id": "nav-tab-containers",
+                "submenu_id": "sidebar-submenu-containers",
+                "items": [
+                    ("subtab-docker-stacks", "subtab-badge-stacks"),
+                    ("subtab-docker-containers", "subtab-badge-containers"),
+                    ("subtab-docker-images", "subtab-badge-images"),
+                    ("subtab-docker-volumes", "subtab-badge-volumes"),
+                    ("subtab-docker-networks", "subtab-badge-networks"),
+                    ("subtab-docker-updates", "subtab-badge-updates"),
+                ],
+            },
+            "packages": {
+                "parent_id": "nav-tab-packages",
+                "submenu_id": "sidebar-submenu-packages",
+                "items": [
+                    ("subtab-pkg-updates-btn", "subtab-pkg-updates-badge"),
+                    ("subtab-pkg-installed-btn", "subtab-pkg-installed-badge"),
+                    ("subtab-pkg-python-btn", "subtab-pkg-python-badge"),
+                ],
+            },
+            "users": {
+                "parent_id": "nav-tab-users",
+                "submenu_id": "sidebar-submenu-users",
+                "items": [
+                    ("subtab-users-btn", "subtab-users-badge"),
+                    ("subtab-groups-btn", "subtab-groups-badge"),
+                ],
+            },
+            "audit": {
+                "parent_id": "nav-tab-audit",
+                "submenu_id": "sidebar-submenu-audit",
+                "items": [
+                    ("subtab-audit-security-btn", "subtab-audit-security-badge"),
+                    ("subtab-audit-alerts-btn", "history-count-badge"),
+                ],
+            },
+        }
+
+        for group_name, cfg in expected_groups.items():
+            groups = find_nodes(
+                parser.root,
+                lambda n, gn=group_name: n["attrs"].get("data-submenu-group") == gn
+                and "sidebar-nav-group" in n["attrs"].get("class", "").split(),
+            )
+            self.assertEqual(len(groups), 1, f"Expected 1 .sidebar-nav-group for {group_name}")
+            group_node = groups[0]
+
+            parent_btns = find_nodes(group_node, lambda n, pid=cfg["parent_id"]: n["attrs"].get("id") == pid)
+            self.assertEqual(len(parent_btns), 1)
+            self.assertIn("sidebar-nav-parent", parent_btns[0]["attrs"].get("class", "").split())
+            self.assertEqual(parent_btns[0]["attrs"].get("aria-expanded"), "false")
+
+            submenus = find_nodes(group_node, lambda n, sid=cfg["submenu_id"]: n["attrs"].get("id") == sid)
+            self.assertEqual(len(submenus), 1)
+            submenu_node = submenus[0]
+            self.assertIn("sidebar-submenu", submenu_node["attrs"].get("class", "").split())
+            self.assertEqual(submenu_node["attrs"].get("role"), "tablist")
+
+            for item_id, badge_id in cfg["items"]:
+                items = find_nodes(submenu_node, lambda n, iid=item_id: n["attrs"].get("id") == iid)
+                self.assertEqual(len(items), 1, f"Missing {item_id} inside #{cfg['submenu_id']}")
+                self.assertIn("sidebar-submenu-item", items[0]["attrs"].get("class", "").split())
+                badges = find_nodes(items[0], lambda n, bid=badge_id: n["attrs"].get("id") == bid)
+                self.assertEqual(len(badges), 1, f"Missing badge #{badge_id} inside #{item_id}")
+
+        # 4. Verify page-level horizontal tab bars were removed from the 4 main page views
+        for view_id in ("view-containers", "view-packages", "view-users", "view-audit"):
+            view_node = by_id(view_id)
+            tablists = find_nodes(view_node, lambda n: n["attrs"].get("role") == "tablist")
+            self.assertEqual(
+                tablists,
+                [],
+                f"Page-level tablist should be removed from #{view_id}, found: {tablists}",
+            )
+            subnavs = find_nodes(
+                view_node,
+                lambda n: "view-subtabs-nav" in n["attrs"].get("class", "").split(),
+            )
+            self.assertEqual(subnavs, [], f"Leftover .view-subtabs-nav found inside #{view_id}")
+
+        # 5. Verify modal/drawer-internal tabs remain intact
+        settings_modal = by_id("settings-modal")
+        self.assertTrue(
+            find_nodes(
+                settings_modal,
+                lambda n: n["attrs"].get("role") == "tablist"
+                and "settings-subtabs-nav" in n["attrs"].get("class", "").split(),
+            ),
+            "Settings modal internal subtabs missing",
+        )
+        stack_modal = by_id("stack-editor-modal")
+        self.assertTrue(
+            find_nodes(stack_modal, lambda n: n["attrs"].get("id") == "stack-editor-tabs-nav"),
+            "Stack editor internal tabs missing",
+        )
+        notification_drawer = by_id("notification-drawer")
+        self.assertTrue(
+            find_nodes(
+                notification_drawer,
+                lambda n: n["attrs"].get("role") == "tablist"
+                and "drawer-categories-bar" in n["attrs"].get("class", "").split(),
+            ),
+            "Notification drawer internal filter tabs missing",
+        )
+
+        # 6. Verify 6-column #docker-containers-table structure in index.html & CSS
+        containers_table = by_id("docker-containers-table")
+        ths = find_nodes(containers_table, lambda n: n["tag"] == "th")
+        self.assertEqual(len(ths), 6, "Expected exactly 6 <th> columns in #docker-containers-table")
+        empty_tds = find_nodes(
+            containers_table,
+            lambda n: n["tag"] == "td" and "empty-state" in n["attrs"].get("class", "").split(),
+        )
+        self.assertEqual(len(empty_tds), 1)
+        self.assertEqual(empty_tds[0]["attrs"].get("colspan"), "6")
+
+        for css_token in (
+            ".app-layout.sidebar-collapsed .sidebar-submenu",
+            ".sidebar-nav-group.expanded > .sidebar-submenu",
+            ".sidebar-submenu.open",
+            "#docker-containers-table td:nth-child(1)",
+            "#docker-containers-table td:nth-child(5)",
+            ".container-cell-primary",
+            ".container-cell-id",
+            "z-index: 1050;",
+        ):
+            self.assertIn(css_token, css, f"Missing CSS token '{css_token}' in static/styles.css")
+
+    def test_sidebar_submenu_switching_and_collapsed_mobile_behavior_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+function makeClassList(initial = []) {{
+  const set = new Set(initial);
+  return {{
+    add(...cls) {{ cls.forEach(c => set.add(c)); }},
+    remove(...cls) {{ cls.forEach(c => set.delete(c)); }},
+    toggle(c, force) {{
+      if (force === undefined) {{
+        if (set.has(c)) {{ set.delete(c); return false; }}
+        set.add(c); return true;
+      }}
+      if (force) {{ set.add(c); return true; }}
+      set.delete(c); return false;
+    }},
+    contains(c) {{ return set.has(c); }},
+    toArray() {{ return Array.from(set); }}
+  }};
+}}
+
+function makeEl(id, classes = [], attrs = {{}}) {{
+  const listeners = {{}};
+  return {{
+    id,
+    classList: makeClassList(classes),
+    attrs: Object.assign({{}}, attrs),
+    children: [],
+    style: {{}},
+    innerHTML: '',
+    textContent: '',
+    value: '',
+    setAttribute(k, v) {{ this.attrs[k] = String(v); }},
+    getAttribute(k) {{ return this.attrs[k] !== undefined ? this.attrs[k] : null; }},
+    addEventListener(ev, fn) {{
+      if (!listeners[ev]) listeners[ev] = [];
+      listeners[ev].push(fn);
+    }},
+    click() {{
+      (listeners.click || []).forEach(fn => fn({{ target: this, preventDefault() {{}}, stopPropagation() {{}} }}));
+    }},
+    querySelector(sel) {{ return null; }},
+    querySelectorAll(sel) {{ return []; }},
+    closest(sel) {{ return null; }}
+  }};
+}}
+
+const elements = {{}};
+const views = [
+  "overview", "raid", "notifications", "containers", "probes",
+  "services", "security", "processes", "users", "audit", "packages", "backups"
+];
+views.forEach((v) => {{
+  elements[`nav-tab-${{v}}`] = makeEl(
+    `nav-tab-${{v}}`,
+    v === "overview" ? ["nav-tab", "sidebar-nav-item", "active"] : ["nav-tab", "sidebar-nav-item"],
+    {{ "aria-selected": v === "overview" ? "true" : "false" }}
+  );
+  elements[`view-${{v}}`] = makeEl(`view-${{v}}`, v === "overview" ? ["view-panel"] : ["view-panel", "hidden"]);
+}});
+
+// Submenu groups
+const submenuDefs = {{
+  containers: {{
+    parent: "nav-tab-containers",
+    submenuId: "sidebar-submenu-containers",
+    items: [
+      ["subtab-docker-stacks", "subview-docker-stacks"],
+      ["subtab-docker-containers", "subview-docker-containers"],
+      ["subtab-docker-images", "subview-docker-images"],
+      ["subtab-docker-volumes", "subview-docker-volumes"],
+      ["subtab-docker-networks", "subview-docker-networks"],
+      ["subtab-docker-updates", "subview-docker-updates"],
+    ]
+  }},
+  packages: {{
+    parent: "nav-tab-packages",
+    submenuId: "sidebar-submenu-packages",
+    items: [
+      ["subtab-pkg-updates-btn", "pkg-updates-subtab-panel"],
+      ["subtab-pkg-installed-btn", "pkg-installed-subtab-panel"],
+      ["subtab-pkg-python-btn", "pkg-python-subtab-panel"],
+    ]
+  }},
+  users: {{
+    parent: "nav-tab-users",
+    submenuId: "sidebar-submenu-users",
+    items: [
+      ["subtab-users-btn", "users-subtab-panel"],
+      ["subtab-groups-btn", "groups-subtab-panel"],
+    ]
+  }},
+  audit: {{
+    parent: "nav-tab-audit",
+    submenuId: "sidebar-submenu-audit",
+    items: [
+      ["subtab-audit-security-btn", "audit-security-subtab-panel"],
+      ["subtab-audit-alerts-btn", "audit-alerts-subtab-panel"],
+    ]
+  }}
+}};
+
+const groupEls = [];
+const parentItems = [];
+const submenuItemEls = [];
+
+Object.entries(submenuDefs).forEach(([groupName, def]) => {{
+  const parentEl = elements[def.parent];
+  parentEl.classList.add("sidebar-nav-parent");
+  parentEl.setAttribute("aria-expanded", "false");
+  parentItems.push(parentEl);
+
+  const submenuEl = makeEl(def.submenuId, ["sidebar-submenu"]);
+  elements[def.submenuId] = submenuEl;
+
+  def.items.forEach(([btnId, panelId], idx) => {{
+    const btn = makeEl(btnId, idx === 0 ? ["sidebar-submenu-item", "active"] : ["sidebar-submenu-item"], {{
+      "aria-selected": idx === 0 ? "true" : "false",
+      "data-parent-view": groupName
+    }});
+    const panel = makeEl(panelId, idx === 0 ? ["subtab-panel"] : ["subtab-panel", "hidden"]);
+    elements[btnId] = btn;
+    elements[panelId] = panel;
+    submenuItemEls.push(btn);
+  }});
+
+  const groupEl = makeEl(`group-${{groupName}}`, ["sidebar-nav-group"], {{ "data-submenu-group": groupName }});
+  groupEl.querySelector = (sel) => {{
+    if (sel === ".sidebar-nav-parent") return parentEl;
+    if (sel === ".sidebar-submenu") return submenuEl;
+    return null;
+  }};
+  groupEls.push(groupEl);
+}});
+
+elements["app-shell"] = makeEl("app-shell", ["app-layout"]);
+elements["app-sidebar"] = makeEl("app-sidebar", ["app-sidebar"]);
+elements["btn-toggle-sidebar"] = makeEl("btn-toggle-sidebar", ["btn-toggle-sidebar"]);
+elements["mobile-nav-backdrop"] = makeEl("mobile-nav-backdrop", ["mobile-nav-backdrop"]);
+elements["sidebar-backdrop"] = makeEl("sidebar-backdrop", ["sidebar-backdrop"]);
+elements["page-title"] = makeEl("page-title");
+
+const storage = {{}};
+const mockWindow = {{
+  innerWidth: 1280,
+  location: {{ hash: "" }},
+  addEventListener() {{}},
+  setInterval() {{ return 1; }},
+  clearInterval() {{}},
+  setTimeout() {{ return 1; }},
+  clearTimeout() {{}}
+}};
+const mockDocument = {{
+  listeners: {{}},
+  addEventListener(ev, fn) {{
+    if (!this.listeners[ev]) this.listeners[ev] = [];
+    this.listeners[ev].push(fn);
+  }},
+  getElementById(id) {{
+    return elements[id] || null;
+  }},
+  querySelector(sel) {{
+    const m = sel.match(/^\\.sidebar-nav-group\\[data-submenu-group="([^"]+)"\\]$/);
+    if (m) return groupEls.find(g => g.getAttribute("data-submenu-group") === m[1]) || null;
+    return null;
+  }},
+  querySelectorAll(sel) {{
+    if (sel === ".sidebar-nav-group[data-submenu-group]") return groupEls;
+    if (sel.includes(".sidebar-submenu-item")) return submenuItemEls;
+    return [];
+  }}
+}};
+
+const ctx = vm.createContext({{
+  document: mockDocument,
+  window: mockWindow,
+  history: {{ replaceState() {{}} }},
+  localStorage: {{
+    getItem(k) {{ return storage[k] !== undefined ? storage[k] : null; }},
+    setItem(k, v) {{ storage[k] = String(v); }}
+  }},
+  console,
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder, TextEncoder, URLSearchParams
+}});
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+vm.runInContext(appJs, ctx);
+
+//Stub network-backed fetch helpers so subtab switching stays synchronous and deterministic
+ctx.fetchDockerStacks = () => {{}};
+ctx.fetchDockerContainers = () => {{}};
+ctx.fetchDockerImages = () => {{}};
+ctx.fetchDockerVolumes = () => {{}};
+ctx.fetchDockerNetworks = () => {{}};
+ctx.fetchDockerUpdates = () => {{}};
+ctx.fetchPackagesOverview = () => {{}};
+ctx.fetchInstalledPackages = () => {{}};
+ctx.fetchPythonPackages = () => {{}};
+ctx.fetchSystemUsers = () => {{}};
+ctx.fetchSystemGroups = () => {{}};
+ctx.fetchAuditLogs = () => {{}};
+ctx.fetchNotificationHistory = () => {{}};
+ctx.refreshCurrentView = () => {{}};
+ctx.checkAuthStatus = () => {{}};
+ctx.sendWsSubscription = () => {{}};
+
+// Bind DOM listeners via initDashboard
+ctx.initDashboard();
+
+// 1. Switching view to containers expands containers submenu and collapses others
+ctx.switchViewTab("containers", false);
+if (!groupEls[0].classList.contains("expanded") || !elements["sidebar-submenu-containers"].classList.contains("open")) {{
+  throw new Error("containers submenu failed to expand on switchViewTab('containers')");
+}}
+if (elements["nav-tab-containers"].getAttribute("aria-expanded") !== "true") {{
+  throw new Error("nav-tab-containers aria-expanded should be 'true'");
+}}
+if (elements["nav-tab-containers"].getAttribute("aria-selected") !== "true") {{
+  throw new Error("nav-tab-containers aria-selected should be 'true'");
+}}
+if (groupEls[1].classList.contains("expanded") || elements["nav-tab-packages"].getAttribute("aria-expanded") !== "false") {{
+  throw new Error("packages submenu should remain collapsed");
+}}
+
+// 2. Clicking active parent nav-tab-containers toggles submenu closed and back open
+elements["nav-tab-containers"].click();
+if (groupEls[0].classList.contains("expanded") || elements["nav-tab-containers"].getAttribute("aria-expanded") !== "false") {{
+  throw new Error("clicking active parent should collapse submenu");
+}}
+elements["nav-tab-containers"].click();
+if (!groupEls[0].classList.contains("expanded") || elements["nav-tab-containers"].getAttribute("aria-expanded") !== "true") {{
+  throw new Error("clicking active parent again should re-expand submenu");
+}}
+
+// 3. Clicking a sub-menu item in another group switches both parent view and active subtab
+elements["subtab-pkg-installed-btn"].click();
+if (!groupEls[1].classList.contains("expanded") || groupEls[0].classList.contains("expanded")) {{
+  throw new Error("clicking packages subtab should expand packages and collapse containers");
+}}
+if (!elements["subtab-pkg-installed-btn"].classList.contains("active") || elements["subtab-pkg-installed-btn"].getAttribute("aria-selected") !== "true") {{
+  throw new Error("subtab-pkg-installed-btn should become active with aria-selected=true");
+}}
+if (elements["subtab-pkg-updates-btn"].classList.contains("active") || elements["subtab-pkg-updates-btn"].getAttribute("aria-selected") !== "false") {{
+  throw new Error("subtab-pkg-updates-btn should become inactive");
+}}
+if (elements["pkg-installed-subtab-panel"].classList.contains("hidden") || !elements["pkg-updates-subtab-panel"].classList.contains("hidden")) {{
+  throw new Error("pkg-installed-subtab-panel should be visible and updates panel hidden");
+}}
+
+// 4. Users & Audit subtab switching updates aria-selected and expands respective submenu
+elements["subtab-groups-btn"].click();
+if (!groupEls[2].classList.contains("expanded") || elements["subtab-groups-btn"].getAttribute("aria-selected") !== "true") {{
+  throw new Error("subtab-groups-btn failed to activate users group and aria-selected");
+}}
+elements["subtab-audit-alerts-btn"].click();
+if (!groupEls[3].classList.contains("expanded") || elements["subtab-audit-alerts-btn"].getAttribute("aria-selected") !== "true") {{
+  throw new Error("subtab-audit-alerts-btn failed to activate audit group and aria-selected");
+}}
+
+// 5. Desktop collapsed-sidebar state persists via localStorage
+elements["btn-toggle-sidebar"].click();
+if (!elements["app-shell"].classList.contains("sidebar-collapsed") || storage["vigil_sidebar_collapsed"] !== "1") {{
+  throw new Error("sidebar-collapsed toggle failed to persist");
+}}
+
+// 6. Mobile drawer auto-close triggers on submenu item click, NOT parent toggle
+mockWindow.innerWidth = 375;
+elements["app-sidebar"].classList.add("mobile-open");
+elements["mobile-nav-backdrop"].classList.add("active");
+elements["nav-tab-containers"].click();
+if (!elements["app-sidebar"].classList.contains("mobile-open")) {{
+  throw new Error("parent click on mobile should keep drawer open for submenu selection");
+}}
+elements["subtab-docker-images"].click();
+if (elements["app-sidebar"].classList.contains("mobile-open") || elements["mobile-nav-backdrop"].classList.contains("active")) {{
+  throw new Error("submenu item click on mobile should auto-close drawer");
+}}
+
+console.log("ALL_SIDEBAR_SUBMENU_VM_CHECKS_PASSED");
+"""
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_SIDEBAR_SUBMENU_VM_CHECKS_PASSED", res.stdout)
+
+    def test_fixed_dropdown_positioning_and_six_column_container_table_in_node_vm(self):
+        import subprocess
+
+        root = Path(__file__).parent
+        js_path = root / "static" / "app.js"
+
+        node_script = f"""
+const fs = require('fs');
+const vm = require('vm');
+
+const windowListeners = {{}};
+const docListeners = {{}};
+const openMenus = [];
+const tbodyEl = {{
+  id: "docker-containers-tbody",
+  innerHTML: "",
+  children: [],
+  querySelector() {{ return null; }},
+  querySelectorAll() {{ return []; }}
+}};
+
+const ctx = vm.createContext({{
+  document: {{
+    addEventListener(ev, fn) {{
+      if (!docListeners[ev]) docListeners[ev] = [];
+      docListeners[ev].push(fn);
+    }},
+    querySelectorAll(sel) {{
+      if (sel === ".actions-dropdown-menu.show") return openMenus;
+      return [];
+    }},
+    getElementById(id) {{
+      if (id === "docker-containers-tbody") return tbodyEl;
+      return null;
+    }},
+    documentElement: {{ clientWidth: 1280, clientHeight: 800 }}
+  }},
+  window: {{
+    innerWidth: 1280,
+    innerHeight: 800,
+    addEventListener(ev, fn) {{
+      if (!windowListeners[ev]) windowListeners[ev] = [];
+      windowListeners[ev].push(fn);
+    }}
+  }},
+  localStorage: {{ getItem() {{ return null; }}, setItem() {{}} }},
+  console,
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  WebSocket: class MockWS {{}},
+  TextDecoder, TextEncoder, URLSearchParams
+}});
+
+const appJs = fs.readFileSync('{str(js_path)}', 'utf-8');
+vm.runInContext(appJs, ctx);
+
+// 1. Verify empty state uses colspan="6"
+ctx.renderDockerContainers(null, []);
+if (!tbodyEl.innerHTML.includes('colspan="6"')) {{
+  throw new Error("Expected colspan='6' in empty container table state, got: " + tbodyEl.innerHTML);
+}}
+
+// 2. Verify populated row has 6 <td> cells with merged Container (Name + ID)
+ctx.renderDockerContainers(null, [
+  {{ id: "abc123456789", name: "vigil-web", image: "nginx:latest", state: "running", status: "Up 1h", ports: "80:80", stack: "core" }}
+]);
+const tdMatches = tbodyEl.innerHTML.match(/<td[\\s>]/g) || [];
+if (tdMatches.length !== 6) {{
+  throw new Error("Expected exactly 6 <td> columns per container row, got " + tdMatches.length);
+}}
+if (!tbodyEl.innerHTML.includes('class="container-cell-primary"') || !tbodyEl.innerHTML.includes('class="mono-text container-cell-id"')) {{
+  throw new Error("Expected merged Container Name + ID cell structure");
+}}
+
+// 3. Verify positionActionsDropdownMenu downward positioning and zIndex 1050
+function makeMenu(width = 148, height = 140) {{
+  const classes = new Set(["actions-dropdown-menu", "show"]);
+  return {{
+    offsetWidth: width,
+    offsetHeight: height,
+    style: {{}},
+    classList: {{
+      remove(c) {{ classes.delete(c); }},
+      contains(c) {{ return classes.has(c); }}
+    }},
+    getBoundingClientRect() {{ return {{ width, height }}; }}
+  }};
+}}
+
+const normalMenu = makeMenu(148, 140);
+const normalBtn = {{ getBoundingClientRect() {{ return {{ top: 120, bottom: 150, left: 820, right: 850 }}; }} }};
+ctx.positionActionsDropdownMenu(normalMenu, normalBtn);
+if (normalMenu.style.position !== "fixed" || normalMenu.style.zIndex !== "1050") {{
+  throw new Error("Dropdown must use position: fixed and zIndex: 1050");
+}}
+if (normalMenu.style.top !== "154px" || normalMenu.style.left !== "702px") {{
+  throw new Error(`Unexpected downward coordinates: top=${{normalMenu.style.top}}, left=${{normalMenu.style.left}}`);
+}}
+if (normalMenu.style.right !== "auto" || normalMenu.style.bottom !== "auto" || normalMenu.style.marginTop !== "0") {{
+  throw new Error("Dropdown must override right/bottom/marginTop when fixed-positioned");
+}}
+
+// 4. Verify upward flip when trigger is near bottom viewport edge
+const flipMenu = makeMenu(148, 140);
+const bottomBtn = {{ getBoundingClientRect() {{ return {{ top: 720, bottom: 750, left: 820, right: 850 }}; }} }};
+ctx.positionActionsDropdownMenu(flipMenu, bottomBtn);
+// top should flip above button: 720 - 140 - 4 = 576px
+if (flipMenu.style.top !== "576px") {{
+  throw new Error(`Expected upward flip top=576px, got ${{flipMenu.style.top}}`);
+}}
+
+// 5. Verify closeAllActionsDropdowns removes 'show' and resets inline positioning styles
+openMenus.push(flipMenu);
+ctx.closeAllActionsDropdowns();
+if (flipMenu.classList.contains("show")) {{
+  throw new Error("closeAllActionsDropdowns did not remove 'show'");
+}}
+for (const prop of ["position", "top", "left", "right", "bottom", "marginTop", "zIndex"]) {{
+  if (flipMenu.style[prop] !== "") {{
+    throw new Error(`closeAllActionsDropdowns failed to reset style.${{prop}}: ${{flipMenu.style[prop]}}`);
+  }}
+}}
+
+// 6. Verify scroll and resize listeners registered by initActionsDropdowns close open menus
+ctx.initActionsDropdowns();
+if (!windowListeners.scroll || !windowListeners.resize) {{
+  throw new Error("initActionsDropdowns did not register window scroll/resize listeners");
+}}
+const scrollMenu = makeMenu();
+openMenus.length = 0;
+openMenus.push(scrollMenu);
+windowListeners.scroll.forEach(fn => fn());
+if (scrollMenu.classList.contains("show")) {{
+  throw new Error("window scroll listener failed to close open dropdown");
+}}
+
+const resizeMenu = makeMenu();
+openMenus.length = 0;
+openMenus.push(resizeMenu);
+windowListeners.resize.forEach(fn => fn());
+if (resizeMenu.classList.contains("show")) {{
+  throw new Error("window resize listener failed to close open dropdown");
+}}
+
+console.log("ALL_FIXED_DROPDOWN_AND_LAYOUT_VM_CHECKS_PASSED");
+"""
+        res = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Node VM failed:\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        self.assertIn("ALL_FIXED_DROPDOWN_AND_LAYOUT_VM_CHECKS_PASSED", res.stdout)
 
 
 if __name__ == "__main__":
