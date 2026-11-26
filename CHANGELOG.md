@@ -2,6 +2,16 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.0.50] - 2026-11-25
+### Added
+- **Collapsible Sidebar Sub-Menus**: Consolidated in-page horizontal tab bars for **Containers**, **Packages**, **Users & Groups**, and **Audit Log** into collapsible sidebar sub-menus (`#sidebar-submenu-containers`, `#sidebar-submenu-packages`, `#sidebar-submenu-users`, `#sidebar-submenu-audit`) with badge pills, chevron indicators, collapsed-sidebar handling, and mobile drawer navigation.
+- **Sidebar & Container Layout Test Coverage**: Added `SidebarSubmenuAndContainerLayoutTests` in `test_main.py` covering duplicate HTML ID checks, sidebar sub-menu switching, viewport-fixed dropdown positioning, and 6-column container table rendering.
+
+### Changed
+- **Viewport-Fixed Container Actions Dropdown**: Updated `.actions-dropdown-menu` with `positionActionsDropdownMenu` and `closeAllActionsDropdowns` (`z-index: 1050`), upward viewport-edge flipping, horizontal clamping, and automatic dismissal on scroll/resize to prevent clipping inside scrollable tables.
+- **Streamlined 6-Column Container Table**: Simplified `#docker-containers-table` to 6 columns by combining container name and short ID into `.container-cell-primary` / `.container-cell-id` with balanced column truncation.
+- **Full Backward Compatibility**: Maintained 100% contract compliance across all 64 REST API endpoints and 722 client DOM element contracts with 440/440 tests passing.
+
 ## [1.0.49] - 2026-11-13
 ### Added
 - **Iconic Task Manager 60-Second Rolling Grid Canvas**: Dark grid palette (`#1a2634` grid, `#0d131a` background) with a 60-point rolling buffer and cyan gradient fill (`#00d2ff`) rendering continuous CPU and per-core oscilloscope charts.

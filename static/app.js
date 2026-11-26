@@ -3008,10 +3008,7 @@ function renderNotificationHistory(historyPayload) {
 
   const countBadge = document.getElementById("history-count-badge");
   if (countBadge) {
-    setTextIfChanged(
-      countBadge,
-      `${records.length} ${records.length === 1 ? "record" : "records"}`
-    );
+    setTextIfChanged(countBadge, String(records.length));
   }
 
   renderDrawerNotificationList(records);
@@ -3813,7 +3810,7 @@ function prependNotificationRow(entry) {
   const countBadge = document.getElementById("history-count-badge");
   if (countBadge) {
     const curCount = tbody.querySelectorAll ? tbody.querySelectorAll("tr").length : 1;
-    countBadge.textContent = `${curCount} ${curCount === 1 ? "record" : "records"}`;
+    countBadge.textContent = String(curCount);
   }
 }
 
@@ -7178,9 +7175,49 @@ function escapeHtml(str) {
 }
 
 /**
+ * Synchronize sidebar sub-menu groups so the active view's group is expanded
+ * and other groups collapse cleanly.
+ */
+function syncSidebarSubmenus(activeView, expandActive = true) {
+  if (typeof document.querySelectorAll !== "function") return;
+  const groups = document.querySelectorAll(".sidebar-nav-group[data-submenu-group]");
+  groups.forEach((group) => {
+    const groupName = group.getAttribute("data-submenu-group");
+    const parentBtn = group.querySelector ? group.querySelector(".sidebar-nav-parent") : null;
+    const submenu = group.querySelector ? group.querySelector(".sidebar-submenu") : null;
+    const shouldExpand = Boolean(expandActive && groupName === activeView);
+    group.classList.toggle("expanded", shouldExpand);
+    submenu?.classList.toggle("open", shouldExpand);
+    parentBtn?.setAttribute("aria-expanded", String(shouldExpand));
+  });
+}
+
+/**
+ * Toggle a sidebar sub-menu group open/closed when clicking its already-active parent tab.
+ */
+function toggleSidebarSubmenuGroup(groupName) {
+  if (typeof document.querySelector !== "function") return;
+  const group = document.querySelector(`.sidebar-nav-group[data-submenu-group="${groupName}"]`);
+  if (!group) return;
+  const nextExpanded = !group.classList.contains("expanded");
+  group.classList.toggle("expanded", nextExpanded);
+  group.querySelector?.(".sidebar-submenu")?.classList.toggle("open", nextExpanded);
+  group.querySelector?.(".sidebar-nav-parent")?.setAttribute("aria-expanded", String(nextExpanded));
+}
+
+/**
  * Switch view panel between 'overview', 'raid', 'notifications', 'containers', 'services', 'processes', 'users', and 'audit'.
  */
-function switchViewTab(tabName, updateHash = true) {
+function switchViewTab(tabName, updateHashOrOptions = true, options = {}) {
+  let updateHash = true;
+  let opts = options && typeof options === "object" ? options : {};
+  if (typeof updateHashOrOptions === "object" && updateHashOrOptions !== null) {
+    opts = updateHashOrOptions;
+    updateHash = opts.updateHash !== false;
+  } else {
+    updateHash = updateHashOrOptions !== false;
+  }
+
   const normTab = (tabName || "").toLowerCase();
   const isNotifications = normTab === "notifications";
   const isContainers = normTab === "containers";
@@ -7199,7 +7236,13 @@ function switchViewTab(tabName, updateHash = true) {
       ? "security"
       : isBackups
         ? "backups"
-        : normTab || "overview";
+        : isPackages
+          ? "packages"
+          : isProbes
+            ? "probes"
+            : normTab || "overview";
+
+  syncSidebarSubmenus(currentViewTab, true);
 
   const overviewTab = document.getElementById("nav-tab-overview");
   const raidTab = document.getElementById("nav-tab-raid");
@@ -7267,11 +7310,13 @@ function switchViewTab(tabName, updateHash = true) {
   packagesView?.classList.add("hidden");
   backupsView?.classList.add("hidden");
 
-  // Automatically close mobile sidebar if opened
-  document.getElementById("app-sidebar")?.classList.remove("open");
-  document.getElementById("app-sidebar")?.classList.remove("mobile-open");
-  document.getElementById("sidebar-backdrop")?.classList.remove("active");
-  document.getElementById("mobile-nav-backdrop")?.classList.remove("active");
+  // Automatically close mobile sidebar if opened (unless caller keeps drawer open for submenu selection)
+  if (!opts.keepMobileDrawerOpen) {
+    document.getElementById("app-sidebar")?.classList.remove("open");
+    document.getElementById("app-sidebar")?.classList.remove("mobile-open");
+    document.getElementById("sidebar-backdrop")?.classList.remove("active");
+    document.getElementById("mobile-nav-backdrop")?.classList.remove("active");
+  }
 
   if (isContainers) {
     containersTab?.classList.add("active");
@@ -7385,7 +7430,7 @@ function switchViewTab(tabName, updateHash = true) {
     }
 
     if (isAuthenticated) {
-      fetchAuditLogs();
+      switchAuditSubtab(currentAuditSubtab);
     }
   } else if (isPackages) {
     packagesTab?.classList.add("active");
@@ -7397,6 +7442,7 @@ function switchViewTab(tabName, updateHash = true) {
       history.replaceState(null, "", "#packages");
     }
 
+    switchPackagesSubtab(currentPackagesSubtab, { skipFetch: true });
     if (isAuthenticated) {
       refreshPackagesView();
     }
@@ -8008,6 +8054,10 @@ function switchUsersSubtab(subtab) {
   const usersPanel = document.getElementById("users-subtab-panel");
   const groupsPanel = document.getElementById("groups-subtab-panel");
 
+  if (currentViewTab === "users") {
+    syncSidebarSubmenus("users", true);
+  }
+
   if (isUsers) {
     usersBtn?.classList.add("active");
     usersBtn?.setAttribute("aria-selected", "true");
@@ -8545,6 +8595,10 @@ function switchAuditSubtab(subtab) {
   const secPanel = document.getElementById("audit-security-subtab-panel");
   const alertsPanel = document.getElementById("audit-alerts-subtab-panel");
 
+  if (currentViewTab === "audit") {
+    syncSidebarSubmenus("audit", true);
+  }
+
   if (isSecurity) {
     secBtn?.classList.add("active");
     secBtn?.setAttribute("aria-selected", "true");
@@ -8678,6 +8732,10 @@ function switchDockerSubtab(subtabName, updateHash = true) {
     subtabName = "stacks";
   }
   currentDockerSubtab = subtabName;
+
+  if (currentViewTab === "containers") {
+    syncSidebarSubmenus("containers", true);
+  }
 
   validSubtabs.forEach((st) => {
     const tabEl = document.getElementById(`subtab-docker-${st}`);
@@ -8987,7 +9045,62 @@ async function handleInstallDocker() {
 function closeAllActionsDropdowns() {
   document.querySelectorAll(".actions-dropdown-menu.show").forEach((menu) => {
     menu.classList.remove("show");
+    if (menu.style) {
+      menu.style.position = "";
+      menu.style.top = "";
+      menu.style.left = "";
+      menu.style.right = "";
+      menu.style.bottom = "";
+      menu.style.marginTop = "";
+      menu.style.zIndex = "";
+    }
   });
+}
+
+/**
+ * Position an open actions dropdown menu using viewport-fixed coordinates
+ * so it is never clipped by overflow-x/y table containers or obscured by
+ * sibling rows/progress bars.
+ */
+function positionActionsDropdownMenu(menu, triggerBtn) {
+  if (
+    !menu ||
+    !triggerBtn ||
+    typeof triggerBtn.getBoundingClientRect !== "function" ||
+    typeof menu.getBoundingClientRect !== "function" ||
+    typeof window === "undefined" ||
+    typeof window.innerHeight !== "number"
+  ) {
+    return;
+  }
+  if (menu.style) {
+    menu.style.position = "fixed";
+    menu.style.right = "auto";
+    menu.style.bottom = "auto";
+    menu.style.marginTop = "0";
+    menu.style.zIndex = "1050";
+  }
+
+  const btnRect = triggerBtn.getBoundingClientRect();
+  const menuRect = menu.getBoundingClientRect();
+  const vw = window.innerWidth || document.documentElement?.clientWidth || 1024;
+  const vh = window.innerHeight || document.documentElement?.clientHeight || 768;
+  const menuHeight = menu.offsetHeight || menuRect.height || 140;
+  const menuWidth = menu.offsetWidth || menuRect.width || 148;
+
+  let top = btnRect.bottom + 4;
+  if (vh - btnRect.bottom < menuHeight + 8 && btnRect.top > menuHeight + 8) {
+    top = btnRect.top - menuHeight - 4;
+  }
+
+  let left = btnRect.right - menuWidth;
+  if (left < 8) left = 8;
+  if (left + menuWidth > vw - 8) left = vw - menuWidth - 8;
+
+  if (menu.style) {
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.left = `${Math.round(left)}px`;
+  }
 }
 
 /**
@@ -9007,6 +9120,7 @@ function initActionsDropdowns() {
 
       if (menu && !isAlreadyOpen) {
         menu.classList.add("show");
+        positionActionsDropdownMenu(menu, moreBtn);
       }
       return;
     }
@@ -9029,6 +9143,19 @@ function initActionsDropdowns() {
       closeAllActionsDropdowns();
     }
   });
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener(
+      "scroll",
+      () => {
+        if (document.querySelectorAll(".actions-dropdown-menu.show").length > 0) {
+          closeAllActionsDropdowns();
+        }
+      },
+      { capture: true, passive: true }
+    );
+    window.addEventListener("resize", closeAllActionsDropdowns, { passive: true });
+  }
 }
 
 /**
@@ -11193,7 +11320,7 @@ function renderDockerContainers(highlightCid = null, containers = null) {
   }
 
   if (filtered.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-state">${query || statusFilter !== "all" || stackFilter !== "all" ? "No containers matching current filters." : "No containers found."}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-state">${query || statusFilter !== "all" || stackFilter !== "all" ? "No containers matching current filters." : "No containers found."}</td></tr>`;
     return;
   }
 
@@ -11263,16 +11390,20 @@ function renderDockerContainers(highlightCid = null, containers = null) {
     }
 
     return `<tr${rowClass}>
-      <td><strong>${safeName}</strong></td>
-      <td><span class="mono-text">${safeId}</span></td>
-      <td><span class="mono-text" style="color: var(--accent-primary);">${safeImage}</span></td>
+      <td>
+        <div class="container-cell-primary">
+          <strong title="${safeName}">${safeName}</strong>
+          <span class="mono-text container-cell-id" title="${safeId}">${safeId}</span>
+        </div>
+      </td>
+      <td title="${safeImage}"><span class="mono-text" style="color: var(--accent-primary);">${safeImage}</span></td>
       <td>
         <span class="status-badge ${statusClass}">
           <span class="status-dot"></span>
           ${safeStatus}
         </span>
       </td>
-      <td><span class="mono-text">${safePorts}</span></td>
+      <td title="${safePorts}"><span class="mono-text">${safePorts}</span></td>
       <td>${safeStack !== "-" ? `<span class="kind-badge kind-weekly">${safeStack}</span>` : "-"}</td>
       <td class="actions-col">
         <div class="btn-action-group">
@@ -13325,14 +13456,19 @@ let lastUpgradeTargetPackage = null;
 let lastPythonUpgradeTargetPackage = null;
 let lastUpgradeModalType = "apt";
 
-function switchPackagesSubtab(subtab) {
+function switchPackagesSubtab(subtab, options = {}) {
   currentPackagesSubtab = subtab || "updates";
+  const skipFetch = Boolean(options && options.skipFetch);
   const btnUpdates = document.getElementById("subtab-pkg-updates-btn");
   const btnInstalled = document.getElementById("subtab-pkg-installed-btn");
   const btnPython = document.getElementById("subtab-pkg-python-btn");
   const panelUpdates = document.getElementById("pkg-updates-subtab-panel");
   const panelInstalled = document.getElementById("pkg-installed-subtab-panel");
   const panelPython = document.getElementById("pkg-python-subtab-panel");
+
+  if (currentViewTab === "packages") {
+    syncSidebarSubmenus("packages", true);
+  }
 
   btnUpdates?.classList.remove("active");
   btnUpdates?.setAttribute("aria-selected", "false");
@@ -13349,21 +13485,21 @@ function switchPackagesSubtab(subtab) {
     btnInstalled?.classList.add("active");
     btnInstalled?.setAttribute("aria-selected", "true");
     panelInstalled?.classList.remove("hidden");
-    if (!cachedInstalledPackages) {
+    if (!skipFetch && !cachedInstalledPackages) {
       fetchInstalledPackages(currentPkgSearchQuery, currentPkgPage);
     }
   } else if (currentPackagesSubtab === "python") {
     btnPython?.classList.add("active");
     btnPython?.setAttribute("aria-selected", "true");
     panelPython?.classList.remove("hidden");
-    if (!cachedPythonPackages) {
+    if (!skipFetch && !cachedPythonPackages) {
       fetchPythonPackages(false);
     }
   } else {
     btnUpdates?.classList.add("active");
     btnUpdates?.setAttribute("aria-selected", "true");
     panelUpdates?.classList.remove("hidden");
-    if (!cachedPackageUpdates) {
+    if (!skipFetch && !cachedPackageUpdates) {
       fetchPackageUpdates();
     }
   }
@@ -16829,7 +16965,13 @@ function initDashboard() {
 
   document
     .getElementById("nav-tab-containers")
-    ?.addEventListener("click", () => switchViewTab("containers", true));
+    ?.addEventListener("click", () => {
+      if (currentViewTab === "containers") {
+        toggleSidebarSubmenuGroup("containers");
+      } else {
+        switchViewTab("containers", { keepMobileDrawerOpen: true });
+      }
+    });
 
   document
     .getElementById("nav-tab-probes")
@@ -16849,11 +16991,23 @@ function initDashboard() {
 
   document
     .getElementById("nav-tab-users")
-    ?.addEventListener("click", () => switchViewTab("users", true));
+    ?.addEventListener("click", () => {
+      if (currentViewTab === "users") {
+        toggleSidebarSubmenuGroup("users");
+      } else {
+        switchViewTab("users", { keepMobileDrawerOpen: true });
+      }
+    });
 
   document
     .getElementById("nav-tab-packages")
-    ?.addEventListener("click", () => switchViewTab("packages", true));
+    ?.addEventListener("click", () => {
+      if (currentViewTab === "packages") {
+        toggleSidebarSubmenuGroup("packages");
+      } else {
+        switchViewTab("packages", { keepMobileDrawerOpen: true });
+      }
+    });
 
   document
     .getElementById("nav-tab-notifications")
@@ -16861,7 +17015,13 @@ function initDashboard() {
 
   document
     .getElementById("nav-tab-audit")
-    ?.addEventListener("click", () => switchViewTab("audit", true));
+    ?.addEventListener("click", () => {
+      if (currentViewTab === "audit") {
+        toggleSidebarSubmenuGroup("audit");
+      } else {
+        switchViewTab("audit", { keepMobileDrawerOpen: true });
+      }
+    });
 
   document
     .getElementById("nav-tab-backups")
@@ -16937,15 +17097,24 @@ function initDashboard() {
 
   document
     .getElementById("subtab-pkg-updates-btn")
-    ?.addEventListener("click", () => switchPackagesSubtab("updates"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "packages") switchViewTab("packages", true);
+      switchPackagesSubtab("updates");
+    });
 
   document
     .getElementById("subtab-pkg-installed-btn")
-    ?.addEventListener("click", () => switchPackagesSubtab("installed"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "packages") switchViewTab("packages", true);
+      switchPackagesSubtab("installed");
+    });
 
   document
     .getElementById("subtab-pkg-python-btn")
-    ?.addEventListener("click", () => switchPackagesSubtab("python"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "packages") switchViewTab("packages", true);
+      switchPackagesSubtab("python");
+    });
 
   document
     .getElementById("pkg-python-search")
@@ -17112,7 +17281,7 @@ function initDashboard() {
     ?.addEventListener("click", closeMobileNavDrawer);
 
   // Auto-close mobile drawer when navigation links are clicked on mobile
-  document.querySelectorAll(".sidebar-nav-item, .nav-link, .btn-sidebar-footer, .sidebar-footer button").forEach((el) => {
+  document.querySelectorAll(".sidebar-nav-item:not(.sidebar-nav-parent), .sidebar-submenu-item, .nav-link, .btn-sidebar-footer, .sidebar-footer button").forEach((el) => {
     el.addEventListener("click", () => {
       if (window.innerWidth <= 768) {
         closeMobileNavDrawer();
@@ -17125,7 +17294,10 @@ function initDashboard() {
   subtabs.forEach((st) => {
     document
       .getElementById(`subtab-docker-${st}`)
-      ?.addEventListener("click", () => switchDockerSubtab(st, true));
+      ?.addEventListener("click", () => {
+        if (currentViewTab !== "containers") switchViewTab("containers", true);
+        switchDockerSubtab(st, true);
+      });
   });
 
   // Quick Stat Cards Navigation
@@ -17849,11 +18021,17 @@ function initDashboard() {
 
   document
     .getElementById("subtab-users-btn")
-    ?.addEventListener("click", () => switchUsersSubtab("users"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "users") switchViewTab("users", true);
+      switchUsersSubtab("users");
+    });
 
   document
     .getElementById("subtab-groups-btn")
-    ?.addEventListener("click", () => switchUsersSubtab("groups"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "users") switchViewTab("users", true);
+      switchUsersSubtab("groups");
+    });
 
   document
     .getElementById("users-regular-only-toggle")
@@ -18098,10 +18276,16 @@ function initDashboard() {
   // Audit view subtabs & redirect banner
   document
     .getElementById("subtab-audit-security-btn")
-    ?.addEventListener("click", () => switchAuditSubtab("security"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "audit") switchViewTab("audit", true);
+      switchAuditSubtab("security");
+    });
   document
     .getElementById("subtab-audit-alerts-btn")
-    ?.addEventListener("click", () => switchAuditSubtab("alerts"));
+    ?.addEventListener("click", () => {
+      if (currentViewTab !== "audit") switchViewTab("audit", true);
+      switchAuditSubtab("alerts");
+    });
   document
     .getElementById("btn-goto-alert-logs")
     ?.addEventListener("click", () => {

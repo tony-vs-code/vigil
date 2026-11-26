@@ -1,35 +1,24 @@
-# Release v1.0.49: Windows Task Manager Performance Dashboard
+# Release v1.0.50: Sidebar Sub-Menu Navigation & Container Table Layout Polish
 
 ## Overview
-Vigil v1.0.49 transforms the real-time system monitoring experience into a high-performance Windows Task Manager-style dashboard. This release introduces the iconic 60-second rolling grid canvas with dark grid styling and cyan gradient fills, dynamic Update Speed control (`High (0.5s) | Normal (1s) | Low (2s) | Paused`) via topbar controls and backend streaming API, zero DOM thrashing with calm meter easing transitions, tabular numeral stabilization across all metrics, an Overall CPU vs Logical Processors multi-core toggle, and subtle pastel heatmap shading across the Task Manager Process Explorer.
+Vigil v1.0.50 streamlines dashboard navigation and container table ergonomics. In-page horizontal tab bars across multi-section views have been consolidated into collapsible sidebar sub-menus with live count badges and mobile drawer support, container action dropdowns now render with viewport-fixed positioning to eliminate clipping, and the Docker containers table has been tightened into a cleaner 6-column layout.
 
 ## Highlights & Enhancements
 
-### 1. Iconic Task Manager 60-Second Rolling Grid Canvas
-- **Dark Grid Palette & Cyan Gradient**: Engineered a high-contrast canvas with `#1a2634` grid divisions, `#0d131a` background, and smooth cyan `#00d2ff` gradient fill with subtle glow.
-- **60-Point Rolling Buffer**: Continuous 60-sample historical ring buffer scrolling smoothly across time, providing instantaneous visualization of historical compute pressure and load spikes.
+### 1. Collapsible Sidebar Sub-Menu Navigation
+- **Unified Multi-View Sub-Menus**: Replaced in-page horizontal tab bars on **Containers** (`#view-containers`), **Packages** (`#view-packages`), **Users & Groups** (`#view-users`), and **Audit Log** (`#view-audit`) with integrated collapsible sidebar sub-menus (`#sidebar-submenu-containers`, `#sidebar-submenu-packages`, `#sidebar-submenu-users`, `#sidebar-submenu-audit`).
+- **Live Badges & Chevron Indicators**: Preserved real-time item and update badge pills alongside animated chevron indicators (`.sidebar-submenu-chevron`) and accessible `role="tablist"` / `aria-expanded` attributes.
+- **Collapsed & Mobile Drawer Awareness**: Synchronizes active parent and sub-tab states via `syncSidebarSubmenus` and `toggleSidebarSubmenuGroup`, cleanly hides sub-menus when the desktop sidebar is collapsed (`.app-layout.sidebar-collapsed`), and supports intuitive parent-vs-submenu navigation inside the mobile drawer.
 
-### 2. Task Manager Update Speed Selector & Backend Stream Interval
-- **Topbar Speed Selector**: Added intuitive speed options: **High (0.5s)**, **Normal (1s)**, **Low (2s)**, and **Paused (0s)** directly in the dashboard header.
-- **Dynamic Stream Synchronization**: Connected via `/api/stream/interval` endpoint to dynamically adjust backend SSE telemetry intervals in real time without dropping active WebSocket or SSE sessions.
+### 2. Viewport-Fixed Container Actions Dropdown
+- **Clip-Free Fixed Positioning**: Added `positionActionsDropdownMenu` and `closeAllActionsDropdowns` so `.actions-dropdown-menu` renders in viewport-fixed coordinates at `z-index: 1050`, preventing clipping by table overflow scrollbars or sibling elements.
+- **Smart Boundary Handling**: Automatically flips upward when near the bottom edge of the viewport, clamps horizontally within viewport margins, and dismisses cleanly on scroll, resize, `Escape`, outside click, or menu action selection.
 
-### 3. Zero DOM Thrashing & Calm Meter Transitions
-- **Eliminated 60fps DOM Thrashing**: Removed hyperactive `requestAnimationFrame` DOM mutation loops, allowing telemetry updates to apply directly on data receipt.
-- **Calm Easing Transitions**: Gauges and progress fills smoothly glide with `0.4s cubic-bezier(0.25, 0.1, 0.25, 1)` easing, allowing meters to glide calmly and settle gracefully before subsequent ticks.
-
-### 4. Tabular Numerals Across All Telemetry
-- **Digit Jitter Elimination**: Enforced `font-variant-numeric: tabular-nums` across all aggregate CPU, multi-core logical processor percentages, RAM, swap, and disk metrics.
-- **Visual Stability**: Monospaced digit widths eliminate horizontal micro-shakes and layout oscillations as values fluctuate rapidly.
-
-### 5. Overall CPU vs Logical Processors Multi-Core View Toggle
-- **Multi-Core Visualization Modes**: Toggle seamlessly between single aggregate CPU chart and per-core logical processor oscilloscope charts.
-- **State Persistence**: Remembers view preference in browser `localStorage`, automatically preserving operator display choices across reloads.
-
-### 6. Process Explorer Heatmap Shading
-- **Subtle Pastel Heatmaps**: Dynamically shades CPU% and Memory% cells in the Process Explorer table with graduated pastel heatmap tints (`rgba(0, 210, 255, alpha)` and `rgba(255, 180, 0, alpha)`).
-- **Instant Hotspot Identification**: Allows operators to immediately spot resource-intensive processes and runaway background tasks at a glance.
+### 3. Streamlined 6-Column Container Table Layout
+- **Merged Primary Container Cell**: Consolidated `#docker-containers-table` into a 6-column layout (`Container`, `Image`, `State`, `Ports`, `Stack`, `Actions`), pairing container names and truncated short IDs cleanly inside `.container-cell-primary` and `.container-cell-id`.
+- **Balanced Column Widths**: Added disciplined `max-width` and ellipsis truncation rules across container metadata columns so action controls remain accessible without horizontal crowding.
 
 ## Reliability & Fixes
-- **100% Contract & Backward Compatibility**: Fully preserves all 64 REST API endpoints and 722 client DOM element contracts.
-- **Comprehensive Test Suite**: 437 unit and cross-tier tests passing cleanly in `tests/test_live_streams.py`, `tests/test_sse_stream.py`, `tests/test_ui_task_manager_dashboard.py`, and across the entire suite.
-- **Cross-Tier QA Gate Verification**: Automated requirements validation passed with 0 failures, 0 syntax errors, and 100% contract compliance.
+- **Sidebar & Layout Test Suite**: Added `SidebarSubmenuAndContainerLayoutTests` in `test_main.py` verifying zero duplicate HTML IDs, sidebar sub-menu DOM contracts, collapsed/mobile navigation flows, viewport-fixed dropdown flipping/closing, and 6-column container table rendering in Node VM.
+- **Cron Lifecycle Test Fix**: Updated `test_fastapi_cron_endpoints_auth_and_lifecycle` in `test_main.py` to mock `DOCKER_MANAGER.prune_volumes` cleanly during scheduled maintenance execution tests.
+- **100% QA Quality Gate Pass**: Validated with `node --check static/app.js`, cross-tier contract checks (64 frontend API routes and 722 DOM element IDs), and **440/440** passing tests in `pytest`.
