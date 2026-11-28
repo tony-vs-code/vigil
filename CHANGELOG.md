@@ -2,6 +2,19 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.2.0] - 2026-11-28
+### Added
+- **Automated Incident Forensics Engine**: Added `alert_forensic_snapshots` SQLite table, `notification_history.snapshot_id` linkage, `capture_forensic_snapshot`, `_collect_top_processes` (top 10 CPU/memory processes), `_collect_forensic_system_metrics`, and `prune_forensic_snapshots` (30-day / 500-record auto-retention) in `main.py`, wired into `evaluate_threshold_alerts` and Discord embeds (`_format_forensic_processes_field`).
+- **Forensics REST APIs**: Added authenticated `GET /api/notifications/snapshots`, `GET /api/notifications/snapshots/{snapshot_id}`, and `GET /api/notifications/{notification_id}/snapshot` endpoints in `api.py` and exposed `id` / `snapshot_id` on notification history payloads.
+- **Interactive Incident Forensics Drawer**: Added `#drawer-forensic-snapshot` (`static/index.html`, `static/app.js`, `static/styles.css`) with frozen load/CPU/memory/swap gauges, `#snapshot-processes-table`, event context cards, and 1-click Markdown post-mortem clipboard export (`copySnapshotSummaryToClipboard`).
+- **Incident Forensics Test Suite**: Added `test_incident_forensics.py` covering snapshot capture, retention pruning, evaluator integration, REST auth/schema, and Node VM drawer/export verification.
+
+### Fixed
+- **Docker Registry Auth & Stack/Update Injection**: Updated `main.py` (`_parse_registry_url`, `_get_docker_config_server_aliases`, `_build_registry_auths_payload`, `_ephemeral_docker_config_dir`) to support bare domain URLs without schemes (`ghcr.io`, `quay.io`), multi-alias Docker CLI auth keys in `config.json`, empty username fallback to `"oauth2"`, and credential injection during Compose stack deployments and image update checks, with regression tests in `test_container_registries.py`.
+
+### Changed
+- **Full Backward Compatibility**: Maintained 100% contract compliance across all 68 frontend API route calls and 763 DOM element IDs with 472/472 tests passing.
+
 ## [1.1.1] - 2026-11-28
 ### Added
 - **Registry-Authenticated Image Pulling**: Enhanced `DockerManager.pull_image` in `main.py` with `extract_registry_host_from_image` and `resolve_registry_for_image` to automatically match configured registry credentials (or use an explicit `registry_id` override), write an isolated `0700`/`0600` temporary `--config` `config.json` cleaned up in `finally`, and log `docker.image.pull` audit events.

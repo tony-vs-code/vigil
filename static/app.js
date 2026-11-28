@@ -3025,7 +3025,7 @@ function renderNotificationHistory(historyPayload) {
 
   const sig = records.length === 0
     ? "__EMPTY__"
-    : `${records.length}::` + records.map((r) => `${r.id ?? ""}:${r.sent_at ?? ""}:${r.outcome ?? ""}:${r.status ?? ""}:${r.trigger ?? ""}:${r.channel ?? ""}`).join("|");
+    : `${records.length}::` + records.map((r) => `${r.id ?? ""}:${r.sent_at ?? ""}:${r.outcome ?? ""}:${r.status ?? ""}:${r.trigger ?? ""}:${r.channel ?? ""}:${r.snapshot_id ?? ""}`).join("|");
 
   if (cachedNotificationHistorySig === sig && tbody.children && tbody.children.length > 0) {
     return;
@@ -3143,6 +3143,22 @@ function renderNotificationHistory(historyPayload) {
       outcomeBadge.textContent = entry.outcome || "DISPATCHED";
     }
     tdOutcome.appendChild(outcomeBadge);
+
+    if (entry.snapshot_id) {
+      const snapshotBtn = document.createElement("button");
+      snapshotBtn.type = "button";
+      snapshotBtn.className = "btn-action btn-snapshot";
+      snapshotBtn.setAttribute("data-snapshot-id", String(entry.snapshot_id));
+      snapshotBtn.setAttribute("title", "Inspect Incident Snapshot");
+      snapshotBtn.textContent = "📸 Snapshot";
+      snapshotBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (typeof openForensicSnapshotDrawer === "function") {
+          openForensicSnapshotDrawer(String(entry.snapshot_id));
+        }
+      });
+      tdOutcome.appendChild(snapshotBtn);
+    }
 
     tr.appendChild(tdTime);
     tr.appendChild(tdTrigger);
@@ -3316,6 +3332,11 @@ function renderDrawerNotificationList(records) {
           </div>
         </div>
         <div class="drawer-item-message">${escapeHtml(details)}</div>
+        ${
+          entry.snapshot_id
+            ? `<div class="drawer-item-actions"><button type="button" class="btn-action btn-snapshot" data-snapshot-id="${escapeHtml(String(entry.snapshot_id))}" title="Inspect Incident Snapshot">📸 Snapshot</button></div>`
+            : ""
+        }
       </div>
     `;
     })
@@ -3329,6 +3350,16 @@ function renderDrawerNotificationList(records) {
         dismissedNotificationIds.add(id);
         saveDismissedNotifications();
         renderDrawerNotificationList();
+      }
+    });
+  });
+
+  listEl.querySelectorAll(".btn-snapshot[data-snapshot-id]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const snapshotId = btn.getAttribute("data-snapshot-id");
+      if (snapshotId && typeof openForensicSnapshotDrawer === "function") {
+        openForensicSnapshotDrawer(snapshotId);
       }
     });
   });
@@ -3376,6 +3407,385 @@ function closeNotificationDrawer() {
       backdrop.classList.add("hidden");
     }
   }, 280);
+}
+
+/* =========================================================================
+ * Automated Incident Forensics & Contextual Event Snapshots
+ * ========================================================================= */
+let activeForensicSnapshot = null;
+
+function formatSnapshotTitle(snapshot) {
+  const evt = String(snapshot?.event_type || "system").trim();
+  const labelMap = {
+    cpu: "High CPU Utilization Incident",
+    ram: "High Memory Utilization Incident",
+    memory: "High Memory Utilization Incident",
+    disk: "Disk Capacity / Storage Incident",
+    raid: "RAID Array Health Incident",
+    smart: "S.M.A.R.T. Disk Health Incident",
+    thermal: "System Thermal Incident",
+    thermals: "System Thermal Incident",
+    probe: "Sentinel Endpoint Probe Incident",
+    sentinel: "Sentinel Endpoint Probe Incident",
+  };
+  return labelMap[evt.toLowerCase()] || `Incident Snapshot: ${evt.toUpperCase()}`;
+}
+
+function updateSnapshotGauge(gaugeId, pctValue, subLabel) {
+  const box = document.getElementById(gaugeId);
+  if (!box) return;
+  const pct = Math.max(0, Math.min(100, Number(pctValue) || 0));
+  const pctEl = box.querySelector ? box.querySelector(".forensic-gauge-pct") : null;
+  const subEl = box.querySelector ? box.querySelector(".forensic-gauge-sub") : null;
+  const fillEl = box.querySelector ? box.querySelector(".forensic-gauge-fill") : null;
+
+  if (pctEl) pctEl.textContent = `${pct.toFixed(1)}%`;
+  if (subEl) subEl.textContent = subLabel || "";
+  if (fillEl) {
+    fillEl.style.width = `${pct.toFixed(1)}%`;
+    fillEl.classList.remove("gauge-ok", "gauge-warn", "gauge-crit");
+    if (pct >= 90) fillEl.classList.add("gauge-crit");
+    else if (pct >= 75) fillEl.classList.add("gauge-warn");
+    else fillEl.classList.add("gauge-ok");
+  }
+}
+
+function renderSnapshotSystemMetrics(snapshot) {
+  const metrics = (snapshot && snapshot.system_metrics) || {};
+  const loadEl = document.getElementById("snapshot-load-avg");
+  const loadArr = Array.isArray(metrics.load_avg) ? metrics.load_avg : [];
+  if (loadEl) {
+    loadEl.textContent =
+      loadArr.length >= 3
+        ? `${Number(loadArr[0]).toFixed(2)} / ${Number(loadArr[1]).toFixed(2)} / ${Number(loadArr[2]).toFixed(2)}`
+        : loadArr.length > 0
+          ? loadArr.map((v) => Number(v).toFixed(2)).join(" / ")
+          : "-- / -- / --";
+  }
+
+  const cpuCores = Array.isArray(metrics.cpu_cores) ? metrics.cpu_cores : [];
+  const cpuSub = cpuCores.length > 0 ? `${cpuCores.length} cores` : "System CPU";
+  updateSnapshotGauge("snapshot-cpu-gauge", metrics.cpu_percent ?? 0, cpuSub);
+
+  const mem = metrics.memory && typeof metrics.memory === "object" ? metrics.memory : {};
+  const memTotal = Number(mem.total) || 0;
+  const memUsed = Number(mem.used) || 0;
+  const memSub = memTotal > 0 ? `${formatBytes(memUsed)} / ${formatBytes(memTotal)}` : "--";
+  updateSnapshotGauge("snapshot-memory-gauge", mem.percent ?? 0, memSub);
+
+  const swap = metrics.swap && typeof metrics.swap === "object" ? metrics.swap : {};
+  const swapTotal = Number(swap.total) || 0;
+  const swapUsed = Number(swap.used) || 0;
+  const swapSub = swapTotal > 0 ? `${formatBytes(swapUsed)} / ${formatBytes(swapTotal)}` : "No swap configured";
+  updateSnapshotGauge("snapshot-swap-gauge", swap.percent ?? 0, swapSub);
+}
+
+function renderSnapshotProcesses(processes) {
+  const tbody = document.getElementById("snapshot-processes-tbody");
+  if (!tbody) return;
+
+  const list = Array.isArray(processes) ? processes : [];
+  if (list.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No top processes recorded for this snapshot.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = list
+    .map((proc) => {
+      const pid = escapeHtml(String(proc.pid ?? "-"));
+      const name = escapeHtml(proc.name || "-");
+      const user = escapeHtml(proc.user || "-");
+      const cpuPct = Number(proc.cpu_percent ?? 0).toFixed(1);
+      const memMb = Number(proc.memory_mb ?? 0).toFixed(1);
+      const memPct = Number(proc.memory_percent ?? 0).toFixed(1);
+      const cmdline = escapeHtml(proc.cmdline || proc.name || "-");
+
+      return `<tr>
+        <td><span class="mono-text">${pid}</span></td>
+        <td><strong>${name}</strong></td>
+        <td><span class="text-secondary">${user}</span></td>
+        <td><span class="mono-text ${Number(cpuPct) >= 50 ? "text-danger font-bold" : ""}">${cpuPct}%</span></td>
+        <td><span class="mono-text">${memMb} MB <span class="text-muted">(${memPct}%)</span></span></td>
+        <td><code class="snapshot-cmdline" title="${cmdline}">${cmdline}</code></td>
+      </tr>`;
+    })
+    .join("");
+}
+
+function formatContextKeyLabel(key) {
+  return String(key || "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function renderSnapshotContext(snapshot) {
+  const card = document.getElementById("snapshot-context-card");
+  const body = document.getElementById("snapshot-context-body");
+  if (!body) return;
+
+  const ctx = snapshot && snapshot.context && typeof snapshot.context === "object" ? snapshot.context : {};
+  const keys = Object.keys(ctx);
+
+  if (keys.length === 0) {
+    if (card) card.classList.remove("hidden");
+    body.innerHTML = `<span class="text-muted">No additional diagnostic context recorded for this event.</span>`;
+    return;
+  }
+
+  const itemsHtml = keys
+    .map((key) => {
+      const val = ctx[key];
+      const label = escapeHtml(formatContextKeyLabel(key));
+      if (Array.isArray(val)) {
+        if (val.length === 0) {
+          return `<div class="forensic-context-item"><span class="forensic-context-key">${label}</span><span class="forensic-context-val text-muted">None</span></div>`;
+        }
+        const listMarkup = val
+          .map((item) => {
+            if (item && typeof item === "object") {
+              const summary = Object.entries(item)
+                .map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(typeof v === "object" ? JSON.stringify(v) : String(v ?? ""))}`)
+                .join(" • ");
+              return `<li><code class="snapshot-cmdline">${summary}</code></li>`;
+            }
+            return `<li><code class="snapshot-cmdline">${escapeHtml(String(item))}</code></li>`;
+          })
+          .join("");
+        return `<div class="forensic-context-item forensic-context-item-full">
+          <span class="forensic-context-key">${label}</span>
+          <ul class="forensic-context-list">${listMarkup}</ul>
+        </div>`;
+      }
+      if (val && typeof val === "object") {
+        const subEntries = Object.entries(val)
+          .map(([k, v]) => `<div class="forensic-sub-kv"><span class="text-muted">${escapeHtml(formatContextKeyLabel(k))}:</span> <span class="mono-text">${escapeHtml(typeof v === "object" ? JSON.stringify(v) : String(v ?? "-"))}</span></div>`)
+          .join("");
+        return `<div class="forensic-context-item forensic-context-item-full">
+          <span class="forensic-context-key">${label}</span>
+          <div class="forensic-sub-kv-grid">${subEntries}</div>
+        </div>`;
+      }
+      return `<div class="forensic-context-item">
+        <span class="forensic-context-key">${label}</span>
+        <span class="forensic-context-val mono-text">${escapeHtml(String(val ?? "-"))}</span>
+      </div>`;
+    })
+    .join("");
+
+  body.innerHTML = `<div class="forensic-context-grid">${itemsHtml}</div>`;
+}
+
+function renderForensicSnapshotDetails(snapshot) {
+  activeForensicSnapshot = snapshot;
+
+  const titleEl = document.getElementById("snapshot-drawer-title");
+  const timeEl = document.getElementById("snapshot-timestamp");
+  const sevBadge = document.getElementById("snapshot-severity-badge");
+  const evtBadge = document.getElementById("snapshot-event-type");
+  const metricPill = document.getElementById("snapshot-metric-value");
+
+  if (titleEl) titleEl.textContent = formatSnapshotTitle(snapshot);
+
+  const tsFormatted =
+    snapshot.created_at_formatted ||
+    (snapshot.created_at ? formatTimestampLocal(snapshot.created_at) : "--");
+  if (timeEl) timeEl.textContent = `Captured: ${tsFormatted} • ID: ${snapshot.id || "--"}`;
+
+  const severity = String(snapshot.severity || "WARNING").toUpperCase();
+  if (sevBadge) {
+    sevBadge.textContent = severity;
+    sevBadge.className = "status-badge";
+    if (severity === "CRITICAL" || severity === "ERROR" || severity === "FAILED") {
+      sevBadge.classList.add("status-danger");
+    } else if (severity === "INFO" || severity === "OK" || severity === "CLEAN") {
+      sevBadge.classList.add("status-ok");
+    } else {
+      sevBadge.classList.add("status-warn");
+    }
+  }
+
+  if (evtBadge) {
+    evtBadge.textContent = String(snapshot.event_type || "SYSTEM").toUpperCase();
+  }
+
+  if (metricPill) {
+    const mv = String(snapshot.metric_value || "").trim();
+    if (mv) {
+      metricPill.textContent = `Trigger: ${mv}`;
+      metricPill.classList.remove("hidden");
+    } else {
+      metricPill.textContent = "";
+      metricPill.classList.add("hidden");
+    }
+  }
+
+  renderSnapshotSystemMetrics(snapshot);
+  renderSnapshotProcesses(snapshot.top_processes);
+  renderSnapshotContext(snapshot);
+}
+
+async function openForensicSnapshotDrawer(snapshotId) {
+  const drawer = document.getElementById("drawer-forensic-snapshot");
+  const backdrop = document.getElementById("forensic-snapshot-backdrop");
+  const loadingEl = document.getElementById("snapshot-loading-state");
+  const errorEl = document.getElementById("snapshot-error-state");
+  const bodyEl = document.getElementById("snapshot-content-body");
+  const titleEl = document.getElementById("snapshot-drawer-title");
+  const timeEl = document.getElementById("snapshot-timestamp");
+
+  if (!drawer || !snapshotId) return;
+
+  activeForensicSnapshot = null;
+  if (titleEl) titleEl.textContent = "Incident Forensic Snapshot";
+  if (timeEl) timeEl.textContent = `Loading snapshot ${snapshotId}...`;
+  loadingEl?.classList.remove("hidden");
+  errorEl?.classList.add("hidden");
+  bodyEl?.classList.add("hidden");
+
+  drawer.classList.remove("hidden");
+  void drawer.offsetWidth;
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+
+  if (backdrop) {
+    backdrop.classList.remove("hidden");
+    void backdrop.offsetWidth;
+    backdrop.classList.add("open");
+  }
+
+  try {
+    const resp = await apiFetch(
+      "/api/notifications/snapshots/" + encodeURIComponent(snapshotId)
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.snapshot) {
+      throw new Error(data.detail || `Failed to load snapshot (HTTP ${resp.status})`);
+    }
+
+    renderForensicSnapshotDetails(data.snapshot);
+    loadingEl?.classList.add("hidden");
+    bodyEl?.classList.remove("hidden");
+  } catch (err) {
+    loadingEl?.classList.add("hidden");
+    if (errorEl) {
+      errorEl.textContent = err.message || String(err);
+      errorEl.classList.remove("hidden");
+    }
+  }
+}
+
+function closeForensicSnapshotDrawer() {
+  const drawer = document.getElementById("drawer-forensic-snapshot");
+  const backdrop = document.getElementById("forensic-snapshot-backdrop");
+  if (!drawer) return;
+
+  drawer.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true");
+
+  if (backdrop) {
+    backdrop.classList.remove("open");
+  }
+
+  setTimeout(() => {
+    if (!drawer.classList.contains("open")) {
+      drawer.classList.add("hidden");
+    }
+    if (backdrop && !backdrop.classList.contains("open")) {
+      backdrop.classList.add("hidden");
+    }
+  }, 280);
+}
+
+async function copySnapshotSummaryToClipboard() {
+  if (!activeForensicSnapshot) {
+    if (typeof showToast === "function") {
+      showToast({ title: "No Snapshot Loaded", message: "Open a forensic snapshot before copying.", type: "warning" });
+    }
+    return;
+  }
+
+  const snap = activeForensicSnapshot;
+  const metrics = snap.system_metrics || {};
+  const loadArr = Array.isArray(metrics.load_avg) ? metrics.load_avg : [];
+  const loadStr =
+    loadArr.length > 0 ? loadArr.map((v) => Number(v).toFixed(2)).join(", ") : "N/A";
+  const mem = metrics.memory || {};
+  const swap = metrics.swap || {};
+  const tsStr =
+    snap.created_at_formatted ||
+    (snap.created_at ? formatTimestampLocal(snap.created_at) : "Unknown");
+
+  const topProcs = (Array.isArray(snap.top_processes) ? snap.top_processes : []).slice(0, 5);
+  const procLines =
+    topProcs.length > 0
+      ? topProcs
+          .map(
+            (p) =>
+              `- **${p.name || "process"}** (PID ${p.pid ?? "?"} | user: \`${p.user || "-"}\`) — CPU: \`${Number(p.cpu_percent ?? 0).toFixed(1)}%\`, Mem: \`${Number(p.memory_mb ?? 0).toFixed(1)} MB\` — \`${p.cmdline || p.name || "-"}\``
+          )
+          .join("\n")
+      : "- None recorded";
+
+  const ctx = snap.context && typeof snap.context === "object" ? snap.context : {};
+  const ctxLines =
+    Object.keys(ctx).length > 0
+      ? Object.entries(ctx)
+          .map(([k, v]) => `- **${formatContextKeyLabel(k)}**: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`)
+          .join("\n")
+      : "- None";
+
+  const markdown = [
+    `## ${formatSnapshotTitle(snap)}`,
+    `- **Snapshot ID**: \`${snap.id || "-"}\``,
+    `- **Timestamp**: ${tsStr}`,
+    `- **Severity**: ${String(snap.severity || "WARNING").toUpperCase()}`,
+    `- **Event Type**: ${String(snap.event_type || "system").toUpperCase()}`,
+    snap.metric_value ? `- **Trigger Metric**: ${snap.metric_value}` : null,
+    ``,
+    `### System Telemetry`,
+    `- **Load Average (1m, 5m, 15m)**: ${loadStr}`,
+    `- **CPU Utilization**: ${Number(metrics.cpu_percent ?? 0).toFixed(1)}%`,
+    `- **Memory**: ${Number(mem.percent ?? 0).toFixed(1)}% (${mem.total ? `${formatBytes(mem.used || 0)} / ${formatBytes(mem.total)}` : "N/A"})`,
+    `- **Swap**: ${Number(swap.percent ?? 0).toFixed(1)}% (${swap.total ? `${formatBytes(swap.used || 0)} / ${formatBytes(swap.total)}` : "N/A"})`,
+    ``,
+    `### Top Contributing Processes`,
+    procLines,
+    ``,
+    `### Contextual Diagnostics`,
+    ctxLines,
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(markdown);
+    } else if (typeof document !== "undefined" && typeof document.createElement === "function") {
+      const ta = document.createElement("textarea");
+      ta.value = markdown;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body?.appendChild(ta);
+      ta.select?.();
+      document.execCommand?.("copy");
+      ta.remove?.();
+    }
+    if (typeof showToast === "function") {
+      showToast({
+        title: "Post-Mortem Summary Copied",
+        message: "Markdown forensic report copied to clipboard.",
+        type: "success",
+      });
+    }
+  } catch (err) {
+    if (typeof showToast === "function") {
+      showToast({
+        title: "Clipboard Error",
+        message: err.message || "Could not copy summary to clipboard.",
+        type: "error",
+      });
+    }
+  }
 }
 
 async function fetchNotificationHistoryDrawer() {
@@ -3801,6 +4211,21 @@ function prependNotificationRow(entry) {
   const tdOutcome = document.createElement("td");
   const isSuccess = entry.success !== false;
   tdOutcome.innerHTML = `<span class="status-badge ${isSuccess ? "status-clean" : "status-failed"}"><span class="status-dot"></span> ${isSuccess ? "Delivered" : "Failed"}</span>`;
+  if (entry.snapshot_id) {
+    const snapshotBtn = document.createElement("button");
+    snapshotBtn.type = "button";
+    snapshotBtn.className = "btn-action btn-snapshot";
+    snapshotBtn.setAttribute("data-snapshot-id", String(entry.snapshot_id));
+    snapshotBtn.setAttribute("title", "Inspect Incident Snapshot");
+    snapshotBtn.textContent = "📸 Snapshot";
+    snapshotBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (typeof openForensicSnapshotDrawer === "function") {
+        openForensicSnapshotDrawer(String(entry.snapshot_id));
+      }
+    });
+    tdOutcome.appendChild(snapshotBtn);
+  }
 
   tr.appendChild(tdTime);
   tr.appendChild(tdTrigger);
@@ -18927,8 +19352,30 @@ function initDashboard() {
     .getElementById("notification-drawer-backdrop")
     ?.addEventListener("click", closeNotificationDrawer);
 
+  // Incident Forensics Snapshot Drawer Handlers
+  document
+    .getElementById("btn-close-snapshot-drawer")
+    ?.addEventListener("click", closeForensicSnapshotDrawer);
+
+  document
+    .getElementById("btn-dismiss-snapshot")
+    ?.addEventListener("click", closeForensicSnapshotDrawer);
+
+  document
+    .getElementById("forensic-snapshot-backdrop")
+    ?.addEventListener("click", closeForensicSnapshotDrawer);
+
+  document
+    .getElementById("btn-copy-snapshot-summary")
+    ?.addEventListener("click", copySnapshotSummaryToClipboard);
+
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
+      const snapshotDrawer = document.getElementById("drawer-forensic-snapshot");
+      if (snapshotDrawer && snapshotDrawer.classList.contains("open")) {
+        closeForensicSnapshotDrawer();
+        return;
+      }
       const drawer = document.getElementById("notification-drawer");
       if (drawer && drawer.classList.contains("open")) {
         closeNotificationDrawer();

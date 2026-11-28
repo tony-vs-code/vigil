@@ -865,16 +865,29 @@ def _get_formatted_history(limit: int = 20) -> list[dict[str, Any]]:
     except (OSError, sqlite3.Error):
         rows = []
 
+    meta_rows: list[tuple[int, str]] = []
+    if rows:
+        try:
+            meta_rows = main.get_notification_history_metadata(limit)
+        except Exception:
+            meta_rows = []
+
     result = []
-    for row in rows:
+    for idx, row in enumerate(rows):
         if len(row) >= 8:
             status, sent_at, weekly, channel, trigger, title, details, outcome = row[:8]
         else:
             status, sent_at, weekly = row[:3]
             channel, trigger, title, details, outcome = "all", status, "", "", "delivered"
 
+        notif_id: Optional[int] = None
+        snapshot_id = ""
+        if idx < len(meta_rows) and len(meta_rows) == len(rows):
+            notif_id, snapshot_id = meta_rows[idx]
+
         result.append(
             {
+                "id": notif_id,
                 "status": status,
                 "sent_at": float(sent_at),
                 "sent_at_formatted": main.format_timestamp(float(sent_at)),
@@ -889,6 +902,7 @@ def _get_formatted_history(limit: int = 20) -> list[dict[str, Any]]:
                 "title": title or "",
                 "details": details or "",
                 "outcome": outcome or "delivered",
+                "snapshot_id": snapshot_id,
             }
         )
     return result
@@ -1451,6 +1465,40 @@ async def api_send_test_notification(
     success, message = await main.send_test_notification(channel=channel)
     await _broadcast_module("notifications")
     return {"success": success, "message": message}
+
+
+@app.get("/api/notifications/snapshots")
+def api_list_forensic_snapshots(
+    limit: int = Query(default=50, ge=1, le=500),
+    event_type: Optional[str] = Query(default=None),
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    snapshots = main.list_forensic_snapshots(limit=limit, event_type=event_type)
+    return {"snapshots": snapshots}
+
+
+@app.get("/api/notifications/snapshots/{snapshot_id}")
+def api_get_forensic_snapshot(
+    snapshot_id: str,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    snapshot = main.get_forensic_snapshot(snapshot_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="Forensic snapshot not found")
+    return {"snapshot": snapshot}
+
+
+@app.get("/api/notifications/{notification_id}/snapshot")
+def api_get_notification_forensic_snapshot(
+    notification_id: int,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    snapshot = main.get_forensic_snapshot_by_notification_id(notification_id)
+    if not snapshot:
+        raise HTTPException(
+            status_code=404, detail="Forensic snapshot not found for notification"
+        )
+    return {"snapshot": snapshot}
 
 
 def _extract_ws_token(websocket: WebSocket) -> Optional[str]:

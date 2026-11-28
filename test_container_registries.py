@@ -1203,12 +1203,21 @@ class RegistryAuthenticatedPullTests(unittest.TestCase):
         self.assertTrue(res["authenticated"])
         self.assertEqual(res["registry_name"], "Company GHCR")
 
-        # Validate auth config content
+        # Validate multi-alias auth config content and credentials
         expected_auth = base64.b64encode(b"ci-bot:ghp_pull_secret_9999").decode("ascii")
-        self.assertEqual(
-            observed_config_json,
-            {"auths": {"ghcr.io": {"auth": expected_auth}}},
-        )
+        expected_entry = {
+            "auth": expected_auth,
+            "username": "ci-bot",
+            "password": "ghp_pull_secret_9999",
+        }
+        for key in (
+            "ghcr.io",
+            "https://ghcr.io",
+            "https://ghcr.io/v1/",
+            "https://ghcr.io/v2/",
+        ):
+            self.assertIn(key, observed_config_json["auths"])
+            self.assertEqual(observed_config_json["auths"][key], expected_entry)
 
         # Temp directory must be cleaned up after pull
         self.assertIsNotNone(observed_config_dir)
@@ -1321,6 +1330,201 @@ class RegistryAuthenticatedPullTests(unittest.TestCase):
                 cookies=self.auth_cookies,
             )
         self.assertEqual(resp_404.status_code, 404)
+
+    def test_bare_domain_matching_without_scheme(self):
+        self.assertTrue(main._registry_url_matches_host("ghcr.io", "ghcr.io"))
+        self.assertTrue(main._registry_url_matches_host("quay.io", "quay.io"))
+        self.assertTrue(
+            main._registry_url_matches_host("reg.local:5000", "reg.local:5000")
+        )
+        self.assertTrue(main._registry_url_matches_host("docker.io", "docker.io"))
+        self.assertEqual(
+            main._get_docker_config_server_address("ghcr.io"), "ghcr.io"
+        )
+        self.assertEqual(
+            main._get_docker_config_server_address("docker.io"),
+            "https://index.docker.io/v1/",
+        )
+
+        # Simulate legacy/bare URL persisted directly in container_registries without https://
+        conn = sqlite3.connect(str(self.db_path))
+        try:
+            now = 1700000000.0
+            conn.execute(
+                """
+                INSERT INTO container_registries (
+                    id, name, url, username, encrypted_token, is_default,
+                    status, last_tested_at, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, 'verified', 0, '', ?, ?)
+                """,
+                (
+                    "bare-ghcr-id",
+                    "Bare GHCR",
+                    "ghcr.io",
+                    "octocat",
+                    main.encrypt_secret("ghp_bare_1234"),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        resolved = main.resolve_registry_for_image("ghcr.io/octocat/hello:latest")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["id"], "bare-ghcr-id")
+        self.assertEqual(resolved["decrypted_token"], "ghp_bare_1234")
+        self.assertIn("ghcr.io", resolved["server_aliases"])
+        self.assertIn("https://ghcr.io", resolved["server_aliases"])
+
+    def test_empty_username_falls_back_to_oauth2_and_docker_hub_multi_aliases(self):
+        main.create_container_registry(
+            {
+                "name": "Token-Only GHCR",
+                "url": "https://ghcr.io",
+                "username": "",
+                "token": "ghp_only_token_7777",
+            }
+        )
+        observed_ghcr_cfg = None
+
+        def fake_ghcr_pull(args, timeout=300):
+            nonlocal observed_ghcr_cfg
+            observed_ghcr_cfg = json.loads(
+                (Path(args[1]) / "config.json").read_text(encoding="utf-8")
+            )
+            return "pulled"
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", side_effect=fake_ghcr_pull
+            ),
+        ):
+            res = main.docker_manager.pull_image("ghcr.io/org/private:v1")
+
+        self.assertTrue(res["authenticated"])
+        expected_oauth_auth = base64.b64encode(
+            b"oauth2:ghp_only_token_7777"
+        ).decode("ascii")
+        self.assertEqual(
+            observed_ghcr_cfg["auths"]["ghcr.io"],
+            {
+                "auth": expected_oauth_auth,
+                "username": "oauth2",
+                "password": "ghp_only_token_7777",
+            },
+        )
+        self.assertIn("https://ghcr.io/v2/", observed_ghcr_cfg["auths"])
+
+        # Docker Hub multi-aliases
+        main.create_container_registry(
+            {
+                "name": "Docker Hub",
+                "url": "https://docker.io",
+                "username": "dhuser",
+                "token": "dckr_pat_8888",
+            }
+        )
+        observed_dh_cfg = None
+
+        def fake_dh_pull(args, timeout=300):
+            nonlocal observed_dh_cfg
+            observed_dh_cfg = json.loads(
+                (Path(args[1]) / "config.json").read_text(encoding="utf-8")
+            )
+            return "pulled"
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(main.docker_manager, "_run_docker", side_effect=fake_dh_pull),
+        ):
+            main.docker_manager.pull_image("myorg/private-app:latest")
+
+        for dh_key in (
+            "https://index.docker.io/v1/",
+            "index.docker.io",
+            "docker.io",
+            "https://docker.io",
+        ):
+            self.assertIn(dh_key, observed_dh_cfg["auths"])
+            self.assertEqual(observed_dh_cfg["auths"][dh_key]["username"], "dhuser")
+            self.assertEqual(
+                observed_dh_cfg["auths"][dh_key]["password"], "dckr_pat_8888"
+            )
+
+    def test_stack_deploy_and_update_check_use_registry_auth(self):
+        main.create_container_registry(
+            {
+                "name": "Private GHCR",
+                "url": "https://ghcr.io",
+                "username": "",
+                "token": "ghp_stack_token_1122",
+            }
+        )
+
+        # 1. Check updates passes --config <temp_dir> for ghcr.io image
+        observed_inspect_cfg = None
+
+        def fake_inspect_docker(args, timeout=30):
+            nonlocal observed_inspect_cfg
+            if args[0] == "--config":
+                observed_inspect_cfg = json.loads(
+                    (Path(args[1]) / "config.json").read_text(encoding="utf-8")
+                )
+                return json.dumps({"config": {"digest": "sha256:abc123"}})
+            return json.dumps([{"Id": "sha256:abc123", "RepoDigests": []}])
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager,
+                "list_containers",
+                return_value=[
+                    {"id": "c1", "name": "priv", "image": "ghcr.io/org/priv:latest", "stack": ""}
+                ],
+            ),
+            patch.object(
+                main.docker_manager, "_run_docker", side_effect=fake_inspect_docker
+            ),
+        ):
+            upd = main.docker_manager.check_updates(force=True)
+
+        self.assertEqual(len(upd["updates"]), 1)
+        self.assertIsNotNone(observed_inspect_cfg)
+        self.assertEqual(
+            observed_inspect_cfg["auths"]["ghcr.io"]["username"], "oauth2"
+        )
+
+        # 2. Stack deploy and pull pass DOCKER_CONFIG in env
+        observed_envs = []
+
+        def fake_run_compose(args, timeout=60, cwd=None, env=None):
+            if env and "DOCKER_CONFIG" in env:
+                cfg_file = Path(env["DOCKER_CONFIG"]) / "config.json"
+                observed_envs.append(json.loads(cfg_file.read_text(encoding="utf-8")))
+            return "ok"
+
+        stacks_dir = Path(self.temp_dir.name) / "stacks"
+        with (
+            patch.object(main.docker_manager, "stacks_dir", stacks_dir),
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_compose", side_effect=fake_run_compose
+            ),
+        ):
+            main.docker_manager.save_stack(
+                "privstack",
+                "services:\n  app:\n    image: ghcr.io/org/priv:latest\n",
+                deploy=True,
+            )
+            main.docker_manager.execute_stack_action("privstack", "pull")
+
+        self.assertEqual(len(observed_envs), 2)
+        for cfg in observed_envs:
+            self.assertIn("ghcr.io", cfg["auths"])
+            self.assertEqual(cfg["auths"]["ghcr.io"]["password"], "ghp_stack_token_1122")
 
     def test_image_pull_registry_dropdown_and_payload_dispatch_in_node_vm(self):
         node_script = r"""
