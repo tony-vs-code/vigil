@@ -20,6 +20,7 @@ import ssl
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import importlib.metadata
@@ -7029,15 +7030,93 @@ class DockerManager:
             logging.warning(f"Failed to list images: {exc}")
             return []
 
-    def pull_image(self, image_tag: str) -> dict[str, Any]:
+    def pull_image(
+        self, image_tag: str, registry_id: Optional[str] = None
+    ) -> dict[str, Any]:
         clean_tag = image_tag.strip()
         if not clean_tag:
             raise ValueError("Image tag cannot be empty.")
         if not self.is_running():
             raise RuntimeError("Docker daemon is not running.")
+
+        matched_registry: Optional[dict[str, Any]] = None
+        if registry_id:
+            reg = get_container_registry(registry_id, include_decrypted_token=True)
+            if not reg:
+                raise KeyError(f"Container registry '{registry_id}' not found.")
+            decrypted_token = reg.get("token", "")
+            if reg.get("username") or decrypted_token:
+                matched_registry = {
+                    **reg,
+                    "decrypted_token": decrypted_token,
+                    "server_address": _get_docker_config_server_address(reg["url"]),
+                }
+        else:
+            matched_registry = resolve_registry_for_image(clean_tag)
+
+        if matched_registry:
+            username = matched_registry.get("username") or ""
+            token = (
+                matched_registry.get("decrypted_token")
+                or matched_registry.get("token")
+                or ""
+            )
+            server_address = matched_registry.get(
+                "server_address"
+            ) or _get_docker_config_server_address(matched_registry["url"])
+            registry_name = matched_registry.get("name")
+
+            temp_dir = tempfile.mkdtemp(prefix="vigil-docker-auth-")
+            try:
+                os.chmod(temp_dir, 0o700)
+                auth_value = base64.b64encode(
+                    f"{username}:{token}".encode("utf-8")
+                ).decode("ascii")
+                config_payload = {
+                    "auths": {
+                        server_address: {
+                            "auth": auth_value,
+                        }
+                    }
+                }
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+                os.chmod(config_path, 0o600)
+                out = self._run_docker(
+                    ["--config", temp_dir, "pull", clean_tag], timeout=300
+                )
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            self.invalidate_cache()
+            record_audit_event(
+                "docker.image.pull",
+                f"Pulled Docker image '{clean_tag}' using registry '{registry_name}'",
+                severity="info",
+                metadata={
+                    "image": clean_tag,
+                    "registry_id": matched_registry.get("id"),
+                    "registry_name": registry_name,
+                    "authenticated": True,
+                },
+            )
+            return {
+                "success": True,
+                "image": clean_tag,
+                "output": out,
+                "authenticated": True,
+                "registry_name": registry_name,
+            }
+
         out = self._run_docker(["pull", clean_tag], timeout=300)
         self.invalidate_cache()
-        return {"success": True, "image": clean_tag, "output": out}
+        return {
+            "success": True,
+            "image": clean_tag,
+            "output": out,
+            "authenticated": False,
+            "registry_name": None,
+        }
 
     def remove_image(self, image_id: str, force: bool = False) -> dict[str, Any]:
         clean_id = image_id.strip()
@@ -8538,6 +8617,101 @@ async def test_container_registry_connection(
         "message": message,
         "status_code": status_code,
     }
+
+
+_DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
+
+
+def extract_registry_host_from_image(image_tag: str) -> str:
+    """Extract registry hostname[:port] from a Docker image reference; defaults to docker.io."""
+    ref = str(image_tag or "").strip().split("@", 1)[0]
+    if not ref:
+        return ""
+    parts = ref.split("/")
+    if len(parts) >= 2:
+        first = parts[0]
+        if first == "localhost" or "." in first or ":" in first:
+            return first.lower()
+    return "docker.io"
+
+
+def _registry_url_matches_host(registry_url: str, image_host: str) -> bool:
+    parsed = urlparse(registry_url)
+    reg_netloc = (parsed.netloc or "").lower()
+    reg_hostname = (parsed.hostname or "").lower()
+    host_lower = (image_host or "").lower()
+    if not host_lower or not reg_netloc:
+        return False
+    if host_lower in _DOCKER_HUB_HOSTS:
+        return reg_hostname in _DOCKER_HUB_HOSTS
+    if reg_netloc == host_lower:
+        return True
+    if ":" not in host_lower and reg_hostname == host_lower:
+        return parsed.port in (None, 443, 80)
+    return False
+
+
+def _get_docker_config_server_address(registry_url: str) -> str:
+    parsed = urlparse(registry_url)
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _DOCKER_HUB_HOSTS:
+        return "https://index.docker.io/v1/"
+    return parsed.netloc or registry_url
+
+
+def resolve_registry_for_image(image_tag: str) -> Optional[dict[str, Any]]:
+    """Resolve matching (or default) container registry credentials for a Docker image tag."""
+    image_host = extract_registry_host_from_image(image_tag)
+    if not image_host:
+        return None
+
+    try:
+        conn = _connect_state_db()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, name, url, username, encrypted_token, is_default,
+                       status, last_tested_at, last_error, created_at, updated_at
+                FROM container_registries
+                ORDER BY is_default DESC, created_at ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error) as exc:
+        logging.warning(f"Could not query container_registries: {exc}")
+        return None
+
+    if not rows:
+        return None
+
+    matched_row: Optional[sqlite3.Row] = None
+    for row in rows:
+        if _registry_url_matches_host(row["url"], image_host):
+            matched_row = row
+            break
+
+    if matched_row is None:
+        for row in rows:
+            if row["is_default"]:
+                matched_row = row
+                break
+
+    if matched_row is None:
+        return None
+
+    encrypted_token = matched_row["encrypted_token"] or ""
+    decrypted_token = decrypt_secret(encrypted_token) if encrypted_token else ""
+    username = matched_registry_user = matched_row["username"] or ""
+    if not matched_registry_user and not decrypted_token:
+        return None
+
+    result = _format_registry_row(matched_row, include_decrypted_token=True)
+    result["decrypted_token"] = decrypted_token
+    result["username"] = username
+    result["server_address"] = _get_docker_config_server_address(matched_row["url"])
+    return result
 
 # ============================================================================
 # System Services & Process Monitoring Helpers

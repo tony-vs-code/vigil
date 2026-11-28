@@ -641,6 +641,7 @@ class ContainerActionRequest(BaseModel):
 class ImagePullRequest(BaseModel):
     image: Optional[str] = None
     image_tag: Optional[str] = None
+    registry_id: Optional[str] = None
 
 
 class ImagePruneRequest(BaseModel):
@@ -2309,8 +2310,15 @@ async def api_docker_pull_image(
     image_name = (payload.image or payload.image_tag or "").strip()
     if not image_name:
         raise HTTPException(status_code=400, detail="Image tag is required")
+    registry_id = (payload.registry_id or "").strip() or None
     try:
-        return await asyncio.to_thread(main.docker_manager.pull_image, image_name)
+        return await asyncio.to_thread(
+            main.docker_manager.pull_image,
+            image_name,
+            registry_id=registry_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

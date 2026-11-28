@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import collections
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -776,6 +778,12 @@ class ContainerRegistryFrontendContractsTests(unittest.TestCase):
             "btn-test-registry-form",
             "btn-cancel-registry",
             "btn-save-registry",
+            "docker-image-pull-input",
+            "docker-image-pull-registry",
+            "btn-pull-image",
+            "docker-image-feedback",
+            "docker-images-table",
+            "docker-images-tbody",
         ]
         for dom_id in required_dom_ids:
             self.assertIn(
@@ -783,6 +791,9 @@ class ContainerRegistryFrontendContractsTests(unittest.TestCase):
                 html,
                 f"Missing required DOM element id='{dom_id}' in static/index.html",
             )
+
+        self.assertIn("<th>Registry</th>", html)
+        self.assertIn('<td colspan="7" class="empty-state">No images found.</td>', html)
 
         required_css_selectors = [
             ".status-badge.status-verified",
@@ -792,12 +803,21 @@ class ContainerRegistryFrontendContractsTests(unittest.TestCase):
             ".registry-default-pill",
             ".registry-token-mask",
             ".btn-preset-chip",
+            ".pull-registry-select",
+            ".pull-auth-badge",
+            ".registry-pill",
+            ".registry-pill.authenticated",
         ]
         for sel in required_css_selectors:
             self.assertIn(sel, css, f"Missing CSS selector {sel} in static/styles.css")
 
         for fn_sig in [
             "function updateRegistriesSubtabBadge(",
+            "function populateImagePullRegistrySelect(",
+            "function extractImageRegistryHost(",
+            "function registryMatchesImageHost(",
+            "function resolveImageRegistryBadgeHtml(",
+            "function renderDockerImages(",
             "function renderContainerRegistries(",
             "async function fetchContainerRegistries(",
             "function openRegistryModal(",
@@ -807,6 +827,7 @@ class ContainerRegistryFrontendContractsTests(unittest.TestCase):
             "async function handleSaveRegistry(",
             "async function handleTestRegistryRow(",
             "async function handleDeleteRegistry(",
+            "async function handlePullImage(",
         ]:
             self.assertIn(fn_sig, js, f"Missing JS function '{fn_sig}' in static/app.js")
 
@@ -1039,6 +1060,536 @@ if (getEl('registry-form-token').placeholder !== '••••••••') thr
         proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, f"Node VM test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
         self.assertIn("NODE_VM_PASS", proc.stdout)
+
+
+class RegistryAuthenticatedPullTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_pull_registries.sqlite3"
+        self.db_patcher = patch.object(main, "RAID_STATE_DB", self.db_path)
+        self.db_patcher.start()
+        main.create_user("admin", "adminpass", email="admin@example.com")
+        self.session_token = main.create_session("admin")
+        self.auth_cookies = {"session_token": self.session_token}
+
+    def tearDown(self):
+        self.db_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def test_extract_registry_host_from_image(self):
+        self.assertEqual(
+            main.extract_registry_host_from_image("ghcr.io/user/repo:tag"), "ghcr.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("quay.io/org/app"), "quay.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("reg.local:5000/app:v1"),
+            "reg.local:5000",
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("localhost:5000/myimg"),
+            "localhost:5000",
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("redis:latest"), "docker.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("library/nginx"), "docker.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("myorg/myrepo:1.0"), "docker.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image("docker.io/user/repo:v2"), "docker.io"
+        )
+        self.assertEqual(
+            main.extract_registry_host_from_image(
+                "ghcr.io/org/app@sha256:abcdef123456"
+            ),
+            "ghcr.io",
+        )
+
+    def test_resolve_registry_for_image_matching_default_and_no_match(self):
+        # No registries configured yet
+        self.assertIsNone(main.resolve_registry_for_image("ghcr.io/org/app:v1"))
+
+        ghcr = main.create_container_registry(
+            {
+                "name": "GHCR",
+                "url": "https://ghcr.io",
+                "username": "octocat",
+                "token": "ghp_secret_1234",
+                "is_default": False,
+            }
+        )
+        dhub = main.create_container_registry(
+            {
+                "name": "Docker Hub",
+                "url": "https://index.docker.io/v1/",
+                "username": "dhuser",
+                "token": "dckr_pat_5678",
+                "is_default": True,
+            }
+        )
+        # Exact match for ghcr.io
+        resolved_ghcr = main.resolve_registry_for_image("ghcr.io/octocat/app:latest")
+        self.assertIsNotNone(resolved_ghcr)
+        self.assertEqual(resolved_ghcr["id"], ghcr["id"])
+        self.assertEqual(resolved_ghcr["username"], "octocat")
+        self.assertEqual(resolved_ghcr["decrypted_token"], "ghp_secret_1234")
+        self.assertEqual(resolved_ghcr["server_address"], "ghcr.io")
+
+        # Docker Hub match for bare image tag
+        resolved_hub = main.resolve_registry_for_image("redis:alpine")
+        self.assertIsNotNone(resolved_hub)
+        self.assertEqual(resolved_hub["id"], dhub["id"])
+        self.assertEqual(resolved_hub["decrypted_token"], "dckr_pat_5678")
+        self.assertEqual(resolved_hub["server_address"], "https://index.docker.io/v1/")
+
+        # Unmatched host falls back to is_default=1
+        resolved_fallback = main.resolve_registry_for_image("quay.io/org/app:v1")
+        self.assertIsNotNone(resolved_fallback)
+        self.assertEqual(resolved_fallback["id"], dhub["id"])
+
+        # Remove default flag and check non-matching host returns None
+        main.update_container_registry(dhub["id"], {"is_default": False})
+        self.assertIsNone(main.resolve_registry_for_image("quay.io/org/app:v1"))
+
+        # Registry without credentials returns None
+        main.create_container_registry(
+            {
+                "name": "Public Quay",
+                "url": "https://quay.io",
+            }
+        )
+        self.assertIsNone(main.resolve_registry_for_image("quay.io/org/app:v1"))
+
+    def test_pull_image_authenticated_config_json_cleanup_and_audit(self):
+        ghcr = main.create_container_registry(
+            {
+                "name": "Company GHCR",
+                "url": "https://ghcr.io",
+                "username": "ci-bot",
+                "token": "ghp_pull_secret_9999",
+            }
+        )
+
+        observed_config_dir = None
+        observed_config_json = None
+
+        def fake_run_docker(args, timeout=300):
+            nonlocal observed_config_dir, observed_config_json
+            self.assertEqual(args[0], "--config")
+            observed_config_dir = Path(args[1])
+            self.assertEqual(os.stat(observed_config_dir).st_mode & 0o777, 0o700)
+            self.assertEqual(args[2:], ["pull", "ghcr.io/myorg/app:v2"])
+            cfg_file = observed_config_dir / "config.json"
+            self.assertTrue(cfg_file.exists())
+            self.assertEqual(os.stat(cfg_file).st_mode & 0o777, 0o600)
+            observed_config_json = json.loads(cfg_file.read_text(encoding="utf-8"))
+            return "Status: Downloaded newer image for ghcr.io/myorg/app:v2"
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", side_effect=fake_run_docker
+            ),
+        ):
+            res = main.docker_manager.pull_image("ghcr.io/myorg/app:v2")
+
+        self.assertTrue(res["success"])
+        self.assertEqual(res["image"], "ghcr.io/myorg/app:v2")
+        self.assertTrue(res["authenticated"])
+        self.assertEqual(res["registry_name"], "Company GHCR")
+
+        # Validate auth config content
+        expected_auth = base64.b64encode(b"ci-bot:ghp_pull_secret_9999").decode("ascii")
+        self.assertEqual(
+            observed_config_json,
+            {"auths": {"ghcr.io": {"auth": expected_auth}}},
+        )
+
+        # Temp directory must be cleaned up after pull
+        self.assertIsNotNone(observed_config_dir)
+        self.assertFalse(observed_config_dir.exists())
+
+        # Audit log recorded without leaking token
+        logs, _ = main.get_audit_logs(limit=20, event_type="docker.image.pull")
+        self.assertEqual(len(logs), 1)
+        self.assertIn("Company GHCR", logs[0]["description"])
+        self.assertNotIn("ghp_pull_secret_9999", json.dumps(logs))
+
+        # Test temp directory cleanup even when _run_docker raises an exception
+        failing_dir = None
+
+        def failing_run_docker(args, timeout=300):
+            nonlocal failing_dir
+            failing_dir = Path(args[1])
+            self.assertTrue((failing_dir / "config.json").exists())
+            raise RuntimeError("pull failed: unauthorized")
+
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", side_effect=failing_run_docker
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                main.docker_manager.pull_image(
+                    "custom.reg/app:v1", registry_id=ghcr["id"]
+                )
+
+        self.assertIsNotNone(failing_dir)
+        self.assertFalse(failing_dir.exists())
+
+    def test_pull_image_unauthenticated_fallback(self):
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", return_value="Pulled alpine"
+            ) as mock_run,
+        ):
+            res = main.docker_manager.pull_image("alpine:latest")
+
+        mock_run.assert_called_once_with(["pull", "alpine:latest"], timeout=300)
+        self.assertTrue(res["success"])
+        self.assertFalse(res["authenticated"])
+        self.assertIsNone(res["registry_name"])
+
+    def test_api_docker_images_pull_with_and_without_registry_id(self):
+        reg = main.create_container_registry(
+            {
+                "name": "Private Harbor",
+                "url": "https://harbor.internal:8443",
+                "username": "robot",
+                "token": "harbor_secret_0001",
+            }
+        )
+
+        # 1. Explicit registry_id passed to POST /api/docker/images/pull
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", return_value="Pulled"
+            ) as mock_run,
+        ):
+            resp = asgi_post(
+                api.app,
+                "/api/docker/images/pull",
+                json_body={
+                    "image": "harbor.internal:8443/team/svc:1.2",
+                    "registry_id": reg["id"],
+                },
+                cookies=self.auth_cookies,
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertTrue(body["authenticated"])
+        self.assertEqual(body["registry_name"], "Private Harbor")
+        called_args = mock_run.call_args.args[0]
+        self.assertEqual(called_args[0], "--config")
+        self.assertEqual(called_args[2:], ["pull", "harbor.internal:8443/team/svc:1.2"])
+
+        # 2. Without registry_id (unauthenticated fallback for unmatched image)
+        with (
+            patch.object(main.docker_manager, "is_running", return_value=True),
+            patch.object(
+                main.docker_manager, "_run_docker", return_value="Pulled"
+            ) as mock_run_unauth,
+        ):
+            resp_unauth = asgi_post(
+                api.app,
+                "/api/docker/images/pull",
+                json_body={"image": "busybox:latest"},
+                cookies=self.auth_cookies,
+            )
+
+        self.assertEqual(resp_unauth.status_code, 200)
+        self.assertFalse(resp_unauth.json()["authenticated"])
+        self.assertIsNone(resp_unauth.json()["registry_name"])
+        mock_run_unauth.assert_called_once_with(["pull", "busybox:latest"], timeout=300)
+
+        # 3. Unknown registry_id -> 404
+        with patch.object(main.docker_manager, "is_running", return_value=True):
+            resp_404 = asgi_post(
+                api.app,
+                "/api/docker/images/pull",
+                json_body={"image": "busybox:latest", "registry_id": "nonexistent-id"},
+                cookies=self.auth_cookies,
+            )
+        self.assertEqual(resp_404.status_code, 404)
+
+    def test_image_pull_registry_dropdown_and_payload_dispatch_in_node_vm(self):
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) idx = source.indexOf('function ' + name + '(');
+  if (idx === -1) throw new Error('Function not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') {
+      depth--;
+      if (started && depth === 0) return source.slice(idx, i + 1);
+    }
+    i++;
+  }
+  throw new Error('Unbalanced braces in ' + name);
+}
+
+function makeClassList(initial = []) {
+  const set = new Set(initial);
+  return {
+    add: (...cls) => cls.forEach((c) => set.add(c)),
+    remove: (...cls) => cls.forEach((c) => set.delete(c)),
+    contains: (c) => set.has(c),
+  };
+}
+
+const elements = {};
+function getEl(id) {
+  if (!elements[id]) {
+    elements[id] = {
+      id,
+      value: '',
+      textContent: '',
+      innerHTML: '',
+      disabled: false,
+      className: '',
+      classList: makeClassList(['hidden']),
+    };
+  }
+  return elements[id];
+}
+
+const pullRequests = [];
+const toasts = [];
+let fetchDockerImagesCount = 0;
+let fetchDockerStatusCount = 0;
+let nextApiResponse = null;
+
+const context = vm.createContext({
+  console,
+  Array,
+  String,
+  Boolean,
+  JSON,
+  document: { getElementById: getEl },
+  containerRegistries: [],
+  escapeHtml: (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+  showToast: (t) => toasts.push(t),
+  fetchDockerImages: () => { fetchDockerImagesCount++; },
+  fetchDockerStatus: () => { fetchDockerStatusCount++; },
+  alert: (msg) => { throw new Error('Unexpected alert: ' + msg); },
+  apiFetch: async (url, opts) => {
+    pullRequests.push({ url, opts, body: JSON.parse(opts.body) });
+    return nextApiResponse;
+  },
+});
+
+vm.runInContext(extractFunc(code, 'populateImagePullRegistrySelect'), context);
+vm.runInContext(extractFunc(code, 'handlePullImage'), context);
+
+const selectEl = getEl('docker-image-pull-registry');
+const inputEl = getEl('docker-image-pull-input');
+const btnEl = getEl('btn-pull-image');
+const feedbackEl = getEl('docker-image-feedback');
+
+// 1. Populate dropdown: only token_configured registries appear, default gets suffix
+context.containerRegistries = [
+  { id: 'reg-ghcr', name: 'Company GHCR', url: 'https://ghcr.io', token_configured: true, is_default: true },
+  { id: 'reg-anon', name: 'Public Quay', url: 'https://quay.io', token_configured: false, is_default: false },
+  { id: 'reg-harbor', name: 'Harbor <Prod>', url: 'https://harbor.local', token_configured: true, is_default: false },
+];
+context.populateImagePullRegistrySelect();
+if (!selectEl.innerHTML.includes('value=""')) throw new Error('Missing Auto option');
+if (!selectEl.innerHTML.includes('value="reg-ghcr"') || !selectEl.innerHTML.includes('(Default)')) {
+  throw new Error('Missing GHCR default option: ' + selectEl.innerHTML);
+}
+if (selectEl.innerHTML.includes('reg-anon')) throw new Error('Tokenless registry should not appear in dropdown');
+if (!selectEl.innerHTML.includes('Harbor &lt;Prod&gt;')) throw new Error('Registry name must be HTML-escaped');
+
+// Preserve selected registry across re-population
+selectEl.value = 'reg-harbor';
+context.populateImagePullRegistrySelect();
+if (selectEl.value !== 'reg-harbor') throw new Error('Selected registry was not preserved');
+
+// Reset selection to Auto if previously selected registry is removed
+context.containerRegistries = [
+  { id: 'reg-ghcr', name: 'Company GHCR', url: 'https://ghcr.io', token_configured: true, is_default: true },
+];
+context.populateImagePullRegistrySelect();
+if (selectEl.value !== '') throw new Error('Removed registry selection should reset to empty string');
+
+(async () => {
+  // 2. Pull with explicit registry selected -> sends registry_id and renders Authenticated badge
+  selectEl.value = 'reg-ghcr';
+  inputEl.value = 'ghcr.io/org/app:v1';
+  nextApiResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      success: true,
+      image: 'ghcr.io/org/app:v1',
+      authenticated: true,
+      registry_name: 'Company GHCR',
+    }),
+  };
+  await context.handlePullImage();
+  if (pullRequests.length !== 1) throw new Error('Expected 1 pull request');
+  if (pullRequests[0].url !== '/api/docker/images/pull') throw new Error('Wrong pull endpoint');
+  if (pullRequests[0].body.image !== 'ghcr.io/org/app:v1' || pullRequests[0].body.registry_id !== 'reg-ghcr') {
+    throw new Error('Unexpected explicit registry pull payload: ' + JSON.stringify(pullRequests[0].body));
+  }
+  if (!feedbackEl.innerHTML.includes('pull-auth-badge') || !feedbackEl.innerHTML.includes('Company GHCR')) {
+    throw new Error('Missing authenticated badge or registry attribution: ' + feedbackEl.innerHTML);
+  }
+  if (inputEl.value !== '') throw new Error('Input should clear after successful pull');
+  if (btnEl.disabled !== false || btnEl.textContent !== 'Pull Image') throw new Error('Button not restored');
+  if (toasts[0].title !== 'Authenticated Image Pull') throw new Error('Expected Authenticated Image Pull toast');
+
+  // 3. Pull with Auto ("") -> omits registry_id and supports unauthenticated fallback
+  selectEl.value = '';
+  inputEl.value = 'alpine:latest';
+  nextApiResponse = {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      success: true,
+      image: 'alpine:latest',
+      authenticated: false,
+      registry_name: null,
+    }),
+  };
+  await context.handlePullImage();
+  if ('registry_id' in pullRequests[1].body) {
+    throw new Error('Auto mode should omit registry_id, got: ' + JSON.stringify(pullRequests[1].body));
+  }
+  if (!feedbackEl.textContent.includes("Successfully pulled image 'alpine:latest'")) {
+    throw new Error('Missing plain success feedback: ' + feedbackEl.textContent);
+  }
+
+  // 4. Error response -> feedback-error and button re-enabled
+  inputEl.value = 'ghcr.io/org/private:latest';
+  selectEl.value = 'reg-ghcr';
+  nextApiResponse = {
+    ok: false,
+    status: 500,
+    json: async () => ({ detail: 'pull access denied' }),
+  };
+  await context.handlePullImage();
+  if (!feedbackEl.className.includes('feedback-error') || feedbackEl.textContent !== 'pull access denied') {
+    throw new Error('Expected error detail in feedback: ' + feedbackEl.textContent);
+  }
+  if (btnEl.disabled !== false) throw new Error('Button should re-enable after error');
+  if (fetchDockerImagesCount !== 2 || fetchDockerStatusCount !== 2) {
+    throw new Error('Expected 2 image/status refreshes for 2 successful pulls');
+  }
+  console.log('PULL_VM_PASS');
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+        proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Node VM pull test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
+        self.assertIn("PULL_VM_PASS", proc.stdout)
+
+    def test_images_table_registry_column_and_badges_in_node_vm(self):
+        node_script = r"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync('static/app.js', 'utf8');
+
+function extractFunc(source, name) {
+  let idx = source.indexOf('async function ' + name + '(');
+  if (idx === -1) idx = source.indexOf('function ' + name + '(');
+  if (idx === -1) throw new Error('Function not found: ' + name);
+  let depth = 0, started = false, i = idx;
+  while (i < source.length) {
+    if (source[i] === '{') { depth++; started = true; }
+    else if (source[i] === '}') {
+      depth--;
+      if (started && depth === 0) return source.slice(idx, i + 1);
+    }
+    i++;
+  }
+  throw new Error('Unbalanced braces in ' + name);
+}
+
+const tbodyEl = {
+  innerHTML: '',
+  querySelectorAll: () => [],
+};
+
+const context = vm.createContext({
+  console,
+  Set,
+  Array,
+  String,
+  Boolean,
+  URL,
+  document: {
+    getElementById: (id) => (id === 'docker-images-tbody' ? tbodyEl : null),
+  },
+  containerRegistries: [
+    { id: 'reg-ghcr', name: 'Company GHCR', url: 'https://ghcr.io', token_configured: true, is_default: false },
+    { id: 'reg-quay', name: 'Public Quay', url: 'https://quay.io', token_configured: false, is_default: false },
+  ],
+  escapeHtml: (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'),
+  handleRemoveImage: () => {},
+});
+
+vm.runInContext(
+  'const DOCKER_HUB_HOSTS = new Set(["docker.io", "registry-1.docker.io", "index.docker.io", "registry.hub.docker.com"]);',
+  context
+);
+for (const fnName of [
+  'extractImageRegistryHost',
+  'registryMatchesImageHost',
+  'resolveImageRegistryBadgeHtml',
+  'renderDockerImages',
+]) {
+  vm.runInContext(extractFunc(code, fnName), context);
+}
+
+// 1. Empty state renders colspan="7"
+context.renderDockerImages([]);
+if (!tbodyEl.innerHTML.includes('colspan="7"')) {
+  throw new Error('Empty images state must have colspan="7", got: ' + tbodyEl.innerHTML);
+}
+
+// 2. Populated images render 7 cells & resolved .registry-pill badges
+context.renderDockerImages([
+  { id: 'sha256:1111', repository: 'ghcr.io/org/webapp', tag: 'v1.0', size: '120MB', created: '2h ago' },
+  { id: 'sha256:2222', repository: 'quay.io/coreos/etcd', tag: 'v3.5', size: '90MB', created: '1d ago' },
+  { id: 'sha256:3333', repository: 'nginx', tag: 'alpine', size: '40MB', created: '3d ago' },
+  { id: 'sha256:4444', repository: '<none>', tag: '<none>', size: '10MB', created: '4d ago' },
+]);
+
+const html = tbodyEl.innerHTML;
+if (!html.includes('class="registry-pill authenticated"') || !html.includes('Company GHCR')) {
+  throw new Error('Missing authenticated GHCR registry pill in: ' + html);
+}
+if (!html.includes('class="registry-pill" title="https://quay.io">Public Quay</span>')) {
+  throw new Error('Missing unauthenticated Quay registry pill in: ' + html);
+}
+if (!html.includes('class="registry-pill" title="docker.io">Docker Hub</span>')) {
+  throw new Error('Missing Docker Hub fallback pill in: ' + html);
+}
+if (!html.includes('<span class="registry-pill">Local</span>')) {
+  throw new Error('Missing Local pill for <none> repository in: ' + html);
+}
+
+console.log('IMAGES_COL_VM_PASS');
+"""
+        proc = subprocess.run(["node", "-e", node_script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, f"Node VM images column test failed:\nSTDOUT: {proc.stdout}\nSTDERR: {proc.stderr}")
+        self.assertIn("IMAGES_COL_VM_PASS", proc.stdout)
 
 
 if __name__ == "__main__":
