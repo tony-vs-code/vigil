@@ -3,6 +3,7 @@ import asyncio
 import base64
 import binascii
 import concurrent.futures
+import contextlib
 import copy
 import fnmatch
 import glob
@@ -498,6 +499,7 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
         ("title", "TEXT DEFAULT ''"),
         ("details", "TEXT DEFAULT ''"),
         ("outcome", "TEXT DEFAULT 'delivered'"),
+        ("snapshot_id", "TEXT DEFAULT ''"),
     ]
     for col_name, col_def in new_cols:
         if col_name not in cols:
@@ -670,6 +672,26 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
         "created_at REAL NOT NULL, "
         "updated_at REAL NOT NULL)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS alert_forensic_snapshots ("
+        "id TEXT PRIMARY KEY, "
+        "notification_id INTEGER, "
+        "event_type TEXT NOT NULL, "
+        "severity TEXT NOT NULL, "
+        "metric_value TEXT NOT NULL, "
+        "system_metrics_json TEXT NOT NULL, "
+        "top_processes_json TEXT NOT NULL, "
+        "context_json TEXT NOT NULL, "
+        "created_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_created "
+        "ON alert_forensic_snapshots(created_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_snapshots_event "
+        "ON alert_forensic_snapshots(event_type, created_at)"
+    )
     connection.commit()
     return connection
 
@@ -697,6 +719,7 @@ def init_db(
             ("title", "TEXT DEFAULT ''"),
             ("details", "TEXT DEFAULT ''"),
             ("outcome", "TEXT DEFAULT 'delivered'"),
+            ("snapshot_id", "TEXT DEFAULT ''"),
         ]
         for col_name, col_def in new_cols:
             if col_name not in cols:
@@ -716,6 +739,26 @@ def init_db(
             "last_error TEXT DEFAULT '', "
             "created_at REAL NOT NULL, "
             "updated_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS alert_forensic_snapshots ("
+            "id TEXT PRIMARY KEY, "
+            "notification_id INTEGER, "
+            "event_type TEXT NOT NULL, "
+            "severity TEXT NOT NULL, "
+            "metric_value TEXT NOT NULL, "
+            "system_metrics_json TEXT NOT NULL, "
+            "top_processes_json TEXT NOT NULL, "
+            "context_json TEXT NOT NULL, "
+            "created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_created "
+            "ON alert_forensic_snapshots(created_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_event "
+            "ON alert_forensic_snapshots(event_type, created_at)"
         )
         conn.commit()
 
@@ -1732,6 +1775,7 @@ def record_notification(
     title: str = "",
     details: str = "",
     outcome: str = "delivered",
+    snapshot_id: Optional[str] = None,
 ) -> None:
     if not trigger:
         if status == "scheduled_report":
@@ -1763,6 +1807,9 @@ def record_notification(
         title = title or status.title()
         details = details or status
 
+    clean_snapshot_id = str(snapshot_id or "").strip()
+    notif_row_id: Optional[int] = None
+
     connection = _connect_state_db()
     try:
         if weekly:
@@ -1779,16 +1826,33 @@ def record_notification(
                 "(name, sent_at, due_at, status) VALUES (?, ?, ?, ?)",
                 ("periodic_report", timestamp, computed_due, status),
             )
-        connection.execute(
-            "INSERT INTO notification_history (status, sent_at, weekly, channel, trigger, title, details, outcome) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (status, timestamp, int(weekly), channel, trigger, title, details, outcome),
+        cur = connection.execute(
+            "INSERT INTO notification_history (status, sent_at, weekly, channel, trigger, title, details, outcome, snapshot_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                status,
+                timestamp,
+                int(weekly),
+                channel,
+                trigger,
+                title,
+                details,
+                outcome,
+                clean_snapshot_id,
+            ),
         )
+        notif_row_id = cur.lastrowid
+        if clean_snapshot_id and notif_row_id is not None:
+            connection.execute(
+                "UPDATE alert_forensic_snapshots SET notification_id = ? WHERE id = ?",
+                (int(notif_row_id), clean_snapshot_id),
+            )
         connection.commit()
     finally:
         connection.close()
 
     notification_event = {
+        "id": notif_row_id,
         "status": status,
         "sent_at": float(timestamp),
         "sent_at_formatted": format_timestamp(float(timestamp)),
@@ -1803,6 +1867,7 @@ def record_notification(
         "title": title or "",
         "details": details or "",
         "outcome": outcome or "delivered",
+        "snapshot_id": clean_snapshot_id,
     }
     for subscriber in list(_notification_subscribers):
         try:
@@ -1828,6 +1893,423 @@ def get_notification_history(limit: int, detailed: bool = False) -> list:
         ).fetchall()
     finally:
         connection.close()
+
+
+def get_notification_history_metadata(limit: int) -> list[tuple[int, str]]:
+    """Return (id, snapshot_id) tuples aligned with get_notification_history ordering."""
+    connection = _connect_state_db()
+    try:
+        rows = connection.execute(
+            "SELECT id, snapshot_id FROM notification_history "
+            "ORDER BY sent_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [(int(r[0]), str(r[1] or "")) for r in rows]
+    finally:
+        connection.close()
+
+
+def _safe_num(value: Any, default: float | int = 0) -> float | int:
+    if value is None or _is_mock_object(value):
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def prune_forensic_snapshots(
+    max_records: int = 500, max_age_days: int = 30
+) -> int:
+    """Prune old or excess forensic snapshots from SQLite; returns deleted row count."""
+    deleted = 0
+    conn = _connect_state_db()
+    try:
+        if max_age_days is not None and int(max_age_days) > 0:
+            cutoff = time.time() - (int(max_age_days) * 86400.0)
+            cur = conn.execute(
+                "DELETE FROM alert_forensic_snapshots WHERE created_at < ?",
+                (cutoff,),
+            )
+            deleted += int(cur.rowcount or 0)
+
+        if max_records is not None and int(max_records) > 0:
+            cur = conn.execute(
+                """
+                DELETE FROM alert_forensic_snapshots
+                WHERE id NOT IN (
+                    SELECT id FROM alert_forensic_snapshots
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                )
+                """,
+                (int(max_records),),
+            )
+            deleted += int(cur.rowcount or 0)
+
+        conn.commit()
+    finally:
+        conn.close()
+    return deleted
+
+
+def _collect_top_processes(event_type: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Collect and rank running processes safely by resource impact."""
+    collected: list[dict[str, Any]] = []
+    attrs = [
+        "pid",
+        "name",
+        "username",
+        "cpu_percent",
+        "memory_percent",
+        "memory_info",
+        "cmdline",
+    ]
+    try:
+        proc_iter = psutil.process_iter(attrs)
+    except Exception as exc:
+        logging.debug(f"psutil.process_iter unavailable: {exc}")
+        return []
+
+    for proc in proc_iter:
+        try:
+            info = getattr(proc, "info", None)
+            if not isinstance(info, dict):
+                info = proc.as_dict(attrs=attrs)
+        except (
+            psutil.NoSuchProcess,
+            psutil.AccessDenied,
+            psutil.ZombieProcess,
+            OSError,
+        ):
+            continue
+        except Exception:
+            continue
+
+        pid_val = int(_safe_num(info.get("pid"), 0))
+        if pid_val <= 0:
+            continue
+
+        name_raw = info.get("name")
+        name = (
+            str(name_raw)
+            if name_raw and not _is_mock_object(name_raw)
+            else "unknown"
+        )
+        user_raw = info.get("username")
+        user = str(user_raw) if user_raw and not _is_mock_object(user_raw) else ""
+        cpu_pct = round(float(_safe_num(info.get("cpu_percent"), 0.0)), 2)
+        mem_pct = round(float(_safe_num(info.get("memory_percent"), 0.0)), 2)
+
+        mem_info = info.get("memory_info")
+        rss_val = 0.0
+        if mem_info is not None:
+            rss_val = float(_safe_num(getattr(mem_info, "rss", 0), 0.0))
+        memory_mb = round(rss_val / (1024.0 * 1024.0), 2)
+
+        raw_cmd = info.get("cmdline")
+        if isinstance(raw_cmd, (list, tuple)):
+            cmdline = " ".join(str(x) for x in raw_cmd if x)[:500]
+        elif isinstance(raw_cmd, str):
+            cmdline = raw_cmd[:500]
+        else:
+            cmdline = name
+
+        collected.append(
+            {
+                "pid": pid_val,
+                "name": name,
+                "user": user,
+                "cpu_percent": cpu_pct,
+                "memory_percent": mem_pct,
+                "memory_mb": memory_mb,
+                "cmdline": cmdline or name,
+            }
+        )
+
+    evt = str(event_type or "").lower()
+    if evt == "cpu":
+        collected.sort(
+            key=lambda p: (p["cpu_percent"], p["memory_percent"]), reverse=True
+        )
+    elif evt in ("memory", "ram"):
+        collected.sort(
+            key=lambda p: (p["memory_percent"], p["cpu_percent"]), reverse=True
+        )
+    else:
+        collected.sort(
+            key=lambda p: (p["cpu_percent"] + p["memory_percent"], p["cpu_percent"]),
+            reverse=True,
+        )
+    return collected[:limit]
+
+
+def _collect_forensic_system_metrics() -> dict[str, Any]:
+    """Collect current CPU, load average, memory, and swap metrics safely."""
+    try:
+        load_avg = [round(float(x), 2) for x in os.getloadavg()]
+    except (AttributeError, OSError):
+        load_avg = []
+
+    try:
+        raw_cpu = psutil.cpu_percent(interval=None)
+        cpu_percent = round(float(_safe_num(raw_cpu, 0.0)), 2)
+    except Exception:
+        cpu_percent = 0.0
+
+    cpu_cores: list[float] = []
+    try:
+        raw_cores = psutil.cpu_percent(interval=None, percpu=True)
+        if isinstance(raw_cores, list):
+            cpu_cores = [
+                round(float(_safe_num(c, 0.0)), 1)
+                for c in raw_cores
+                if not _is_mock_object(c)
+            ]
+    except Exception:
+        cpu_cores = []
+
+    memory_dict = {"total": 0, "available": 0, "used": 0, "percent": 0.0}
+    try:
+        vm = psutil.virtual_memory()
+        memory_dict = {
+            "total": int(_safe_num(getattr(vm, "total", 0), 0)),
+            "available": int(_safe_num(getattr(vm, "available", 0), 0)),
+            "used": int(_safe_num(getattr(vm, "used", 0), 0)),
+            "percent": round(float(_safe_num(getattr(vm, "percent", 0.0), 0.0)), 2),
+        }
+    except Exception:
+        pass
+
+    swap_dict = {"total": 0, "used": 0, "percent": 0.0}
+    try:
+        sw = psutil.swap_memory()
+        swap_dict = {
+            "total": int(_safe_num(getattr(sw, "total", 0), 0)),
+            "used": int(_safe_num(getattr(sw, "used", 0), 0)),
+            "percent": round(float(_safe_num(getattr(sw, "percent", 0.0), 0.0)), 2),
+        }
+    except Exception:
+        pass
+
+    return {
+        "load_avg": load_avg,
+        "cpu_percent": cpu_percent,
+        "cpu_cores": cpu_cores,
+        "memory": memory_dict,
+        "swap": swap_dict,
+    }
+
+
+def _format_forensic_snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
+    def _parse_json(raw: str, fallback: Any) -> Any:
+        try:
+            return json.loads(raw) if raw else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    created_ts = float(row["created_at"])
+    return {
+        "id": row["id"],
+        "notification_id": row["notification_id"],
+        "event_type": row["event_type"],
+        "severity": row["severity"],
+        "metric_value": row["metric_value"],
+        "system_metrics": _parse_json(row["system_metrics_json"], {}),
+        "top_processes": _parse_json(row["top_processes_json"], []),
+        "context": _parse_json(row["context_json"], {}),
+        "created_at": created_ts,
+        "created_at_formatted": format_timestamp(created_ts),
+    }
+
+
+def capture_forensic_snapshot(
+    event_type: str,
+    severity: str,
+    metric_value: Any,
+    context: Optional[dict[str, Any]] = None,
+    created_at: Optional[float] = None,
+) -> dict[str, Any]:
+    """Capture and persist a real-time incident forensic snapshot."""
+    clean_event = str(event_type or "system").strip().lower() or "system"
+    clean_severity = str(severity or "WARNING").strip().upper() or "WARNING"
+    metric_str = str(metric_value) if metric_value is not None else ""
+    ctx = dict(context) if isinstance(context, dict) else {}
+    now_ts = float(created_at) if created_at is not None else time.time()
+    snapshot_id = str(uuid.uuid4())
+
+    top_processes = _collect_top_processes(clean_event, limit=10)
+    system_metrics = _collect_forensic_system_metrics()
+
+    conn = _connect_state_db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO alert_forensic_snapshots (
+                id, notification_id, event_type, severity, metric_value,
+                system_metrics_json, top_processes_json, context_json, created_at
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                clean_event,
+                clean_severity,
+                metric_str,
+                json.dumps(system_metrics, default=str),
+                json.dumps(top_processes, default=str),
+                json.dumps(ctx, default=str),
+                now_ts,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        prune_forensic_snapshots(max_records=500, max_age_days=30)
+    except Exception as exc:
+        logging.debug(f"Could not prune forensic snapshots: {exc}")
+
+    return {
+        "id": snapshot_id,
+        "notification_id": None,
+        "event_type": clean_event,
+        "severity": clean_severity,
+        "metric_value": metric_str,
+        "system_metrics": system_metrics,
+        "top_processes": top_processes,
+        "context": ctx,
+        "created_at": now_ts,
+        "created_at_formatted": format_timestamp(now_ts),
+    }
+
+
+def list_forensic_snapshots(
+    limit: int = 50, event_type: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """List recent incident forensic snapshots, optionally filtered by event_type."""
+    safe_limit = max(1, min(int(limit), 500))
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        if event_type and str(event_type).strip():
+            rows = conn.execute(
+                """
+                SELECT id, notification_id, event_type, severity, metric_value,
+                       system_metrics_json, top_processes_json, context_json, created_at
+                FROM alert_forensic_snapshots
+                WHERE LOWER(event_type) = LOWER(?)
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (str(event_type).strip(), safe_limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, notification_id, event_type, severity, metric_value,
+                       system_metrics_json, top_processes_json, context_json, created_at
+                FROM alert_forensic_snapshots
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [_format_forensic_snapshot_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_forensic_snapshot(snapshot_id: str) -> Optional[dict[str, Any]]:
+    """Retrieve a single forensic snapshot by its ID."""
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, notification_id, event_type, severity, metric_value,
+                   system_metrics_json, top_processes_json, context_json, created_at
+            FROM alert_forensic_snapshots
+            WHERE id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        return _format_forensic_snapshot_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_forensic_snapshot_by_notification_id(
+    notification_id: int,
+) -> Optional[dict[str, Any]]:
+    """Retrieve the forensic snapshot linked to a notification_history row ID."""
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, notification_id, event_type, severity, metric_value,
+                   system_metrics_json, top_processes_json, context_json, created_at
+            FROM alert_forensic_snapshots
+            WHERE notification_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (int(notification_id),),
+        ).fetchone()
+        if row:
+            return _format_forensic_snapshot_row(row)
+
+        hist_row = conn.execute(
+            "SELECT snapshot_id FROM notification_history WHERE id = ?",
+            (int(notification_id),),
+        ).fetchone()
+        if hist_row and hist_row["snapshot_id"]:
+            snap_row = conn.execute(
+                """
+                SELECT id, notification_id, event_type, severity, metric_value,
+                       system_metrics_json, top_processes_json, context_json, created_at
+                FROM alert_forensic_snapshots
+                WHERE id = ?
+                """,
+                (hist_row["snapshot_id"],),
+            ).fetchone()
+            return _format_forensic_snapshot_row(snap_row) if snap_row else None
+        return None
+    finally:
+        conn.close()
+
+
+def _format_forensic_processes_field(
+    top_processes: list[dict[str, Any]], event_type: str, limit: int = 3
+) -> Optional[dict[str, Any]]:
+    """Format a concise Discord embed field summarizing top contributing processes."""
+    if not top_processes:
+        return None
+    evt = str(event_type or "").lower()
+    lines: list[str] = []
+    for idx, proc in enumerate(top_processes[:limit], start=1):
+        name = proc.get("name") or "unknown"
+        pid = proc.get("pid") or 0
+        if evt in ("memory", "ram"):
+            mem_pct = float(proc.get("memory_percent") or 0.0)
+            mem_mb = float(proc.get("memory_mb") or 0.0)
+            metric_label = f"{mem_pct:.1f}% RAM ({mem_mb:.0f} MB)" if mem_mb > 0 else f"{mem_pct:.1f}% RAM"
+        else:
+            cpu_pct = float(proc.get("cpu_percent") or 0.0)
+            metric_label = f"{cpu_pct:.1f}% CPU"
+        lines.append(f"{idx}. `{name}` [PID {pid}] — {metric_label}")
+    if not lines:
+        return None
+    return {
+        "name": "Top Contributing Processes",
+        "value": "\n".join(lines)[:1024],
+        "inline": False,
+    }
 
 
 def format_timestamp(timestamp: float) -> str:
@@ -3152,6 +3634,34 @@ def build_periodic_report_data(
     return title, description, embed_data
 
 
+def _attach_forensic_snapshot_to_alert(
+    embed: dict[str, Any],
+    event_type: str,
+    severity: str,
+    metric_value: Any,
+    context: Optional[dict[str, Any]] = None,
+    created_at: Optional[float] = None,
+) -> Optional[str]:
+    """Capture a forensic snapshot, append Top Contributing Processes to embed, and return snapshot ID."""
+    try:
+        snapshot = capture_forensic_snapshot(
+            event_type=event_type,
+            severity=severity,
+            metric_value=metric_value,
+            context=context,
+            created_at=created_at,
+        )
+        proc_field = _format_forensic_processes_field(
+            snapshot.get("top_processes", []), event_type, limit=3
+        )
+        if proc_field is not None:
+            embed.setdefault("fields", []).append(proc_field)
+        return snapshot["id"]
+    except Exception as exc:
+        logging.debug(f"Could not capture forensic snapshot for {event_type}: {exc}")
+        return None
+
+
 async def evaluate_threshold_alerts(
     now: Optional[float] = None,
 ) -> list[dict[str, Any]]:
@@ -3208,12 +3718,27 @@ async def evaluate_threshold_alerts(
                             {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                         ],
                     }
+                    snapshot_id = _attach_forensic_snapshot_to_alert(
+                        embed,
+                        event_type="memory",
+                        severity=severity,
+                        metric_value=f"{vm.percent}%",
+                        context={
+                            "metric": key,
+                            "threshold_percent": float(ram_limit),
+                            "used_bytes": int(_safe_num(getattr(vm, "used", 0), 0)),
+                            "total_bytes": int(_safe_num(getattr(vm, "total", 0), 0)),
+                            "percent": ram_val,
+                        },
+                        created_at=current_time,
+                    )
                     alerts.append({
                         "metric": key,
                         "title": title,
                         "message": msg,
                         "embed": embed,
                         "value": str(vm.percent),
+                        "snapshot_id": snapshot_id,
                     })
         except Exception as exc:
             logging.debug(f"RAM threshold check error: {exc}")
@@ -3250,12 +3775,25 @@ async def evaluate_threshold_alerts(
                             {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                         ],
                     }
+                    snapshot_id = _attach_forensic_snapshot_to_alert(
+                        embed,
+                        event_type="cpu",
+                        severity=severity,
+                        metric_value=f"{cpu_pct}%",
+                        context={
+                            "metric": key,
+                            "threshold_percent": float(cpu_limit),
+                            "percent": cpu_val,
+                        },
+                        created_at=current_time,
+                    )
                     alerts.append({
                         "metric": key,
                         "title": title,
                         "message": msg,
                         "embed": embed,
                         "value": str(cpu_pct),
+                        "snapshot_id": snapshot_id,
                     })
         except Exception as exc:
             logging.debug(f"CPU threshold check error: {exc}")
@@ -3302,12 +3840,28 @@ async def evaluate_threshold_alerts(
                                 {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                             ],
                         }
+                        snapshot_id = _attach_forensic_snapshot_to_alert(
+                            embed,
+                            event_type="disk",
+                            severity=severity,
+                            metric_value=f"{pct}%",
+                            context={
+                                "metric": metric_key,
+                                "path": d,
+                                "threshold_percent": float(disk_limit),
+                                "percent": float(pct),
+                                "used_bytes": int(_safe_num(st.get("used", 0), 0)),
+                                "total_bytes": int(_safe_num(st.get("total", 0), 0)),
+                            },
+                            created_at=current_time,
+                        )
                         alerts.append({
                             "metric": metric_key,
                             "title": title,
                             "message": msg,
                             "embed": embed,
                             "value": str(pct),
+                            "snapshot_id": snapshot_id,
                         })
         except Exception as exc:
             logging.debug(f"Disk threshold check error: {exc}")
@@ -3345,12 +3899,28 @@ async def evaluate_threshold_alerts(
                             {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                         ],
                     }
+                    snapshot_id = _attach_forensic_snapshot_to_alert(
+                        embed,
+                        event_type="raid",
+                        severity="CRITICAL",
+                        metric_value=status.upper(),
+                        context={
+                            "metric": key,
+                            "status": status,
+                            "active_devices": active_devs,
+                            "working_devices": working_devs,
+                            "failed_devices": failed_devs,
+                            "details": str(details or "")[:1000],
+                        },
+                        created_at=current_time,
+                    )
                     alerts.append({
                         "metric": key,
                         "title": title,
                         "message": msg,
                         "embed": embed,
                         "value": status,
+                        "snapshot_id": snapshot_id,
                     })
         except Exception as exc:
             logging.debug(f"RAID threshold check error: {exc}")
@@ -3403,12 +3973,29 @@ async def evaluate_threshold_alerts(
                                 {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                             ],
                         }
+                        snapshot_id = _attach_forensic_snapshot_to_alert(
+                            embed,
+                            event_type="smart",
+                            severity="CRITICAL",
+                            metric_value="FAILED",
+                            context={
+                                "metric": key,
+                                "device": dev_path,
+                                "model": model,
+                                "serial_number": serial,
+                                "reallocated_sectors": realloc,
+                                "media_errors": media_err,
+                                "wear_level_percent": wear,
+                            },
+                            created_at=current_time,
+                        )
                         alerts.append({
                             "metric": key,
                             "title": title,
                             "message": msg,
                             "embed": embed,
                             "value": "FAILED",
+                            "snapshot_id": snapshot_id,
                         })
 
                 # 2. Thermal Early-Warning Alert
@@ -3438,12 +4025,28 @@ async def evaluate_threshold_alerts(
                                 {"name": "Timestamp", "value": format_timestamp(current_time), "inline": True},
                             ],
                         }
+                        snapshot_id = _attach_forensic_snapshot_to_alert(
+                            embed,
+                            event_type="thermal",
+                            severity=severity,
+                            metric_value=f"{temp}°C",
+                            context={
+                                "metric": key,
+                                "device": dev_path,
+                                "model": model,
+                                "temperature_c": float(temp),
+                                "threshold_c": float(temp_limit),
+                                "device_type": "nvme" if is_nvme else "hdd",
+                            },
+                            created_at=current_time,
+                        )
                         alerts.append({
                             "metric": key,
                             "title": title,
                             "message": msg,
                             "embed": embed,
                             "value": f"{temp}C",
+                            "snapshot_id": snapshot_id,
                         })
         except Exception as exc:
             logging.debug(f"SMART/Thermal threshold check error: {exc}")
@@ -3459,7 +4062,14 @@ async def evaluate_threshold_alerts(
                 due_at=current_time + cooldown_sec,
                 status=alert["value"],
             )
-            record_notification(f"alert_{alert['metric']}", current_time, weekly=False)
+            record_notification(
+                f"alert_{alert['metric']}",
+                current_time,
+                weekly=False,
+                title=alert["title"],
+                details=alert["message"],
+                snapshot_id=alert.get("snapshot_id"),
+            )
 
     return alerts
 
@@ -5582,6 +6192,7 @@ class DockerManager:
         cmd: list[str],
         timeout: int = 30,
         cwd: Optional[Path] = None,
+        env: Optional[dict[str, str]] = None,
     ) -> str:
         try:
             proc = subprocess.run(
@@ -5591,6 +6202,7 @@ class DockerManager:
                 text=True,
                 timeout=timeout,
                 cwd=str(cwd) if cwd else None,
+                env=env,
                 check=True,
             )
             return proc.stdout
@@ -5615,8 +6227,11 @@ class DockerManager:
         args: list[str],
         timeout: int = 60,
         cwd: Optional[Path] = None,
+        env: Optional[dict[str, str]] = None,
     ) -> str:
         prefix = self._get_compose_cmd()
+        if env is not None:
+            return self._run_cmd(prefix + args, timeout=timeout, cwd=cwd, env=env)
         return self._run_cmd(prefix + args, timeout=timeout, cwd=cwd)
 
     def _parse_json_lines(self, raw: str) -> list[dict[str, Any]]:
@@ -6775,9 +7390,20 @@ class DockerManager:
         if deploy:
             if not self.is_running():
                 raise RuntimeError("Docker daemon is not running.")
-            self._run_compose(
-                ["-f", str(stack_file), "-p", clean_name, "up", "-d"], timeout=120
-            )
+            with _ephemeral_docker_config_dir(
+                _get_all_registries_with_credentials()
+            ) as cfg_dir:
+                if cfg_dir:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "up", "-d"],
+                        timeout=120,
+                        env={**os.environ, "DOCKER_CONFIG": cfg_dir},
+                    )
+                else:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "up", "-d"],
+                        timeout=120,
+                    )
             status = "running"
 
         now = time.time()
@@ -6877,9 +7503,20 @@ class DockerManager:
             )
 
         if act == "start":
-            self._run_compose(
-                ["-f", str(stack_file), "-p", clean_name, "up", "-d"], timeout=90
-            )
+            with _ephemeral_docker_config_dir(
+                _get_all_registries_with_credentials()
+            ) as cfg_dir:
+                if cfg_dir:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "up", "-d"],
+                        timeout=90,
+                        env={**os.environ, "DOCKER_CONFIG": cfg_dir},
+                    )
+                else:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "up", "-d"],
+                        timeout=90,
+                    )
             new_status = "running"
         elif act == "stop":
             self._run_compose(
@@ -6897,9 +7534,19 @@ class DockerManager:
             )
             new_status = "down"
         elif act == "pull":
-            self._run_compose(
-                ["-f", str(stack_file), "-p", clean_name, "pull"], timeout=180
-            )
+            with _ephemeral_docker_config_dir(
+                _get_all_registries_with_credentials()
+            ) as cfg_dir:
+                if cfg_dir:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "pull"],
+                        timeout=180,
+                        env={**os.environ, "DOCKER_CONFIG": cfg_dir},
+                    )
+                else:
+                    self._run_compose(
+                        ["-f", str(stack_file), "-p", clean_name, "pull"], timeout=180
+                    )
             new_status = "updated"
 
         now = time.time()
@@ -7050,43 +7697,20 @@ class DockerManager:
                     **reg,
                     "decrypted_token": decrypted_token,
                     "server_address": _get_docker_config_server_address(reg["url"]),
+                    "server_aliases": _get_docker_config_server_aliases(reg["url"]),
                 }
         else:
             matched_registry = resolve_registry_for_image(clean_tag)
 
         if matched_registry:
-            username = matched_registry.get("username") or ""
-            token = (
-                matched_registry.get("decrypted_token")
-                or matched_registry.get("token")
-                or ""
-            )
-            server_address = matched_registry.get(
-                "server_address"
-            ) or _get_docker_config_server_address(matched_registry["url"])
             registry_name = matched_registry.get("name")
-
-            temp_dir = tempfile.mkdtemp(prefix="vigil-docker-auth-")
-            try:
-                os.chmod(temp_dir, 0o700)
-                auth_value = base64.b64encode(
-                    f"{username}:{token}".encode("utf-8")
-                ).decode("ascii")
-                config_payload = {
-                    "auths": {
-                        server_address: {
-                            "auth": auth_value,
-                        }
-                    }
-                }
-                config_path = Path(temp_dir) / "config.json"
-                config_path.write_text(json.dumps(config_payload), encoding="utf-8")
-                os.chmod(config_path, 0o600)
-                out = self._run_docker(
-                    ["--config", temp_dir, "pull", clean_tag], timeout=300
-                )
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            with _ephemeral_docker_config_dir([matched_registry]) as temp_dir:
+                if temp_dir:
+                    out = self._run_docker(
+                        ["--config", temp_dir, "pull", clean_tag], timeout=300
+                    )
+                else:
+                    out = self._run_docker(["pull", clean_tag], timeout=300)
 
             self.invalidate_cache()
             record_audit_event(
@@ -7463,15 +8087,95 @@ class DockerManager:
         )
 
         candidates: set[str] = set()
+        matched_reg = resolve_registry_for_image(clean_img)
 
-        # Attempt 1: buildx imagetools inspect --raw
-        try:
-            raw = self._run_docker(["buildx", "imagetools", "inspect", "--raw", clean_img], timeout=8)
-            if raw and raw.strip():
-                raw_hash = f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
-                candidates.add(raw_hash)
-                result["primary_digest"] = raw_hash
+        with _ephemeral_docker_config_dir(
+            [matched_reg] if matched_reg else []
+        ) as cfg_dir:
+            cfg_prefix = ["--config", cfg_dir] if cfg_dir else []
 
+            # Attempt 1: buildx imagetools inspect --raw
+            try:
+                raw = self._run_docker(
+                    cfg_prefix + ["buildx", "imagetools", "inspect", "--raw", clean_img],
+                    timeout=8,
+                )
+                if raw and raw.strip():
+                    raw_hash = f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+                    candidates.add(raw_hash)
+                    result["primary_digest"] = raw_hash
+
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        manifests = data.get("manifests")
+                        if isinstance(manifests, list) and manifests:
+                            for m in manifests:
+                                digest = m.get("digest")
+                                if digest:
+                                    candidates.add(digest)
+                                plat = m.get("platform", {})
+                                if plat.get("architecture") == arch and plat.get("os") == "linux":
+                                    if not result["platform_digest"] and digest:
+                                        result["platform_digest"] = digest
+                            if not result["platform_digest"] and manifests:
+                                first_digest = manifests[0].get("digest")
+                                if first_digest:
+                                    result["platform_digest"] = first_digest
+                        elif "config" in data:
+                            cfg_digest = data.get("config", {}).get("digest")
+                            if cfg_digest:
+                                candidates.add(cfg_digest)
+                                result["platform_digest"] = cfg_digest
+                                if not result["primary_digest"]:
+                                    result["primary_digest"] = cfg_digest
+
+                    if result["platform_digest"] or result["primary_digest"]:
+                        result["candidate_digests"] = candidates
+                        return result
+            except Exception:
+                pass
+
+            # Fallback attempt 2: manifest inspect -v
+            try:
+                raw = self._run_docker(
+                    cfg_prefix + ["manifest", "inspect", "-v", clean_img], timeout=8
+                )
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    for entry in data:
+                        if isinstance(entry, dict):
+                            desc = entry.get("Descriptor", {})
+                            digest = desc.get("digest")
+                            if digest:
+                                candidates.add(digest)
+                            plat = desc.get("platform", {})
+                            if plat.get("architecture") == arch and plat.get("os") == "linux":
+                                if not result["platform_digest"] and digest:
+                                    result["platform_digest"] = digest
+                    if not result["platform_digest"] and data and isinstance(data[0], dict):
+                        first_digest = data[0].get("Descriptor", {}).get("digest")
+                        if first_digest:
+                            result["platform_digest"] = first_digest
+                elif isinstance(data, dict):
+                    digest = data.get("Descriptor", {}).get("digest")
+                    if digest:
+                        candidates.add(digest)
+                        result["platform_digest"] = digest
+                        result["primary_digest"] = digest
+
+                if result["platform_digest"] or candidates:
+                    result["candidate_digests"] = candidates
+                    if not result["primary_digest"]:
+                        result["primary_digest"] = result["platform_digest"]
+                    return result
+            except Exception:
+                pass
+
+            # Fallback attempt 3: manifest inspect
+            try:
+                raw = self._run_docker(
+                    cfg_prefix + ["manifest", "inspect", clean_img], timeout=8
+                )
                 data = json.loads(raw)
                 if isinstance(data, dict):
                     manifests = data.get("manifests")
@@ -7493,82 +8197,15 @@ class DockerManager:
                         if cfg_digest:
                             candidates.add(cfg_digest)
                             result["platform_digest"] = cfg_digest
-                            if not result["primary_digest"]:
-                                result["primary_digest"] = cfg_digest
+                            result["primary_digest"] = cfg_digest
 
-                if result["platform_digest"] or result["primary_digest"]:
+                if result["platform_digest"] or candidates:
                     result["candidate_digests"] = candidates
+                    if not result["primary_digest"]:
+                        result["primary_digest"] = result["platform_digest"]
                     return result
-        except Exception:
-            pass
-
-        # Fallback attempt 2: manifest inspect -v
-        try:
-            raw = self._run_docker(["manifest", "inspect", "-v", clean_img], timeout=8)
-            data = json.loads(raw)
-            if isinstance(data, list):
-                for entry in data:
-                    if isinstance(entry, dict):
-                        desc = entry.get("Descriptor", {})
-                        digest = desc.get("digest")
-                        if digest:
-                            candidates.add(digest)
-                        plat = desc.get("platform", {})
-                        if plat.get("architecture") == arch and plat.get("os") == "linux":
-                            if not result["platform_digest"] and digest:
-                                result["platform_digest"] = digest
-                if not result["platform_digest"] and data and isinstance(data[0], dict):
-                    first_digest = data[0].get("Descriptor", {}).get("digest")
-                    if first_digest:
-                        result["platform_digest"] = first_digest
-            elif isinstance(data, dict):
-                digest = data.get("Descriptor", {}).get("digest")
-                if digest:
-                    candidates.add(digest)
-                    result["platform_digest"] = digest
-                    result["primary_digest"] = digest
-
-            if result["platform_digest"] or candidates:
-                result["candidate_digests"] = candidates
-                if not result["primary_digest"]:
-                    result["primary_digest"] = result["platform_digest"]
-                return result
-        except Exception:
-            pass
-
-        # Fallback attempt 3: manifest inspect
-        try:
-            raw = self._run_docker(["manifest", "inspect", clean_img], timeout=8)
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                manifests = data.get("manifests")
-                if isinstance(manifests, list) and manifests:
-                    for m in manifests:
-                        digest = m.get("digest")
-                        if digest:
-                            candidates.add(digest)
-                        plat = m.get("platform", {})
-                        if plat.get("architecture") == arch and plat.get("os") == "linux":
-                            if not result["platform_digest"] and digest:
-                                result["platform_digest"] = digest
-                    if not result["platform_digest"] and manifests:
-                        first_digest = manifests[0].get("digest")
-                        if first_digest:
-                            result["platform_digest"] = first_digest
-                elif "config" in data:
-                    cfg_digest = data.get("config", {}).get("digest")
-                    if cfg_digest:
-                        candidates.add(cfg_digest)
-                        result["platform_digest"] = cfg_digest
-                        result["primary_digest"] = cfg_digest
-
-            if result["platform_digest"] or candidates:
-                result["candidate_digests"] = candidates
-                if not result["primary_digest"]:
-                    result["primary_digest"] = result["platform_digest"]
-                return result
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         result["candidate_digests"] = candidates
         return result
@@ -8635,8 +9272,15 @@ def extract_registry_host_from_image(image_tag: str) -> str:
     return "docker.io"
 
 
+def _parse_registry_url(registry_url: str):
+    raw = str(registry_url or "").strip()
+    if raw and "://" not in raw:
+        raw = f"https://{raw}"
+    return urlparse(raw)
+
+
 def _registry_url_matches_host(registry_url: str, image_host: str) -> bool:
-    parsed = urlparse(registry_url)
+    parsed = _parse_registry_url(registry_url)
     reg_netloc = (parsed.netloc or "").lower()
     reg_hostname = (parsed.hostname or "").lower()
     host_lower = (image_host or "").lower()
@@ -8652,11 +9296,122 @@ def _registry_url_matches_host(registry_url: str, image_host: str) -> bool:
 
 
 def _get_docker_config_server_address(registry_url: str) -> str:
-    parsed = urlparse(registry_url)
+    parsed = _parse_registry_url(registry_url)
     hostname = (parsed.hostname or "").lower()
     if hostname in _DOCKER_HUB_HOSTS:
         return "https://index.docker.io/v1/"
     return parsed.netloc or registry_url
+
+
+def _get_docker_config_server_aliases(registry_url: str) -> list[str]:
+    parsed = _parse_registry_url(registry_url)
+    netloc = (parsed.netloc or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    scheme = (parsed.scheme or "https").lower()
+    if hostname in _DOCKER_HUB_HOSTS:
+        return [
+            "https://index.docker.io/v1/",
+            "index.docker.io",
+            "docker.io",
+            "https://docker.io",
+            "registry-1.docker.io",
+            "https://registry-1.docker.io",
+        ]
+    aliases: list[str] = []
+    if netloc:
+        for candidate in (
+            netloc,
+            f"{scheme}://{netloc}",
+            f"https://{netloc}",
+            f"https://{netloc}/v1/",
+            f"https://{netloc}/v2/",
+        ):
+            if candidate not in aliases:
+                aliases.append(candidate)
+        if scheme == "http":
+            for candidate in (f"http://{netloc}/v1/", f"http://{netloc}/v2/"):
+                if candidate not in aliases:
+                    aliases.append(candidate)
+    return aliases or ([registry_url] if registry_url else [])
+
+
+def _build_registry_auths_payload(registries: list[dict[str, Any]]) -> dict[str, Any]:
+    auths: dict[str, dict[str, str]] = {}
+    for reg in registries:
+        if not reg:
+            continue
+        raw_username = (reg.get("username") or "").strip()
+        token = reg.get("decrypted_token") or reg.get("token") or ""
+        if not raw_username and not token:
+            continue
+        effective_username = raw_username if raw_username else "oauth2"
+        auth_value = base64.b64encode(
+            f"{effective_username}:{token}".encode("utf-8")
+        ).decode("ascii")
+        auth_entry = {
+            "auth": auth_value,
+            "username": effective_username,
+            "password": token,
+        }
+        aliases = reg.get("server_aliases") or _get_docker_config_server_aliases(
+            reg.get("url", "")
+        )
+        for alias in aliases:
+            if alias:
+                auths[alias] = dict(auth_entry)
+    return {"auths": auths} if auths else {}
+
+
+@contextlib.contextmanager
+def _ephemeral_docker_config_dir(registries: list[dict[str, Any]]):
+    payload = _build_registry_auths_payload(registries)
+    if not payload:
+        yield None
+        return
+
+    temp_dir = tempfile.mkdtemp(prefix="vigil-docker-auth-")
+    try:
+        os.chmod(temp_dir, 0o700)
+        config_path = Path(temp_dir) / "config.json"
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(config_path, 0o600)
+        yield temp_dir
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _get_all_registries_with_credentials() -> list[dict[str, Any]]:
+    try:
+        conn = _connect_state_db()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, name, url, username, encrypted_token, is_default,
+                       status, last_tested_at, last_error, created_at, updated_at
+                FROM container_registries
+                ORDER BY is_default DESC, created_at ASC
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+    except (OSError, sqlite3.Error):
+        return []
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        encrypted_token = row["encrypted_token"] or ""
+        decrypted_token = decrypt_secret(encrypted_token) if encrypted_token else ""
+        username = row["username"] or ""
+        if not username and not decrypted_token:
+            continue
+        item = _format_registry_row(row, include_decrypted_token=True)
+        item["decrypted_token"] = decrypted_token
+        item["username"] = username
+        item["server_address"] = _get_docker_config_server_address(row["url"])
+        item["server_aliases"] = _get_docker_config_server_aliases(row["url"])
+        results.append(item)
+    return results
 
 
 def resolve_registry_for_image(image_tag: str) -> Optional[dict[str, Any]]:
@@ -8711,6 +9466,7 @@ def resolve_registry_for_image(image_tag: str) -> Optional[dict[str, Any]]:
     result["decrypted_token"] = decrypted_token
     result["username"] = username
     result["server_address"] = _get_docker_config_server_address(matched_row["url"])
+    result["server_aliases"] = _get_docker_config_server_aliases(matched_row["url"])
     return result
 
 # ============================================================================

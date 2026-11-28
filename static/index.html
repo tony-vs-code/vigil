@@ -5100,6 +5100,125 @@
     </div>
   </aside>
 
+  <!-- Incident Forensics Snapshot Backdrop (#forensic-snapshot-backdrop) -->
+  <div id="forensic-snapshot-backdrop" class="drawer-backdrop forensic-snapshot-backdrop hidden" aria-hidden="true"></div>
+
+  <!-- Slide-Over Incident Forensics Drawer (#drawer-forensic-snapshot) -->
+  <aside id="drawer-forensic-snapshot" class="forensic-snapshot-drawer hidden" aria-label="Incident Forensic Snapshot Drawer" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="snapshot-drawer-title">
+    <div class="drawer-header forensic-drawer-header">
+      <div class="forensic-header-meta">
+        <div class="forensic-title-row">
+          <h2 id="snapshot-drawer-title" class="drawer-title">Incident Forensic Snapshot</h2>
+          <span id="snapshot-severity-badge" class="status-badge status-warn">WARNING</span>
+          <span id="snapshot-event-type" class="kind-badge">SYSTEM</span>
+          <span id="snapshot-metric-value" class="snapshot-metric-pill hidden"></span>
+        </div>
+        <p id="snapshot-timestamp" class="forensic-timestamp mono-text">--</p>
+      </div>
+      <button id="btn-close-snapshot-drawer" class="btn-close-drawer" type="button" title="Close forensic snapshot" aria-label="Close forensic snapshot">
+        <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+
+    <div class="forensic-drawer-body">
+      <div id="snapshot-loading-state" class="forensic-loading-state hidden">
+        <span class="spinner"></span>
+        <span>Capturing forensic telemetry &amp; process snapshot...</span>
+      </div>
+
+      <div id="snapshot-error-state" class="auth-alert feedback-error hidden" role="status"></div>
+
+      <div id="snapshot-content-body" class="forensic-content-body">
+        <!-- System Metrics Panel -->
+        <section class="forensic-section" aria-label="System Metrics at Incident Time">
+          <h3 class="forensic-section-title">System Telemetry at Trigger Time</h3>
+          <div class="forensic-metrics-grid">
+            <div class="forensic-metric-card">
+              <span class="forensic-metric-label">Load Average (1m / 5m / 15m)</span>
+              <div id="snapshot-load-avg" class="forensic-metric-value mono-text">-- / -- / --</div>
+            </div>
+            <div class="forensic-metric-card">
+              <span class="forensic-metric-label">CPU Utilization</span>
+              <div id="snapshot-cpu-gauge" class="forensic-gauge-box">
+                <div class="forensic-gauge-header">
+                  <span class="forensic-gauge-pct mono-text">--%</span>
+                  <span class="forensic-gauge-sub text-muted">--</span>
+                </div>
+                <div class="forensic-gauge-track"><div class="forensic-gauge-fill" style="width: 0%;"></div></div>
+              </div>
+            </div>
+            <div class="forensic-metric-card">
+              <span class="forensic-metric-label">Memory</span>
+              <div id="snapshot-memory-gauge" class="forensic-gauge-box">
+                <div class="forensic-gauge-header">
+                  <span class="forensic-gauge-pct mono-text">--%</span>
+                  <span class="forensic-gauge-sub text-muted">--</span>
+                </div>
+                <div class="forensic-gauge-track"><div class="forensic-gauge-fill" style="width: 0%;"></div></div>
+              </div>
+            </div>
+            <div class="forensic-metric-card">
+              <span class="forensic-metric-label">Swap</span>
+              <div id="snapshot-swap-gauge" class="forensic-gauge-box">
+                <div class="forensic-gauge-header">
+                  <span class="forensic-gauge-pct mono-text">--%</span>
+                  <span class="forensic-gauge-sub text-muted">--</span>
+                </div>
+                <div class="forensic-gauge-track"><div class="forensic-gauge-fill" style="width: 0%;"></div></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Top Contributing Processes Table -->
+        <section class="forensic-section" aria-label="Top Contributing Processes">
+          <h3 class="forensic-section-title">Top Contributing Processes</h3>
+          <div class="table-container forensic-processes-table-wrap">
+            <table class="data-table" id="snapshot-processes-table">
+              <thead>
+                <tr>
+                  <th>PID</th>
+                  <th>Process</th>
+                  <th>User</th>
+                  <th>CPU %</th>
+                  <th>Memory</th>
+                  <th>Command Line</th>
+                </tr>
+              </thead>
+              <tbody id="snapshot-processes-tbody">
+                <tr>
+                  <td colspan="6" class="empty-state">No process telemetry captured.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Contextual Diagnostic Card -->
+        <section id="snapshot-context-card" class="forensic-section forensic-context-card" aria-label="Contextual Diagnostic Details">
+          <h3 class="forensic-section-title">Contextual Diagnostic Details</h3>
+          <div id="snapshot-context-body" class="forensic-context-body">
+            <span class="text-muted">No additional context recorded for this event.</span>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <div class="forensic-drawer-footer">
+      <button id="btn-copy-snapshot-summary" type="button" class="btn-primary">
+        <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+        <span>Copy Post-Mortem Summary</span>
+      </button>
+      <button id="btn-dismiss-snapshot" type="button" class="btn-secondary">Close</button>
+    </div>
+  </aside>
+
   <!-- Add / Edit Probe Modal (#probe-modal) -->
   <div id="probe-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="probe-modal-title">
     <div class="modal-card probe-modal-card">

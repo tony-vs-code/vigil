@@ -9302,6 +9302,322 @@ hr.overview-flow-divider {
   background-color: currentColor;
 }
 
+/* =========================================================================
+ * Automated Incident Forensics & Snapshot Drawer (#drawer-forensic-snapshot)
+ * ========================================================================= */
+.btn-snapshot {
+  margin-left: 8px;
+  padding: 3px 9px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.38);
+  background: rgba(14, 165, 233, 0.12);
+}
+
+.btn-snapshot:hover {
+  color: #e0f2fe;
+  border-color: rgba(56, 189, 248, 0.7);
+  background: rgba(14, 165, 233, 0.24);
+}
+
+.drawer-item-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.forensic-snapshot-backdrop {
+  z-index: 1055;
+}
+
+.forensic-snapshot-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 720px;
+  max-width: 96vw;
+  background: var(--bg-card);
+  border-left: 1px solid var(--border-subtle);
+  box-shadow: -14px 0 42px rgba(0, 0, 0, 0.72);
+  z-index: 1060;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  overflow: hidden;
+}
+
+.forensic-snapshot-drawer.open {
+  transform: translateX(0);
+}
+
+.forensic-drawer-header {
+  align-items: flex-start;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.7);
+}
+
+.forensic-header-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.forensic-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.forensic-timestamp {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.snapshot-metric-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.forensic-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.forensic-loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 36px 16px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.forensic-content-body {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.forensic-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.forensic-section-title {
+  margin: 0;
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+.forensic-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.forensic-metric-card {
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.55);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.forensic-metric-label {
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.forensic-metric-value {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.forensic-gauge-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.forensic-gauge-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.forensic-gauge-pct {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.forensic-gauge-sub {
+  font-size: 0.74rem;
+}
+
+.forensic-gauge-track {
+  height: 7px;
+  width: 100%;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow: hidden;
+}
+
+.forensic-gauge-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.forensic-gauge-fill.gauge-ok {
+  background: var(--state-clean);
+}
+
+.forensic-gauge-fill.gauge-warn {
+  background: var(--state-degraded);
+}
+
+.forensic-gauge-fill.gauge-crit {
+  background: var(--state-failed);
+}
+
+.forensic-processes-table-wrap {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.snapshot-cmdline {
+  display: inline-block;
+  max-width: 260px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(2, 6, 23, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  color: #e2e8f0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.forensic-context-card {
+  padding: 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.5);
+}
+
+.forensic-context-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 14px;
+}
+
+.forensic-context-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.forensic-context-item-full {
+  grid-column: 1 / -1;
+}
+
+.forensic-context-key {
+  font-size: 0.73rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.forensic-context-val {
+  font-size: 0.84rem;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.forensic-context-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.forensic-context-list .snapshot-cmdline {
+  max-width: 100%;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.forensic-sub-kv-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.8rem;
+}
+
+.forensic-drawer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  border-top: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.75);
+}
+
+@media (max-width: 768px) {
+  .forensic-snapshot-drawer {
+    width: 100%;
+    max-width: 100vw;
+  }
+
+  .forensic-metrics-grid,
+  .forensic-context-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .forensic-drawer-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 
 
 
