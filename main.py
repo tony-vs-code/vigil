@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import base64
+import binascii
 import concurrent.futures
 import copy
 import fnmatch
@@ -24,6 +26,7 @@ import importlib.metadata
 import urllib.request
 import urllib.parse
 from urllib.parse import urlparse
+import uuid
 import aiohttp
 import discord
 import logging
@@ -652,6 +655,20 @@ def _connect_state_db(db_path: Optional[Path] = None) -> sqlite3.Connection:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_telemetry_samples_timestamp ON telemetry_samples(timestamp)"
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS container_registries ("
+        "id TEXT PRIMARY KEY, "
+        "name TEXT NOT NULL, "
+        "url TEXT NOT NULL, "
+        "username TEXT DEFAULT '', "
+        "encrypted_token TEXT DEFAULT '', "
+        "is_default INTEGER DEFAULT 0, "
+        "status TEXT DEFAULT 'unverified', "
+        "last_tested_at REAL DEFAULT 0, "
+        "last_error TEXT DEFAULT '', "
+        "created_at REAL NOT NULL, "
+        "updated_at REAL NOT NULL)"
+    )
     connection.commit()
     return connection
 
@@ -685,6 +702,20 @@ def init_db(
                 conn.execute(
                     f"ALTER TABLE notification_history ADD COLUMN {col_name} {col_def}"
                 )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS container_registries ("
+            "id TEXT PRIMARY KEY, "
+            "name TEXT NOT NULL, "
+            "url TEXT NOT NULL, "
+            "username TEXT DEFAULT '', "
+            "encrypted_token TEXT DEFAULT '', "
+            "is_default INTEGER DEFAULT 0, "
+            "status TEXT DEFAULT 'unverified', "
+            "last_tested_at REAL DEFAULT 0, "
+            "last_error TEXT DEFAULT '', "
+            "created_at REAL NOT NULL, "
+            "updated_at REAL NOT NULL)"
+        )
         conn.commit()
 
         cron_table_exists = conn.execute(
@@ -7963,6 +7994,550 @@ create_docker_container_exec = docker_manager.create_container_exec
 resize_docker_container_exec = docker_manager.resize_container_exec
 start_docker_container_exec_socket = docker_manager.start_container_exec_socket
 _clean_docker_error = DockerManager._clean_docker_error
+
+
+# ============================================================================
+# Secret Encryption & Container Registry Persistence
+# ============================================================================
+
+_REGISTRY_SECRET_SALT = b"vigil-container-registry-aes256-v1"
+_SECRET_ENCRYPTION_PREFIX = "enc:v1:"
+
+
+def _derive_registry_master_key() -> bytes:
+    """Derive a 256-bit application master key from AUTH_SECRET_KEY via PBKDF2-SHA256."""
+    secret_src = str(AUTH_SECRET_KEY or "systemalerts-diagnostic-sec-token-ok")
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        secret_src.encode("utf-8"),
+        _REGISTRY_SECRET_SALT,
+        100_000,
+        dklen=32,
+    )
+
+
+def _derive_record_keys(master_key: bytes, salt: bytes) -> tuple[bytes, bytes]:
+    """Derive independent AES-256 encryption and HMAC-SHA256 authentication keys."""
+    enc_key = hmac.new(master_key, b"enc:" + salt, hashlib.sha256).digest()
+    mac_key = hmac.new(master_key, b"mac:" + salt, hashlib.sha256).digest()
+    return enc_key, mac_key
+
+
+def encrypt_secret(plaintext: str) -> str:
+    """Encrypt a plaintext secret with AES-256-CBC + HMAC-SHA256 and return base64 payload."""
+    if not plaintext:
+        return ""
+    pt_bytes = str(plaintext).encode("utf-8")
+    salt = secrets.token_bytes(16)
+    iv = secrets.token_bytes(16)
+    master_key = _derive_registry_master_key()
+    enc_key, mac_key = _derive_record_keys(master_key, salt)
+
+    proc = subprocess.run(
+        ["openssl", "enc", "-aes-256-cbc", "-e", "-K", enc_key.hex(), "-iv", iv.hex()],
+        input=pt_bytes,
+        capture_output=True,
+        check=True,
+    )
+    ct_bytes = proc.stdout
+    mac = hmac.new(mac_key, b"v1:" + salt + iv + ct_bytes, hashlib.sha256).digest()
+    encoded = base64.urlsafe_b64encode(salt + iv + mac + ct_bytes).decode("ascii")
+    return f"{_SECRET_ENCRYPTION_PREFIX}{encoded}"
+
+
+def decrypt_secret(ciphertext: str) -> str:
+    """Decrypt an AES-256-CBC + HMAC-SHA256 payload; return '' on empty or invalid input."""
+    if not ciphertext or not isinstance(ciphertext, str):
+        return ""
+    if not ciphertext.startswith(_SECRET_ENCRYPTION_PREFIX):
+        return ""
+
+    payload_b64 = ciphertext[len(_SECRET_ENCRYPTION_PREFIX) :]
+    try:
+        raw = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    except (ValueError, binascii.Error, UnicodeEncodeError):
+        logging.warning("Failed to base64-decode encrypted secret payload.")
+        return ""
+
+    # Minimum valid length: 16B salt + 16B IV + 32B HMAC + 16B AES block = 80 bytes
+    if len(raw) < 80:
+        logging.warning("Encrypted secret payload is truncated or malformed.")
+        return ""
+
+    salt = raw[:16]
+    iv = raw[16:32]
+    mac = raw[32:64]
+    ct_bytes = raw[64:]
+
+    master_key = _derive_registry_master_key()
+    enc_key, mac_key = _derive_record_keys(master_key, salt)
+    expected_mac = hmac.new(
+        mac_key, b"v1:" + salt + iv + ct_bytes, hashlib.sha256
+    ).digest()
+    if not hmac.compare_digest(mac, expected_mac):
+        logging.warning("Encrypted secret MAC verification failed.")
+        return ""
+
+    try:
+        proc = subprocess.run(
+            [
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-d",
+                "-K",
+                enc_key.hex(),
+                "-iv",
+                iv.hex(),
+            ],
+            input=ct_bytes,
+            capture_output=True,
+        )
+    except OSError as exc:
+        logging.warning(f"OpenSSL decryption subprocess error: {exc}")
+        return ""
+
+    if proc.returncode != 0:
+        logging.warning("OpenSSL decryption failed with non-zero exit status.")
+        return ""
+
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        logging.warning("Decrypted secret is not valid UTF-8.")
+        return ""
+
+
+def _mask_secret_token(raw_token: str) -> str:
+    if not raw_token:
+        return ""
+    if len(raw_token) > 4:
+        return f"••••{raw_token[-4:]}"
+    return "••••"
+
+
+def _normalize_registry_url(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    if not url:
+        raise ValueError("Registry URL is required.")
+    if any(ch.isspace() for ch in url):
+        raise ValueError("Registry URL must not contain whitespace.")
+    if not url.startswith(("http://", "https://")):
+        if "://" in url:
+            raise ValueError("Registry URL must use http:// or https://.")
+        url = f"https://{url}"
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("Invalid registry URL.")
+    return url.rstrip("/")
+
+
+def _resolve_registry_v2_endpoint(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in ("docker.io", "index.docker.io"):
+        return "https://registry-1.docker.io/v2/"
+    return f"{url.rstrip('/')}/v2/"
+
+
+def _format_registry_row(
+    row: sqlite3.Row, include_decrypted_token: bool = False
+) -> dict[str, Any]:
+    encrypted_token = row["encrypted_token"] or ""
+    decrypted = decrypt_secret(encrypted_token) if encrypted_token else ""
+    token_configured = bool(decrypted) or bool(encrypted_token)
+    if decrypted:
+        token_masked = _mask_secret_token(decrypted)
+    elif encrypted_token:
+        token_masked = "••••"
+    else:
+        token_masked = ""
+
+    result: dict[str, Any] = {
+        "id": row["id"],
+        "name": row["name"],
+        "url": row["url"],
+        "username": row["username"] or "",
+        "token_masked": token_masked,
+        "token_configured": token_configured,
+        "is_default": bool(row["is_default"]),
+        "status": row["status"] or "unverified",
+        "last_tested_at": float(row["last_tested_at"] or 0.0),
+        "last_error": row["last_error"] or "",
+        "created_at": float(row["created_at"]),
+        "updated_at": float(row["updated_at"]),
+    }
+    if include_decrypted_token:
+        result["token"] = decrypted
+    return result
+
+
+def list_container_registries() -> list[dict[str, Any]]:
+    """Return all configured container registries with masked credentials."""
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, name, url, username, encrypted_token, is_default,
+                   status, last_tested_at, last_error, created_at, updated_at
+            FROM container_registries
+            ORDER BY is_default DESC, created_at ASC
+            """
+        ).fetchall()
+        return [_format_registry_row(r, include_decrypted_token=False) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_container_registry(
+    registry_id: str, include_decrypted_token: bool = False
+) -> Optional[dict[str, Any]]:
+    """Fetch a single container registry by ID, optionally including its decrypted token."""
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT id, name, url, username, encrypted_token, is_default,
+                   status, last_tested_at, last_error, created_at, updated_at
+            FROM container_registries
+            WHERE id = ?
+            """,
+            (registry_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return _format_registry_row(
+            row, include_decrypted_token=include_decrypted_token
+        )
+    finally:
+        conn.close()
+
+
+def create_container_registry(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate and persist a new container registry with encrypted credentials."""
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("Registry name is required.")
+
+    url = _normalize_registry_url(str(data.get("url") or ""))
+    username = str(data.get("username") or "").strip()
+    raw_token = str(data.get("token") or "").strip()
+    encrypted_token = encrypt_secret(raw_token) if raw_token else ""
+    is_default = 1 if data.get("is_default") else 0
+
+    registry_id = str(uuid.uuid4())
+    now = time.time()
+
+    conn = _connect_state_db()
+    try:
+        if is_default:
+            conn.execute("UPDATE container_registries SET is_default = 0")
+        conn.execute(
+            """
+            INSERT INTO container_registries (
+                id, name, url, username, encrypted_token, is_default,
+                status, last_tested_at, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'unverified', 0.0, '', ?, ?)
+            """,
+            (
+                registry_id,
+                name,
+                url,
+                username,
+                encrypted_token,
+                is_default,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    created = get_container_registry(registry_id, include_decrypted_token=False)
+    if not created:
+        raise RuntimeError("Failed to retrieve newly created container registry.")
+    return created
+
+
+def update_container_registry(registry_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Update a container registry, re-encrypting or preserving credentials as appropriate."""
+    conn = _connect_state_db()
+    conn.row_factory = sqlite3.Row
+    try:
+        existing = conn.execute(
+            """
+            SELECT id, name, url, username, encrypted_token, is_default,
+                   status, last_tested_at, last_error, created_at, updated_at
+            FROM container_registries
+            WHERE id = ?
+            """,
+            (registry_id,),
+        ).fetchone()
+        if not existing:
+            raise KeyError(f"Container registry '{registry_id}' not found.")
+
+        new_name = existing["name"]
+        if "name" in data and data["name"] is not None:
+            candidate_name = str(data["name"]).strip()
+            if not candidate_name:
+                raise ValueError("Registry name is required.")
+            new_name = candidate_name
+
+        new_url = existing["url"]
+        url_changed = False
+        if "url" in data and data["url"] is not None:
+            candidate_url = _normalize_registry_url(str(data["url"]))
+            url_changed = candidate_url != new_url
+            new_url = candidate_url
+
+        new_username = existing["username"] or ""
+        username_changed = False
+        if "username" in data and data["username"] is not None:
+            candidate_user = str(data["username"]).strip()
+            username_changed = candidate_user != new_username
+            new_username = candidate_user
+
+        new_encrypted_token = existing["encrypted_token"] or ""
+        token_changed = False
+        if "token" in data and data["token"] is not None:
+            candidate_token = str(data["token"]).strip()
+            if candidate_token == "********":
+                pass
+            elif candidate_token == "":
+                token_changed = bool(new_encrypted_token)
+                new_encrypted_token = ""
+            else:
+                new_encrypted_token = encrypt_secret(candidate_token)
+                token_changed = True
+
+        new_is_default = int(existing["is_default"] or 0)
+        if "is_default" in data and data["is_default"] is not None:
+            new_is_default = 1 if data["is_default"] else 0
+
+        new_status = existing["status"] or "unverified"
+        new_last_tested_at = float(existing["last_tested_at"] or 0.0)
+        new_last_error = existing["last_error"] or ""
+        if url_changed or username_changed or token_changed:
+            new_status = "unverified"
+            new_last_tested_at = 0.0
+            new_last_error = ""
+
+        now = time.time()
+        if new_is_default:
+            conn.execute(
+                "UPDATE container_registries SET is_default = 0 WHERE id != ?",
+                (registry_id,),
+            )
+
+        conn.execute(
+            """
+            UPDATE container_registries
+            SET name = ?, url = ?, username = ?, encrypted_token = ?,
+                is_default = ?, status = ?, last_tested_at = ?, last_error = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                new_name,
+                new_url,
+                new_username,
+                new_encrypted_token,
+                new_is_default,
+                new_status,
+                new_last_tested_at,
+                new_last_error,
+                now,
+                registry_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    updated = get_container_registry(registry_id, include_decrypted_token=False)
+    if not updated:
+        raise KeyError(f"Container registry '{registry_id}' not found.")
+    return updated
+
+
+def delete_container_registry(registry_id: str) -> bool:
+    """Delete a container registry by ID. Returns True if a row was deleted."""
+    conn = _connect_state_db()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM container_registries WHERE id = ?",
+            (registry_id,),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+async def test_container_registry_connection(
+    registry_id: str = "",
+    url: str = "",
+    username: str = "",
+    token: str = "",
+) -> dict[str, Any]:
+    """Test connectivity and authentication against a registry /v2/ endpoint."""
+    target_url = str(url or "").strip()
+    target_username = str(username or "").strip()
+    target_token = str(token or "").strip()
+
+    if registry_id:
+        reg = get_container_registry(registry_id, include_decrypted_token=True)
+        if not reg:
+            return {
+                "success": False,
+                "status": "error",
+                "message": "Registry not found",
+                "status_code": None,
+            }
+        if not target_url:
+            target_url = reg["url"]
+        if not target_username:
+            target_username = reg["username"]
+        if not target_token or target_token == "********":
+            target_token = reg.get("token", "")
+
+    def _persist_test_outcome(status_val: str, error_msg: str) -> None:
+        if not registry_id:
+            return
+        now_ts = time.time()
+        conn = _connect_state_db()
+        try:
+            conn.execute(
+                """
+                UPDATE container_registries
+                SET status = ?, last_tested_at = ?, last_error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status_val, now_ts, error_msg, now_ts, registry_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    try:
+        normalized_url = _normalize_registry_url(target_url)
+    except ValueError as exc:
+        msg = str(exc)
+        _persist_test_outcome("error", msg)
+        return {
+            "success": False,
+            "status": "error",
+            "message": msg,
+            "status_code": None,
+        }
+
+    v2_url = _resolve_registry_v2_endpoint(normalized_url)
+    req_headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": "Vigil-Registry-Check/1.0",
+    }
+    basic_auth_header = ""
+    if target_token:
+        creds = f"{target_username or 'oauth2'}:{target_token}".encode("utf-8")
+        basic_auth_header = f"Basic {base64.b64encode(creds).decode('ascii')}"
+        req_headers["Authorization"] = basic_auth_header
+
+    success = False
+    status_str = "error"
+    message = ""
+    status_code: Optional[int] = None
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                v2_url, headers=req_headers, allow_redirects=True
+            ) as resp:
+                status_code = resp.status
+                www_auth = resp.headers.get("WWW-Authenticate", "") if resp.headers else ""
+
+                if (
+                    status_code == 401
+                    and target_token
+                    and isinstance(www_auth, str)
+                    and www_auth.lower().startswith("bearer ")
+                ):
+                    challenge = dict(re.findall(r'(\w+)="([^"]*)"', www_auth))
+                    realm = challenge.get("realm", "")
+                    if realm.startswith(("http://", "https://")):
+                        token_params: dict[str, str] = {}
+                        if challenge.get("service"):
+                            token_params["service"] = challenge["service"]
+                        if challenge.get("scope"):
+                            token_params["scope"] = challenge["scope"]
+                        token_headers = {
+                            "Accept": "application/json",
+                            "Authorization": basic_auth_header,
+                        }
+                        async with session.get(
+                            realm,
+                            params=token_params,
+                            headers=token_headers,
+                            allow_redirects=True,
+                        ) as tok_resp:
+                            if tok_resp.status == 200:
+                                tok_data = await tok_resp.json(content_type=None)
+                                bearer = (
+                                    tok_data.get("token")
+                                    or tok_data.get("access_token")
+                                    or ""
+                                )
+                                if bearer:
+                                    retry_headers = {
+                                        "Accept": "application/json",
+                                        "User-Agent": "Vigil-Registry-Check/1.0",
+                                        "Authorization": f"Bearer {bearer}",
+                                    }
+                                    async with session.get(
+                                        v2_url,
+                                        headers=retry_headers,
+                                        allow_redirects=True,
+                                    ) as retry_resp:
+                                        status_code = retry_resp.status
+
+        if status_code is not None and 200 <= status_code < 300:
+            success = True
+            status_str = "verified"
+            message = f"Connection verified (HTTP {status_code})"
+        elif status_code in (401, 403):
+            success = False
+            status_str = "error"
+            message = (
+                f"Authentication failed (HTTP {status_code})"
+                if target_token
+                else f"Registry requires authentication (HTTP {status_code})"
+            )
+        else:
+            success = False
+            status_str = "error"
+            message = f"Registry returned HTTP {status_code}"
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        success = False
+        status_str = "error"
+        status_code = None
+        message = f"Connection failed: {exc or type(exc).__name__}"
+    except Exception as exc:
+        success = False
+        status_str = "error"
+        status_code = None
+        message = f"Connection error: {exc or type(exc).__name__}"
+
+    _persist_test_outcome(status_str, "" if success else message)
+    return {
+        "success": success,
+        "status": status_str,
+        "message": message,
+        "status_code": status_code,
+    }
 
 # ============================================================================
 # System Services & Process Monitoring Helpers

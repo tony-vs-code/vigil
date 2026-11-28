@@ -663,6 +663,29 @@ class UpdateScheduleRequest(BaseModel):
     notify_discord: Optional[bool] = True
 
 
+class ContainerRegistryCreateRequest(BaseModel):
+    name: str
+    url: str
+    username: Optional[str] = ""
+    token: Optional[str] = ""
+    is_default: Optional[bool] = False
+
+
+class ContainerRegistryUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    url: Optional[str] = None
+    username: Optional[str] = None
+    token: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class ContainerRegistryTestRequest(BaseModel):
+    registry_id: Optional[str] = ""
+    url: Optional[str] = ""
+    username: Optional[str] = ""
+    token: Optional[str] = ""
+
+
 class NotificationCenterUpdateRequest(BaseModel):
     channels: Optional[dict[str, Any]] = None
     schedule: Optional[dict[str, Any]] = None
@@ -2501,6 +2524,204 @@ def api_docker_set_update_schedule(
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/docker/registries")
+def api_docker_list_registries(
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    registries = main.list_container_registries()
+    return {"registries": registries}
+
+
+@app.post("/api/docker/registries", status_code=201)
+def api_docker_create_registry(
+    payload: ContainerRegistryCreateRequest,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    try:
+        registry = main.create_container_registry(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    main.record_audit_event(
+        "docker.registry.create",
+        f"Added container registry '{registry['name']}' ({registry['url']})",
+        actor=_user,
+        ip_address=_get_client_ip(request),
+        severity="info",
+        metadata={
+            "registry_id": registry["id"],
+            "name": registry["name"],
+            "url": registry["url"],
+            "token_configured": registry["token_configured"],
+        },
+    )
+    return {"success": True, "registry": registry}
+
+
+@app.post("/api/docker/registries/test")
+async def api_docker_test_registry_ad_hoc(
+    payload: ContainerRegistryTestRequest,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    registry_id = (payload.registry_id or "").strip()
+    url = (payload.url or "").strip()
+    target_label = url
+
+    if registry_id:
+        existing = main.get_container_registry(registry_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Container registry not found")
+        target_label = url or existing["url"]
+    elif not url:
+        raise HTTPException(
+            status_code=400,
+            detail="Either registry_id or url must be provided.",
+        )
+
+    if url:
+        try:
+            main._normalize_registry_url(url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result = await main.test_container_registry_connection(
+        registry_id=registry_id,
+        url=url,
+        username=payload.username or "",
+        token=payload.token or "",
+    )
+    main.record_audit_event(
+        "docker.registry.test",
+        f"Tested container registry '{target_label}': {result.get('status')} ({result.get('message')})",
+        actor=_user,
+        ip_address=_get_client_ip(request),
+        severity="info" if result.get("success") else "warning",
+        metadata={
+            "registry_id": registry_id or None,
+            "url": target_label,
+            "success": result.get("success"),
+            "status": result.get("status"),
+            "status_code": result.get("status_code"),
+        },
+    )
+    response = dict(result)
+    if registry_id:
+        updated = main.get_container_registry(registry_id)
+        if updated:
+            response["registry"] = updated
+    return response
+
+
+@app.get("/api/docker/registries/{registry_id}")
+def api_docker_get_registry(
+    registry_id: str,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    registry = main.get_container_registry(registry_id, include_decrypted_token=False)
+    if not registry:
+        raise HTTPException(status_code=404, detail="Container registry not found")
+    return {"registry": registry}
+
+
+@app.put("/api/docker/registries/{registry_id}")
+def api_docker_update_registry(
+    registry_id: str,
+    payload: ContainerRegistryUpdateRequest,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    updates = payload.model_dump(exclude_unset=True)
+    try:
+        updated = main.update_container_registry(registry_id, updates)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    main.record_audit_event(
+        "docker.registry.update",
+        f"Updated container registry '{updated['name']}' ({updated['url']})",
+        actor=_user,
+        ip_address=_get_client_ip(request),
+        severity="info",
+        metadata={
+            "registry_id": registry_id,
+            "updated_fields": sorted(updates.keys()),
+        },
+    )
+    return {"success": True, "registry": updated}
+
+
+@app.delete("/api/docker/registries/{registry_id}")
+def api_docker_delete_registry(
+    registry_id: str,
+    request: Request,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    existing = main.get_container_registry(registry_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Container registry not found")
+
+    deleted = main.delete_container_registry(registry_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Container registry not found")
+
+    main.record_audit_event(
+        "docker.registry.delete",
+        f"Deleted container registry '{existing['name']}' ({existing['url']})",
+        actor=_user,
+        ip_address=_get_client_ip(request),
+        severity="info",
+        metadata={
+            "registry_id": registry_id,
+            "name": existing["name"],
+            "url": existing["url"],
+        },
+    )
+    return {"success": True, "deleted": registry_id}
+
+
+@app.post("/api/docker/registries/{registry_id}/test")
+async def api_docker_test_registry_by_id(
+    registry_id: str,
+    request: Request,
+    payload: Optional[ContainerRegistryTestRequest] = None,
+    _user: str = Depends(require_auth),
+) -> dict[str, Any]:
+    existing = main.get_container_registry(registry_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Container registry not found")
+
+    result = await main.test_container_registry_connection(
+        registry_id=registry_id,
+        url=(payload.url or "") if payload else "",
+        username=(payload.username or "") if payload else "",
+        token=(payload.token or "") if payload else "",
+    )
+    main.record_audit_event(
+        "docker.registry.test",
+        f"Tested container registry '{existing['name']}': {result.get('status')} ({result.get('message')})",
+        actor=_user,
+        ip_address=_get_client_ip(request),
+        severity="info" if result.get("success") else "warning",
+        metadata={
+            "registry_id": registry_id,
+            "name": existing["name"],
+            "url": existing["url"],
+            "success": result.get("success"),
+            "status": result.get("status"),
+            "status_code": result.get("status_code"),
+        },
+    )
+    updated = main.get_container_registry(registry_id)
+    response = dict(result)
+    if updated:
+        response["registry"] = updated
+    return response
 
 
 # ============================================================================

@@ -2,6 +2,17 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.1.0] - 2026-11-28
+### Added
+- **Container Registries & Source Repositories Sub-View**: Added `#subtab-docker-registries` and `#subview-docker-registries` under the Containers workspace with `#containers/registries` hash routing, live count badge (`#subtab-badge-registries`), empty state (`#registries-empty-state`), and status-badged table (`#docker-registries-table`).
+- **Registry Modal & Provider Presets**: Added `#modal-registry` with one-click presets for **Docker Hub**, **GitHub GHCR**, and **Quay.io**, custom URL support (Harbor/self-hosted), show/hide token toggle (`#btn-toggle-registry-token`), default-registry flag, and in-modal test feedback.
+- **AES-256-CBC + HMAC-SHA256 Credential Encryption**: Added `encrypt_secret`, `decrypt_secret`, and PBKDF2-SHA256 key derivation from `AUTH_SECRET_KEY` in `main.py` to encrypt registry tokens at rest in the SQLite `container_registries` table with masked API previews (`token_masked`).
+- **Registry CRUD & `/v2/` Connection Testing APIs**: Added authenticated `/api/docker/registries` (`GET`, `POST`), `/api/docker/registries/{registry_id}` (`GET`, `PUT`, `DELETE`), `/api/docker/registries/test` (`POST`), and `/api/docker/registries/{registry_id}/test` (`POST`) endpoints supporting Docker v2 Basic and Bearer `WWW-Authenticate` challenge verification plus audit logging.
+- **Registry Test Suite**: Added `test_container_registries.py` verifying encryption/tamper resistance, persistence, API auth/masking, `/v2/` test flows, DOM contracts, and Node VM subtab/modal behavior.
+
+### Changed
+- **Full Backward Compatibility**: Maintained 100% contract compliance across all 67 frontend API route calls and 745 DOM element IDs with 454/454 tests passing.
+
 ## [1.0.50] - 2026-11-25
 ### Added
 - **Collapsible Sidebar Sub-Menus**: Consolidated in-page horizontal tab bars for **Containers**, **Packages**, **Users & Groups**, and **Audit Log** into collapsible sidebar sub-menus (`#sidebar-submenu-containers`, `#sidebar-submenu-packages`, `#sidebar-submenu-users`, `#sidebar-submenu-audit`) with badge pills, chevron indicators, collapsed-sidebar handling, and mobile drawer navigation.

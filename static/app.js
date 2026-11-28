@@ -339,8 +339,14 @@ let isFetchingDockerImages = false;
 let isFetchingDockerVolumes = false;
 let isFetchingDockerNetworks = false;
 let isFetchingDockerUpdates = false;
+let isFetchingContainerRegistries = false;
 let isFetchingContainerLogs = false;
 let isFetchingUpdateSchedule = false;
+
+let containerRegistries = [];
+let editingRegistryId = null;
+let editingRegistryTokenConfigured = false;
+const testingRegistryIds = new Set();
 
 let lastDockerSubtabFetchTime = 0;
 let dockerSubtabThrottleTimer = null;
@@ -5372,8 +5378,9 @@ function onAuthenticatedSuccess(username) {
   fetchNotificationCenterConfig();
   checkForUpdates({ silent: true });
   fetchDockerUpdatesConfig();
-  // Preload container updates, package updates, and installed packages in background
+  // Preload container updates, container registries, package updates, and installed packages in background
   fetchDockerUpdates({ background: true });
+  fetchContainerRegistries();
   fetchPackageUpdates();
   fetchInstalledPackages("", 1);
   fetchSystemUsers();
@@ -7345,6 +7352,9 @@ function switchViewTab(tabName, updateHashOrOptions = true, options = {}) {
       if (!cachedDockerUpdates || cachedDockerUpdates.length === 0) {
         fetchDockerUpdates({ background: true });
       }
+      if (currentDockerSubtab !== "registries") {
+        fetchContainerRegistries();
+      }
     }
   } else if (isRaid) {
     raidTab?.classList.add("active");
@@ -8724,10 +8734,10 @@ function renderAuditLogs(data) {
 }
 
 /**
- * Switch Docker sub-tabs ('stacks', 'containers', 'images', 'volumes', 'networks', 'updates')
+ * Switch Docker sub-tabs ('stacks', 'containers', 'images', 'volumes', 'networks', 'updates', 'registries')
  */
 function switchDockerSubtab(subtabName, updateHash = true) {
-  const validSubtabs = ["stacks", "containers", "images", "volumes", "networks", "updates"];
+  const validSubtabs = ["stacks", "containers", "images", "volumes", "networks", "updates", "registries"];
   if (!validSubtabs.includes(subtabName)) {
     subtabName = "stacks";
   }
@@ -8779,6 +8789,8 @@ function isDockerSubtabInFlight(subtabName = currentDockerSubtab) {
       return isFetchingDockerNetworks;
     case "updates":
       return isFetchingDockerUpdates;
+    case "registries":
+      return isFetchingContainerRegistries;
     default:
       return false;
   }
@@ -8840,6 +8852,9 @@ function refreshDockerSubtab(subtabName) {
       } else {
         renderDockerUpdates(cachedDockerUpdates);
       }
+      break;
+    case "registries":
+      fetchContainerRegistries();
       break;
   }
 }
@@ -13442,6 +13457,482 @@ async function handleSaveUpdateSchedule() {
 }
 
 /* =========================================================================
+ * Container Registries & Source Repositories (#subview-docker-registries)
+ * ========================================================================= */
+const REGISTRY_PRESETS = {
+  dockerhub: { name: "Docker Hub", url: "https://registry-1.docker.io" },
+  ghcr: { name: "GitHub GHCR", url: "https://ghcr.io" },
+  quay: { name: "Quay.io", url: "https://quay.io" },
+};
+
+function updateRegistriesSubtabBadge() {
+  const badge = document.getElementById("subtab-badge-registries");
+  if (badge) {
+    badge.textContent = String(containerRegistries.length);
+  }
+}
+
+function setRegistryAlertBox(el, message, type = "info") {
+  if (!el) return;
+  if (!message) {
+    el.className = "auth-alert hidden";
+    el.textContent = "";
+    return;
+  }
+  const typeClass = type === "success" ? "feedback-success" : "feedback-error";
+  el.className = `auth-alert ${typeClass}`;
+  el.textContent = message;
+  el.classList.remove("hidden");
+}
+
+function formatRegistryStatusBadge(reg) {
+  const status = String(reg.status || "unverified").toLowerCase();
+  if (status === "verified") {
+    return `<span class="status-badge status-verified"><span class="status-dot"></span> Verified</span>`;
+  }
+  if (status === "error") {
+    const errDetail = reg.last_error ? escapeHtml(reg.last_error) : "Connection check failed";
+    return `<span class="status-badge status-error" title="${errDetail}"><span class="status-dot"></span> Error</span>`;
+  }
+  return `<span class="status-badge status-unverified"><span class="status-dot"></span> Unverified</span>`;
+}
+
+function renderContainerRegistries() {
+  const emptyState = document.getElementById("registries-empty-state");
+  const tableContainer = document.getElementById("registries-table-container");
+  const tbody = document.getElementById("docker-registries-tbody");
+  updateRegistriesSubtabBadge();
+
+  if (!tbody) return;
+
+  if (!Array.isArray(containerRegistries) || containerRegistries.length === 0) {
+    emptyState?.classList.remove("hidden");
+    tableContainer?.classList.add("hidden");
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-state">No registries configured.</td></tr>`;
+    return;
+  }
+
+  emptyState?.classList.add("hidden");
+  tableContainer?.classList.remove("hidden");
+
+  tbody.innerHTML = containerRegistries
+    .map((reg) => {
+      const safeId = escapeHtml(reg.id || "");
+      const safeName = escapeHtml(reg.name || "Unnamed Registry");
+      const safeUrl = escapeHtml(reg.url || "-");
+      const safeUser = reg.username ? escapeHtml(reg.username) : `<span class="text-muted">Anonymous</span>`;
+      const isDefault = Boolean(reg.is_default);
+      const tokenConfigured = Boolean(reg.token_configured);
+      const tokenMasked = escapeHtml(reg.token_masked || "••••••••");
+      const credHtml = tokenConfigured
+        ? `<div class="registry-cred-cell"><span class="status-badge status-info">Configured</span><code class="mono-text registry-token-mask">${tokenMasked}</code></div>`
+        : `<span class="status-badge status-muted">None</span>`;
+      const statusHtml = formatRegistryStatusBadge(reg);
+      const lastTestedTs = Number(reg.last_tested_at) || 0;
+      const lastTestedText = lastTestedTs > 0 ? escapeHtml(formatRelativeTime(lastTestedTs)) : "Never";
+      const lastTestedTitle = lastTestedTs > 0 ? escapeHtml(formatDateTime(lastTestedTs)) : "Not tested yet";
+      const errSnippet =
+        String(reg.status || "").toLowerCase() === "error" && reg.last_error
+          ? `<div class="registry-error-snippet" title="${escapeHtml(reg.last_error)}">${escapeHtml(reg.last_error)}</div>`
+          : "";
+      const isTesting = testingRegistryIds.has(reg.id);
+
+      return `<tr data-registry-id="${safeId}">
+        <td>
+          <div class="registry-name-cell">
+            <strong>${safeName}</strong>
+            ${isDefault ? `<span class="registry-default-pill">Default</span>` : ""}
+          </div>
+        </td>
+        <td><span class="mono-text registry-url-text" title="${safeUrl}">${safeUrl}</span></td>
+        <td>${safeUser}</td>
+        <td>${credHtml}</td>
+        <td>${statusHtml}${errSnippet}</td>
+        <td><span class="text-secondary" title="${lastTestedTitle}">${lastTestedText}</span></td>
+        <td class="actions-col">
+          <div class="btn-action-group">
+            <button
+              type="button"
+              class="btn-action btn-action-success"
+              data-reg-test="${safeId}"
+              ${isTesting ? "disabled" : ""}
+              title="Test connection to ${safeName}"
+            >
+              ${isTesting ? `<span class="spinner"></span> Testing...` : "Test"}
+            </button>
+            <button
+              type="button"
+              class="btn-action"
+              data-reg-edit="${safeId}"
+              title="Edit ${safeName}"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              class="btn-action btn-action-danger"
+              data-reg-delete="${safeId}"
+              data-reg-name="${safeName}"
+              title="Delete ${safeName}"
+            >
+              Delete
+            </button>
+          </div>
+        </td>
+      </tr>`;
+    })
+    .join("");
+
+  tbody.querySelectorAll("button[data-reg-test]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-reg-test");
+      if (id) handleTestRegistryRow(id);
+    });
+  });
+
+  tbody.querySelectorAll("button[data-reg-edit]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-reg-edit");
+      const target = containerRegistries.find((r) => r.id === id);
+      if (target) openRegistryModal(target);
+    });
+  });
+
+  tbody.querySelectorAll("button[data-reg-delete]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-reg-delete");
+      const name = btn.getAttribute("data-reg-name") || "this registry";
+      if (id) handleDeleteRegistry(id, name);
+    });
+  });
+}
+
+async function fetchContainerRegistries() {
+  if (isFetchingContainerRegistries) return;
+  isFetchingContainerRegistries = true;
+
+  try {
+    const resp = await apiFetch("/api/docker/registries");
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}));
+      throw new Error(errData.detail || `HTTP ${resp.status}`);
+    }
+    const data = await resp.json();
+    containerRegistries = Array.isArray(data.registries) ? data.registries : [];
+    renderContainerRegistries();
+  } catch (err) {
+    console.warn("Failed to fetch container registries:", err);
+    const feedback = document.getElementById("docker-registries-feedback");
+    setRegistryAlertBox(feedback, `Failed to load registries: ${err.message || String(err)}`, "error");
+  } finally {
+    isFetchingContainerRegistries = false;
+  }
+}
+
+function openRegistryModal(registry = null) {
+  const modal = document.getElementById("modal-registry");
+  const titleEl = document.getElementById("registry-modal-title");
+  const subtitleEl = document.getElementById("registry-modal-subtitle");
+  const nameInput = document.getElementById("registry-form-name");
+  const urlInput = document.getElementById("registry-form-url");
+  const userInput = document.getElementById("registry-form-username");
+  const tokenInput = document.getElementById("registry-form-token");
+  const tokenHint = document.getElementById("registry-token-hint");
+  const toggleBtn = document.getElementById("btn-toggle-registry-token");
+  const defaultCb = document.getElementById("registry-form-is-default");
+  const saveBtn = document.getElementById("btn-save-registry");
+  const feedbackEl = document.getElementById("registry-form-test-feedback");
+
+  if (!modal) return;
+
+  setRegistryAlertBox(feedbackEl, "");
+
+  if (tokenInput) {
+    tokenInput.type = "password";
+    tokenInput.value = "";
+  }
+  if (toggleBtn) {
+    updateEyeIcon(toggleBtn, true);
+  }
+
+  if (registry && registry.id) {
+    editingRegistryId = registry.id;
+    editingRegistryTokenConfigured = Boolean(registry.token_configured);
+    if (titleEl) titleEl.textContent = "Edit Container Registry";
+    if (subtitleEl) subtitleEl.textContent = `Update credentials and connection settings for ${registry.name || "registry"}`;
+    if (saveBtn) saveBtn.textContent = "Save Changes";
+    if (nameInput) nameInput.value = registry.name || "";
+    if (urlInput) urlInput.value = registry.url || "";
+    if (userInput) userInput.value = registry.username || "";
+    if (defaultCb) defaultCb.checked = Boolean(registry.is_default);
+    if (tokenInput) {
+      tokenInput.placeholder = editingRegistryTokenConfigured
+        ? "••••••••"
+        : "Enter PAT or registry secret";
+    }
+    if (tokenHint) {
+      tokenHint.textContent = editingRegistryTokenConfigured
+        ? "Existing encrypted token is preserved if left blank. Enter a new token to replace it."
+        : "Encrypted at rest using Vigil's secret store. Leave blank for anonymous registries.";
+    }
+  } else {
+    editingRegistryId = null;
+    editingRegistryTokenConfigured = false;
+    if (titleEl) titleEl.textContent = "Add Container Registry";
+    if (subtitleEl) subtitleEl.textContent = "Store encrypted registry credentials for private pulls and update scans";
+    if (saveBtn) saveBtn.textContent = "Save Registry";
+    if (nameInput) nameInput.value = "";
+    if (urlInput) urlInput.value = "";
+    if (userInput) userInput.value = "";
+    if (defaultCb) defaultCb.checked = false;
+    if (tokenInput) tokenInput.placeholder = "Enter PAT or registry secret";
+    if (tokenHint) {
+      tokenHint.textContent = "Encrypted at rest using Vigil's secret store. Leave blank for anonymous registries.";
+    }
+  }
+
+  modal.classList.remove("hidden");
+  nameInput?.focus();
+}
+
+function closeRegistryModal() {
+  const modal = document.getElementById("modal-registry");
+  modal?.classList.add("hidden");
+  editingRegistryId = null;
+  editingRegistryTokenConfigured = false;
+}
+
+function applyRegistryPreset(presetKey) {
+  const preset = REGISTRY_PRESETS[presetKey];
+  if (!preset) return;
+  const nameInput = document.getElementById("registry-form-name");
+  const urlInput = document.getElementById("registry-form-url");
+  if (urlInput) {
+    urlInput.value = preset.url;
+  }
+  if (nameInput) {
+    const current = nameInput.value.trim();
+    const isPresetName = Object.values(REGISTRY_PRESETS).some((p) => p.name === current);
+    if (!current || isPresetName) {
+      nameInput.value = preset.name;
+    }
+  }
+}
+
+async function handleTestRegistryForm() {
+  const urlInput = document.getElementById("registry-form-url");
+  const userInput = document.getElementById("registry-form-username");
+  const tokenInput = document.getElementById("registry-form-token");
+  const testBtn = document.getElementById("btn-test-registry-form");
+  const feedbackEl = document.getElementById("registry-form-test-feedback");
+
+  const url = (urlInput?.value || "").trim();
+  const username = (userInput?.value || "").trim();
+  const rawToken = (tokenInput?.value || "").trim();
+
+  if (!url) {
+    setRegistryAlertBox(feedbackEl, "Please enter a Registry URL before testing.", "error");
+    urlInput?.focus();
+    return;
+  }
+
+  const originalHtml = testBtn ? testBtn.innerHTML : "Test Connection";
+  if (testBtn) {
+    testBtn.disabled = true;
+    testBtn.innerHTML = `<span class="spinner"></span> Testing...`;
+  }
+  setRegistryAlertBox(feedbackEl, "");
+
+  try {
+    const payload = {
+      url,
+      username,
+      token: editingRegistryId && !rawToken && editingRegistryTokenConfigured ? "********" : rawToken,
+      registry_id: editingRegistryId || "",
+    };
+    const resp = await apiFetch("/api/docker/registries/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `Test failed with HTTP ${resp.status}`);
+    }
+
+    const msg = data.message || (data.success ? "Connection verified" : "Connection check failed");
+    if (data.success) {
+      setRegistryAlertBox(feedbackEl, msg, "success");
+      showToast({ title: "Registry Verified", message: msg, type: "success" });
+    } else {
+      setRegistryAlertBox(feedbackEl, msg, "error");
+      showToast({ title: "Registry Test Failed", message: msg, type: "error" });
+    }
+
+    if (data.registry && editingRegistryId) {
+      const idx = containerRegistries.findIndex((r) => r.id === data.registry.id);
+      if (idx >= 0) {
+        containerRegistries[idx] = data.registry;
+      }
+      renderContainerRegistries();
+    }
+  } catch (err) {
+    const msg = err.message || String(err);
+    setRegistryAlertBox(feedbackEl, msg, "error");
+    showToast({ title: "Registry Test Error", message: msg, type: "error" });
+  } finally {
+    if (testBtn) {
+      testBtn.disabled = false;
+      testBtn.innerHTML = originalHtml;
+    }
+  }
+}
+
+async function handleSaveRegistry() {
+  const nameInput = document.getElementById("registry-form-name");
+  const urlInput = document.getElementById("registry-form-url");
+  const userInput = document.getElementById("registry-form-username");
+  const tokenInput = document.getElementById("registry-form-token");
+  const defaultCb = document.getElementById("registry-form-is-default");
+  const saveBtn = document.getElementById("btn-save-registry");
+  const feedbackEl = document.getElementById("registry-form-test-feedback");
+
+  const name = (nameInput?.value || "").trim();
+  const url = (urlInput?.value || "").trim();
+  const username = (userInput?.value || "").trim();
+  const rawToken = (tokenInput?.value || "").trim();
+  const isDefault = Boolean(defaultCb?.checked);
+
+  if (!name) {
+    setRegistryAlertBox(feedbackEl, "Registry Name is required.", "error");
+    nameInput?.focus();
+    return;
+  }
+  if (!url) {
+    setRegistryAlertBox(feedbackEl, "Registry URL is required.", "error");
+    urlInput?.focus();
+    return;
+  }
+
+  const originalText = saveBtn ? saveBtn.textContent : "Save Registry";
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving...";
+  }
+  setRegistryAlertBox(feedbackEl, "");
+
+  try {
+    const isEdit = Boolean(editingRegistryId);
+    const endpoint = isEdit
+      ? "/api/docker/registries/" + encodeURIComponent(editingRegistryId)
+      : "/api/docker/registries";
+    const method = isEdit ? "PUT" : "POST";
+    const tokenValue =
+      isEdit && !rawToken && editingRegistryTokenConfigured ? "********" : rawToken;
+
+    const resp = await apiFetch(endpoint, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name,
+        url,
+        username,
+        token: tokenValue,
+        is_default: isDefault,
+      }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `Save failed with HTTP ${resp.status}`);
+    }
+
+    closeRegistryModal();
+    await fetchContainerRegistries();
+    showToast({
+      title: isEdit ? "Registry Updated" : "Registry Added",
+      message: `${name} (${url}) saved successfully.`,
+      type: "success",
+    });
+  } catch (err) {
+    const msg = err.message || String(err);
+    setRegistryAlertBox(feedbackEl, msg, "error");
+    showToast({ title: "Save Registry Failed", message: msg, type: "error" });
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = originalText;
+    }
+  }
+}
+
+async function handleTestRegistryRow(registryId) {
+  if (!registryId || testingRegistryIds.has(registryId)) return;
+  testingRegistryIds.add(registryId);
+  renderContainerRegistries();
+
+  try {
+    const resp = await apiFetch(
+      "/api/docker/registries/" + encodeURIComponent(registryId) + "/test",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `Test failed with HTTP ${resp.status}`);
+    }
+
+    const msg = data.message || (data.success ? "Connection verified" : "Verification failed");
+    showToast({
+      title: data.success ? "Registry Verified" : "Registry Test Failed",
+      message: msg,
+      type: data.success ? "success" : "error",
+    });
+  } catch (err) {
+    showToast({
+      title: "Registry Test Error",
+      message: err.message || String(err),
+      type: "error",
+    });
+  } finally {
+    testingRegistryIds.delete(registryId);
+    await fetchContainerRegistries();
+  }
+}
+
+async function handleDeleteRegistry(registryId, registryName) {
+  if (!confirm(`Are you sure you want to delete registry "${registryName}"?`)) {
+    return;
+  }
+
+  try {
+    const resp = await apiFetch(
+      "/api/docker/registries/" + encodeURIComponent(registryId),
+      { method: "DELETE" }
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(data.detail || `Delete failed with HTTP ${resp.status}`);
+    }
+
+    await fetchContainerRegistries();
+    showToast({
+      title: "Registry Deleted",
+      message: `Removed registry "${registryName}".`,
+      type: "success",
+    });
+  } catch (err) {
+    showToast({
+      title: "Delete Registry Failed",
+      message: err.message || String(err),
+      type: "error",
+    });
+  }
+}
+
+/* =========================================================================
  * Packages & Updates Manager View (#view-packages)
  * ========================================================================= */
 let currentPackagesSubtab = "updates";
@@ -17290,7 +17781,7 @@ function initDashboard() {
   });
 
   // Docker Sub-Tabs
-  const subtabs = ["stacks", "containers", "images", "volumes", "networks", "updates"];
+  const subtabs = ["stacks", "containers", "images", "volumes", "networks", "updates", "registries"];
   subtabs.forEach((st) => {
     document
       .getElementById(`subtab-docker-${st}`)
@@ -17299,6 +17790,61 @@ function initDashboard() {
         switchDockerSubtab(st, true);
       });
   });
+
+  // Container Registries & Source Repos
+  document
+    .getElementById("btn-add-registry")
+    ?.addEventListener("click", () => openRegistryModal());
+
+  document
+    .getElementById("btn-empty-add-registry")
+    ?.addEventListener("click", () => openRegistryModal());
+
+  document
+    .getElementById("btn-close-registry-modal")
+    ?.addEventListener("click", closeRegistryModal);
+
+  document
+    .getElementById("btn-cancel-registry")
+    ?.addEventListener("click", closeRegistryModal);
+
+  const registryModal = document.getElementById("modal-registry");
+  registryModal?.addEventListener("click", (e) => {
+    if (e.target === registryModal) {
+      closeRegistryModal();
+    }
+  });
+
+  document
+    .querySelectorAll("#modal-registry [data-registry-preset]")
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const preset = btn.getAttribute("data-registry-preset");
+        if (preset) applyRegistryPreset(preset);
+      });
+    });
+
+  document
+    .getElementById("btn-toggle-registry-token")
+    ?.addEventListener("click", () => {
+      const tokenInput = document.getElementById("registry-form-token");
+      const toggleBtn = document.getElementById("btn-toggle-registry-token");
+      if (!tokenInput || !toggleBtn) return;
+      const isPw = tokenInput.type === "password";
+      tokenInput.type = isPw ? "text" : "password";
+      updateEyeIcon(toggleBtn, tokenInput.type === "password");
+    });
+
+  document
+    .getElementById("btn-test-registry-form")
+    ?.addEventListener("click", handleTestRegistryForm);
+
+  document
+    .getElementById("registry-form")
+    ?.addEventListener("submit", (e) => {
+      e.preventDefault();
+      handleSaveRegistry();
+    });
 
   // Quick Stat Cards Navigation
   document.querySelectorAll(".docker-stat-card[data-subtab]").forEach((card) => {
