@@ -215,6 +215,10 @@
                 <span class="sidebar-submenu-label">Updates</span>
                 <span class="sidebar-submenu-badge subtab-badge subnav-badge-warn hidden" id="subtab-badge-updates">0</span>
               </button>
+              <button id="subtab-docker-registries" class="sidebar-submenu-item" type="button" role="tab" aria-selected="false" aria-controls="subview-docker-registries" data-parent-view="containers" data-subtab="registries">
+                <span class="sidebar-submenu-label">Registries</span>
+                <span class="sidebar-submenu-badge subtab-badge" id="subtab-badge-registries">0</span>
+              </button>
             </div>
           </div>
           <button
@@ -1589,6 +1593,71 @@
                 <tbody id="docker-updates-tbody">
                   <tr>
                     <td colspan="8" class="empty-state">Click 'Check Now' to scan running containers for upstream updates.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Subview: Container Registries & Source Repos -->
+          <div id="subview-docker-registries" class="subview-panel hidden" role="tabpanel" aria-labelledby="subtab-docker-registries">
+            <div class="subview-toolbar">
+              <div class="subview-title-group">
+                <h3 class="subview-title">Container Registries &amp; Source Repos</h3>
+                <span class="subview-subtitle">Configure private registry credentials, API tokens, and default image pull sources</span>
+              </div>
+              <div class="subview-actions">
+                <button id="btn-add-registry" type="button" class="btn-primary">
+                  <svg viewBox="0 0 24 24" width="15" height="15" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                  <span>Add Registry</span>
+                </button>
+              </div>
+            </div>
+
+            <div id="docker-registries-feedback" class="auth-alert hidden" role="status"></div>
+
+            <!-- Empty State (#registries-empty-state) -->
+            <div id="registries-empty-state" class="registries-empty-state">
+              <div class="empty-state-icon">
+                <svg viewBox="0 0 24 24" width="44" height="44" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                </svg>
+              </div>
+              <h4 class="empty-state-title">No Container Registries Configured</h4>
+              <p class="empty-state-desc">
+                Add credentials for private or rate-limited registries so Vigil can authenticate image pulls, update checks, and stack deployments.
+              </p>
+              <div class="registries-setup-hints">
+                <span class="registry-hint-pill">Docker Hub (<code>registry-1.docker.io</code>)</span>
+                <span class="registry-hint-pill">GitHub GHCR (<code>ghcr.io</code>)</span>
+                <span class="registry-hint-pill">Quay.io (<code>quay.io</code>)</span>
+              </div>
+              <button id="btn-empty-add-registry" type="button" class="btn-primary">
+                <span>Add Your First Registry</span>
+              </button>
+            </div>
+
+            <!-- Registries Table (#registries-table-container) -->
+            <div id="registries-table-container" class="table-container hidden">
+              <table class="data-table" id="docker-registries-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>URL</th>
+                    <th>Username</th>
+                    <th>Credential Status</th>
+                    <th>Status</th>
+                    <th>Last Tested</th>
+                    <th class="actions-col">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="docker-registries-tbody">
+                  <tr>
+                    <td colspan="7" class="empty-state">No registries configured.</td>
                   </tr>
                 </tbody>
               </table>
@@ -5288,6 +5357,85 @@
         <div class="modal-actions">
           <button type="button" id="btn-firewall-modal-cancel" class="btn-secondary">Cancel</button>
           <button type="submit" id="btn-firewall-modal-save" class="btn-primary">Add Rule</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Add / Edit Container Registry Modal (#modal-registry) -->
+  <div id="modal-registry" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="registry-modal-title">
+    <div class="modal-card registry-modal-card">
+      <div class="modal-header">
+        <div class="modal-title-with-icon">
+          <div class="modal-icon-badge" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <div>
+            <h3 id="registry-modal-title" class="modal-title">Add Container Registry</h3>
+            <p id="registry-modal-subtitle" class="modal-subtitle">Store encrypted registry credentials for private pulls and update scans</p>
+          </div>
+        </div>
+        <button id="btn-close-registry-modal" type="button" class="btn-icon-close" aria-label="Close registry modal">&times;</button>
+      </div>
+
+      <div class="registry-presets-bar" role="group" aria-label="Registry Quick-Fill Presets">
+        <span class="registry-presets-label">Quick Presets:</span>
+        <button type="button" id="btn-preset-dockerhub" class="btn-preset-chip" data-registry-preset="dockerhub">Docker Hub</button>
+        <button type="button" id="btn-preset-ghcr" class="btn-preset-chip" data-registry-preset="ghcr">GitHub GHCR</button>
+        <button type="button" id="btn-preset-quay" class="btn-preset-chip" data-registry-preset="quay">Quay.io</button>
+      </div>
+
+      <div id="registry-form-test-feedback" class="auth-alert hidden" role="status"></div>
+
+      <form id="registry-form" class="settings-form" onsubmit="return false;">
+        <div class="form-group">
+          <label for="registry-form-name">Registry Name <span class="required-star">*</span></label>
+          <input type="text" id="registry-form-name" placeholder="e.g. GitHub GHCR" autocomplete="off" required />
+        </div>
+
+        <div class="form-group">
+          <label for="registry-form-url">Registry URL <span class="required-star">*</span></label>
+          <input type="text" id="registry-form-url" placeholder="e.g. https://ghcr.io" autocomplete="off" spellcheck="false" required />
+          <small class="form-hint">Base HTTPS URL of the OCI/Docker v2 registry (e.g. <code>https://registry-1.docker.io</code>, <code>https://ghcr.io</code>).</small>
+        </div>
+
+        <div class="form-group">
+          <label for="registry-form-username">Username</label>
+          <input type="text" id="registry-form-username" placeholder="Registry username or account handle" autocomplete="off" spellcheck="false" />
+        </div>
+
+        <div class="form-group">
+          <label for="registry-form-token">Personal Access Token / API Key</label>
+          <div class="registry-token-input-group">
+            <input type="password" id="registry-form-token" placeholder="Enter PAT or registry secret" autocomplete="new-password" spellcheck="false" />
+            <button type="button" id="btn-toggle-registry-token" class="btn-icon-subtle btn-toggle-secret" title="Show value" aria-label="Show token">
+              <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </button>
+          </div>
+          <small id="registry-token-hint" class="form-hint">Encrypted at rest using Vigil's secret store. Leave blank for anonymous registries.</small>
+        </div>
+
+        <div class="form-group registry-checkbox-group">
+          <label class="registry-checkbox-label" for="registry-form-is-default">
+            <input type="checkbox" id="registry-form-is-default" />
+            <span>Set as default registry for unqualified image pulls</span>
+          </label>
+        </div>
+
+        <div class="modal-actions modal-actions-spread">
+          <button type="button" id="btn-test-registry-form" class="btn-secondary">
+            <span>Test Connection</span>
+          </button>
+          <div class="modal-actions-right">
+            <button type="button" id="btn-cancel-registry" class="btn-secondary">Cancel</button>
+            <button type="submit" id="btn-save-registry" class="btn-primary">Save Registry</button>
+          </div>
         </div>
       </form>
     </div>
