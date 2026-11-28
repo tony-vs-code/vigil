@@ -1,23 +1,19 @@
-# Release v1.1.0: Container Registries & Encrypted Credential Management
+# Release v1.1.1: Registry-Authenticated Docker Image Pulls & Registry Visibility
 
 ## Overview
-Vigil v1.1.0 introduces **Container Registries & Source Repositories** management under the Containers workspace. Operators can now configure, test, and manage credentials for Docker Hub, GitHub Container Registry (GHCR), Quay.io, Harbor, and custom OCI/Docker v2 registries with AES-256-CBC + HMAC-SHA256 encryption at rest, strict API token masking, live `/v2/` connection testing, and audit trail logging.
+Vigil v1.1.1 connects the Container Registries secret store directly to Docker image operations. Operators can now pull private images using configured registry credentials—either automatically matched by image host or explicitly selected from the Images toolbar—while viewing resolved registry origin and authentication pills directly in the Docker Images table.
 
 ## Highlights & Enhancements
 
-### 1. Container Registries & Source Repositories UI
-- **Dedicated Registries Sub-View**: Added the **Registries** sidebar sub-menu entry (`#subtab-docker-registries`) and view panel (`#subview-docker-registries`) under **Containers** with live count badge updates (`#subtab-badge-registries`) and `#containers/registries` hash routing.
-- **Provider Presets & Custom Endpoints**: One-click preset chips (`#btn-preset-dockerhub`, `#btn-preset-ghcr`, `#btn-preset-quay`) pre-populate Docker Hub (`https://registry-1.docker.io`), GitHub GHCR (`https://ghcr.io`), and Quay.io (`https://quay.io`), alongside support for Harbor and private self-hosted registries.
-- **Add/Edit Modal & State Rendering**: Added `#modal-registry` featuring show/hide token visibility toggle (`#btn-toggle-registry-token`), default registry selection (`#registry-form-is-default`), in-modal connection test feedback (`#registry-form-test-feedback`), guided empty state (`#registries-empty-state`), and status-badged table rendering (`#docker-registries-table`).
+### 1. Registry-Authenticated Image Pulling
+- **Automatic Host Matching & Default Fallback**: `DockerManager.pull_image` now resolves matching credentials from configured registries via `extract_registry_host_from_image` and `resolve_registry_for_image` (supporting Docker Hub aliases, GHCR, Quay.io, Harbor, and custom ports/hosts), falling back to the default configured registry when appropriate.
+- **Ephemeral Isolated Docker Config**: Authenticated pulls materialize an ephemeral `0700` temporary directory containing a `0600` `config.json` passed via `docker --config <dir> pull <image>` and clean it up in a `finally` block—preventing credentials from ever persisting in host Docker config files.
+- **Pull API & Audit Trail**: `POST /api/docker/images/pull` accepts an optional `registry_id` override (returning `404` for unknown IDs), returns `authenticated` and `registry_name` metadata, and records `docker.image.pull` audit events without exposing secrets.
 
-### 2. Encrypted Credential Storage & Token Masking
-- **Encrypt-then-MAC Secret Store**: Persisted registry credentials in the SQLite `container_registries` table with `encrypt_secret` / `decrypt_secret` using AES-256-CBC + HMAC-SHA256, per-record random 16-byte salts and IVs, and PBKDF2-SHA256 master key derivation from `AUTH_SECRET_KEY`.
-- **Strict Secret Masking**: API responses never return plaintext tokens, exposing only `token_configured` flags and masked previews (`••••` + trailing characters). Editing a registry safely preserves the existing encrypted token when the input is left unchanged.
-
-### 3. Registry CRUD APIs & Live `/v2/` Connection Testing
-- **Authenticated REST Endpoints**: Added full CRUD and test routes on `/api/docker/registries`, `/api/docker/registries/{registry_id}`, `/api/docker/registries/test`, and `/api/docker/registries/{registry_id}/test`, recording `docker.registry.create`, `docker.registry.update`, `docker.registry.delete`, and `docker.registry.test` audit events.
-- **Registry `/v2/` Challenge Exchange**: Implemented `test_container_registry_connection` with Basic auth and Docker Registry v2 Bearer `WWW-Authenticate` realm/service/scope token exchange, persisting `verified`/`error` status, `last_tested_at`, and `last_error` results.
+### 2. Pull Registry Selector & Images Table Registry Column
+- **Pull Registry Selector (`#docker-image-pull-registry`)**: Added a credential selector beside the image pull input populated with configured registries (showing `(Default)` labels) while defaulting to `Registry: Auto (Recommended)` and displaying authenticated pull badges (`.pull-auth-badge`) and toasts on completion.
+- **Images Table `Registry` Column**: Expanded `#docker-images-table` with a `Registry` column rendering `.registry-pill` origin badges (`Local`, `Docker Hub`, or matched registry name) and `.registry-pill.authenticated` status indicators when encrypted credentials are configured for that source.
 
 ## Reliability & Fixes
-- **Dedicated Registry Test Suite**: Added `test_container_registries.py` covering AES-256-CBC/HMAC-SHA256 encryption and tamper resistance, SQLite CRUD persistence, API authorization and token masking, `/v2/` Basic/Bearer connection test edge cases, zero duplicate HTML IDs, and Node VM frontend subtab/modal flows.
-- **100% QA Quality Gate Pass**: Validated with `node --check static/app.js`, cross-tier contract checks (67 frontend API routes and 745 DOM element IDs), and **454/454** passing tests in `pytest`.
+- **Authenticated Pull Test Coverage**: Added `RegistryAuthenticatedPullTests` in `test_container_registries.py` covering image host extraction, registry matching/fallback logic, ephemeral `0700`/`0600` `config.json` lifecycle & exception-safe cleanup, `POST /api/docker/images/pull` API responses/audit logs, and Node VM tests for `#docker-image-pull-registry` and the 7-column Images table.
+- **100% QA Quality Gate Pass**: Validated with `node --check static/app.js`, cross-tier contract checks (67 frontend API routes and 746 DOM element IDs), and **461/461** passing tests in `pytest`.

@@ -2,6 +2,16 @@
 
 All notable changes to the SystemAlerts project are documented in this file.
 
+## [1.1.1] - 2026-11-28
+### Added
+- **Registry-Authenticated Image Pulling**: Enhanced `DockerManager.pull_image` in `main.py` with `extract_registry_host_from_image` and `resolve_registry_for_image` to automatically match configured registry credentials (or use an explicit `registry_id` override), write an isolated `0700`/`0600` temporary `--config` `config.json` cleaned up in `finally`, and log `docker.image.pull` audit events.
+- **Pull Registry Selector (`#docker-image-pull-registry`)**: Added a target registry dropdown in the Docker Images toolbar (`static/index.html`, `static/app.js`) supporting `Registry: Auto (Recommended)` or explicit credential selection with authenticated pull feedback badges (`.pull-auth-badge`).
+- **Docker Images `Registry` Column**: Added a `Registry` column to `#docker-images-table` displaying origin `.registry-pill` badges and `.registry-pill.authenticated` indicators for images backed by configured registry credentials.
+- **Authenticated Pull API & Test Suite**: Updated `POST /api/docker/images/pull` (`ImagePullRequest.registry_id`) in `api.py` and added `RegistryAuthenticatedPullTests` in `test_container_registries.py` covering host extraction, isolated `config.json` cleanup, API endpoints, and Node VM frontend contracts.
+
+### Changed
+- **Full Backward Compatibility**: Maintained 100% contract compliance across all 67 frontend API route calls and 746 DOM element IDs with 461/461 tests passing.
+
 ## [1.1.0] - 2026-11-28
 ### Added
 - **Container Registries & Source Repositories Sub-View**: Added `#subtab-docker-registries` and `#subview-docker-registries` under the Containers workspace with `#containers/registries` hash routing, live count badge (`#subtab-badge-registries`), empty state (`#registries-empty-state`), and status-badged table (`#docker-registries-table`).

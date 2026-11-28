@@ -1384,6 +1384,9 @@
                     class="search-input"
                     placeholder="Image (e.g. nginx:alpine)"
                   />
+                  <select id="docker-image-pull-registry" class="search-input pull-registry-select" title="Target Registry Credentials" aria-label="Registry credentials">
+                    <option value="">Registry: Auto (Recommended)</option>
+                  </select>
                   <button id="btn-pull-image" type="button" class="btn-primary">
                     Pull Image
                   </button>
@@ -1399,6 +1402,7 @@
                 <thead>
                   <tr>
                     <th>ID</th>
+                    <th>Registry</th>
                     <th>Repository</th>
                     <th>Tag</th>
                     <th>Size</th>
@@ -1408,7 +1412,7 @@
                 </thead>
                 <tbody id="docker-images-tbody">
                   <tr>
-                    <td colspan="6" class="empty-state">No images found.</td>
+                    <td colspan="7" class="empty-state">No images found.</td>
                   </tr>
                 </tbody>
               </table>

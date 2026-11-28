@@ -9240,6 +9240,66 @@ hr.overview-flow-divider {
   .modal-actions-right button {
     flex: 1;
   }
+
+  .image-pull-actions,
+  .image-pull-actions .pull-input-group {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .image-pull-actions .pull-input-group .search-input,
+  .image-pull-actions .pull-input-group .pull-registry-select,
+  .image-pull-actions .pull-input-group button {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+  }
+}
+
+.image-pull-actions .pull-input-group {
+  flex-wrap: wrap;
+}
+
+.pull-registry-select {
+  min-width: 195px;
+  max-width: 260px;
+  cursor: pointer;
+}
+
+.pull-auth-badge {
+  margin-right: 6px;
+  padding: 2px 8px;
+  font-size: 0.7rem;
+  vertical-align: middle;
+}
+
+.registry-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  white-space: nowrap;
+}
+
+.registry-pill.authenticated {
+  color: var(--state-clean);
+  background-color: var(--state-clean-bg);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.registry-pill.authenticated::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: currentColor;
 }
 
 

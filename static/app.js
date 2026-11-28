@@ -344,6 +344,7 @@ let isFetchingContainerLogs = false;
 let isFetchingUpdateSchedule = false;
 
 let containerRegistries = [];
+let cachedDockerImages = null;
 let editingRegistryId = null;
 let editingRegistryTokenConfigured = false;
 const testingRegistryIds = new Set();
@@ -8837,6 +8838,12 @@ function refreshDockerSubtab(subtabName) {
       break;
     case "images":
       fetchDockerImages();
+      if (typeof populateImagePullRegistrySelect === "function") {
+        populateImagePullRegistrySelect();
+      }
+      if (typeof containerRegistries !== "undefined" && containerRegistries.length === 0) {
+        fetchContainerRegistries();
+      }
       break;
     case "volumes":
       fetchDockerVolumes();
@@ -12504,6 +12511,121 @@ function handleTerminalPaste(e) {
 /**
  * Images Tab: Fetch, Pull, Prune, Remove.
  */
+const DOCKER_HUB_HOSTS = new Set([
+  "docker.io",
+  "registry-1.docker.io",
+  "index.docker.io",
+  "registry.hub.docker.com",
+]);
+
+function extractImageRegistryHost(repository) {
+  const repo = String(repository || "").trim();
+  if (!repo || repo === "<none>") return "";
+  const parts = repo.split("/");
+  if (parts.length >= 2) {
+    const first = parts[0];
+    if (first === "localhost" || first.includes(".") || first.includes(":")) {
+      return first.toLowerCase();
+    }
+  }
+  return "docker.io";
+}
+
+function registryMatchesImageHost(registryUrl, imageHost) {
+  if (!registryUrl || !imageHost) return false;
+  const hostLower = imageHost.toLowerCase();
+  let regNetloc = "";
+  let regHostname = "";
+  let regPort = "";
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(registryUrl) ? registryUrl : `https://${registryUrl}`);
+    regNetloc = (parsed.host || "").toLowerCase();
+    regHostname = (parsed.hostname || "").toLowerCase();
+    regPort = parsed.port || "";
+  } catch (_err) {
+    const stripped = String(registryUrl).replace(/^https?:\/\//i, "").split("/")[0].toLowerCase();
+    regNetloc = stripped;
+    regHostname = stripped.split(":")[0];
+  }
+  if (!regNetloc) return false;
+  if (DOCKER_HUB_HOSTS.has(hostLower)) {
+    return DOCKER_HUB_HOSTS.has(regHostname);
+  }
+  if (regNetloc === hostLower) return true;
+  if (!hostLower.includes(":") && regHostname === hostLower) {
+    return !regPort || regPort === "443" || regPort === "80";
+  }
+  return false;
+}
+
+function resolveImageRegistryBadgeHtml(repository) {
+  const host = extractImageRegistryHost(repository);
+  if (!host) {
+    return `<span class="registry-pill">Local</span>`;
+  }
+
+  const registries = Array.isArray(containerRegistries) ? containerRegistries : [];
+  const matches = registries.filter((reg) => reg && registryMatchesImageHost(reg.url, host));
+  const matched =
+    matches.find((r) => Boolean(r.token_configured)) ||
+    matches.find((r) => Boolean(r.is_default)) ||
+    matches[0] ||
+    null;
+
+  if (matched) {
+    const safeLabel = escapeHtml(matched.name || host);
+    const safeTitle = escapeHtml(matched.url || host);
+    if (matched.token_configured) {
+      return `<span class="registry-pill authenticated" title="Authenticated registry: ${safeTitle}">${safeLabel}</span>`;
+    }
+    return `<span class="registry-pill" title="${safeTitle}">${safeLabel}</span>`;
+  }
+
+  const defaultLabel = host === "docker.io" ? "Docker Hub" : host;
+  return `<span class="registry-pill" title="${escapeHtml(host)}">${escapeHtml(defaultLabel)}</span>`;
+}
+
+function renderDockerImages(images) {
+  const tbody = document.getElementById("docker-images-tbody");
+  if (!tbody) return;
+
+  if (!Array.isArray(images) || images.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-state">No images found on host.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = images
+    .map((img) => {
+      const safeId = escapeHtml(img.id);
+      const safeRepo = escapeHtml(img.repository);
+      const safeTag = escapeHtml(img.tag);
+      const safeSize = escapeHtml(img.size);
+      const safeCreated = escapeHtml(img.created);
+      const registryBadgeHtml = resolveImageRegistryBadgeHtml(img.repository);
+
+      return `<tr>
+        <td><span class="mono-text">${safeId}</span></td>
+        <td>${registryBadgeHtml}</td>
+        <td><strong>${safeRepo}</strong></td>
+        <td><span class="mono-text">${safeTag}</span></td>
+        <td>${safeSize}</td>
+        <td>${safeCreated}</td>
+        <td class="actions-col">
+          <button type="button" class="btn-action btn-action-danger" data-img-delete="${safeId}" data-img-tag="${safeRepo}:${safeTag}">Remove</button>
+        </td>
+      </tr>`;
+    })
+    .join("");
+
+  tbody.querySelectorAll("button[data-img-delete]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-img-delete");
+      const tag = btn.getAttribute("data-img-tag");
+      handleRemoveImage(id, tag);
+    });
+  });
+}
+
 async function fetchDockerImages() {
   const tbody = document.getElementById("docker-images-tbody");
   if (!tbody) return;
@@ -12515,38 +12637,8 @@ async function fetchDockerImages() {
     if (!resp.ok) return;
     const data = await resp.json();
     const images = data.images || [];
-
-    if (images.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="6" class="empty-state">No images found on host.</td></tr>`;
-      return;
-    }
-
-    tbody.innerHTML = images.map((img) => {
-      const safeId = escapeHtml(img.id);
-      const safeRepo = escapeHtml(img.repository);
-      const safeTag = escapeHtml(img.tag);
-      const safeSize = escapeHtml(img.size);
-      const safeCreated = escapeHtml(img.created);
-
-      return `<tr>
-        <td><span class="mono-text">${safeId}</span></td>
-        <td><strong>${safeRepo}</strong></td>
-        <td><span class="mono-text">${safeTag}</span></td>
-        <td>${safeSize}</td>
-        <td>${safeCreated}</td>
-        <td class="actions-col">
-          <button type="button" class="btn-action btn-action-danger" data-img-delete="${safeId}" data-img-tag="${safeRepo}:${safeTag}">Remove</button>
-        </td>
-      </tr>`;
-    }).join("");
-
-    tbody.querySelectorAll("button[data-img-delete]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const id = btn.getAttribute("data-img-delete");
-        const tag = btn.getAttribute("data-img-tag");
-        handleRemoveImage(id, tag);
-      });
-    });
+    cachedDockerImages = images;
+    renderDockerImages(images);
   } catch (err) {
     console.warn("Failed to fetch Docker images:", err);
   } finally {
@@ -12556,6 +12648,7 @@ async function fetchDockerImages() {
 
 async function handlePullImage() {
   const input = document.getElementById("docker-image-pull-input");
+  const registrySelect = document.getElementById("docker-image-pull-registry");
   const btn = document.getElementById("btn-pull-image");
   const feedback = document.getElementById("docker-image-feedback");
 
@@ -12564,6 +12657,8 @@ async function handlePullImage() {
     alert("Please enter an image name to pull (e.g. nginx:alpine)");
     return;
   }
+
+  const registryId = (registrySelect?.value || "").trim() || null;
 
   if (btn) {
     btn.disabled = true;
@@ -12577,16 +12672,34 @@ async function handlePullImage() {
   }
 
   try {
+    const payload = {
+      image: tag,
+      ...(registryId ? { registry_id: registryId } : {}),
+    };
     const resp = await apiFetch("/api/docker/images/pull", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: tag }),
+      body: JSON.stringify(payload),
     });
     const data = await resp.json().catch(() => ({}));
     if (resp.ok) {
       if (feedback) {
         feedback.className = "auth-alert feedback-success";
-        feedback.textContent = `Successfully pulled image '${tag}'.`;
+        if (data.authenticated) {
+          const registryLabel = data.registry_name || "configured registry";
+          feedback.innerHTML = `<span class="status-badge status-verified pull-auth-badge">Authenticated</span> <span>Successfully pulled '${escapeHtml(tag)}' using credentials from ${escapeHtml(registryLabel)}.</span>`;
+        } else {
+          feedback.textContent = `Successfully pulled image '${tag}'.`;
+        }
+      }
+      if (typeof showToast === "function") {
+        showToast({
+          title: data.authenticated ? "Authenticated Image Pull" : "Image Pulled",
+          message: data.authenticated
+            ? `Successfully pulled '${tag}' using credentials from ${data.registry_name || "configured registry"}.`
+            : `Successfully pulled image '${tag}'.`,
+          type: "success",
+        });
       }
       if (input) input.value = "";
       fetchDockerImages();
@@ -13497,11 +13610,46 @@ function formatRegistryStatusBadge(reg) {
   return `<span class="status-badge status-unverified"><span class="status-dot"></span> Unverified</span>`;
 }
 
+function populateImagePullRegistrySelect() {
+  const select = document.getElementById("docker-image-pull-registry");
+  if (!select) return;
+
+  const prevValue = select.value || "";
+  const options = ['<option value="">Registry: Auto (Recommended)</option>'];
+
+  if (Array.isArray(containerRegistries)) {
+    containerRegistries.forEach((reg) => {
+      if (!reg || !reg.id || !reg.token_configured) return;
+      const safeId = escapeHtml(reg.id);
+      const safeName = escapeHtml(reg.name || reg.url || reg.id);
+      const suffix = reg.is_default ? " (Default)" : "";
+      options.push(`<option value="${safeId}">Registry: ${safeName}${suffix}</option>`);
+    });
+  }
+
+  select.innerHTML = options.join("");
+  if (
+    prevValue &&
+    Array.isArray(containerRegistries) &&
+    containerRegistries.some((r) => r && r.id === prevValue && r.token_configured)
+  ) {
+    select.value = prevValue;
+  } else {
+    select.value = "";
+  }
+}
+
 function renderContainerRegistries() {
   const emptyState = document.getElementById("registries-empty-state");
   const tableContainer = document.getElementById("registries-table-container");
   const tbody = document.getElementById("docker-registries-tbody");
   updateRegistriesSubtabBadge();
+  if (typeof populateImagePullRegistrySelect === "function") {
+    populateImagePullRegistrySelect();
+  }
+  if (typeof renderDockerImages === "function" && typeof cachedDockerImages !== "undefined" && Array.isArray(cachedDockerImages)) {
+    renderDockerImages(cachedDockerImages);
+  }
 
   if (!tbody) return;
 
@@ -13620,6 +13768,7 @@ async function fetchContainerRegistries() {
     const data = await resp.json();
     containerRegistries = Array.isArray(data.registries) ? data.registries : [];
     renderContainerRegistries();
+    populateImagePullRegistrySelect();
   } catch (err) {
     console.warn("Failed to fetch container registries:", err);
     const feedback = document.getElementById("docker-registries-feedback");
